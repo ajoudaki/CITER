@@ -1,0 +1,30 @@
+# Jupyter Lab
+.ipynb_checkpoints/
+.DS_Store
+*.pyc
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch
+*.pth
+*.pt
+
+# Virtual environment
+venv/
+.env
+
+# Data and model files
+data/
+models/
+
+# Logs and output files
+logs/
+output/
+
+# Miscellaneous
+.idea/
+.vscode/
+
