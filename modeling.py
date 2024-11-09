@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoTokenizer, AutoModel
 from torch.utils.data import Dataset, DataLoader
+from tqdm.auto import tqdm
 
 @dataclass
 class ModelConfig:
@@ -182,20 +183,143 @@ class CitationMatcher(nn.Module):
         
         return similarity
 
+@dataclass
+class DatasetStats:
+    """Statistics for dataset preprocessing."""
+    total_samples: int = 0
+    processed: int = 0
+    skipped_no_cite: int = 0
+    skipped_errors: int = 0
+    
+    def update(self, processed: int = 0, skipped_no_cite: int = 0, skipped_errors: int = 0):
+        self.processed += processed
+        self.skipped_no_cite += skipped_no_cite
+        self.skipped_errors += skipped_errors
+    
+    def __str__(self) -> str:
+        return (f"Total samples: {self.total_samples}\n"
+                f"Processed: {self.processed}\n"
+                f"Skipped (no citation): {self.skipped_no_cite}\n"
+                f"Skipped (errors): {self.skipped_errors}")
+
+class BatchProcessor:
+    """Handles batch processing of text samples."""
+    
+    def __init__(
+        self,
+        tokenizer: AutoTokenizer,
+        max_length: int,
+        cite_token: str,
+        ref_token: str,
+        batch_size: int = 128
+    ):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.cite_token_id = tokenizer.convert_tokens_to_ids(cite_token)
+        self.ref_token_id = tokenizer.convert_tokens_to_ids(ref_token)
+        self.batch_size = batch_size
+
+    def process_batch(
+        self,
+        sources: List[str],
+        targets: List[str]
+    ) -> Tuple[List[Dict[str, torch.Tensor]], DatasetStats]:
+        """Process a batch of samples efficiently."""
+        # Batch tokenization
+        source_tokens = self.tokenizer(
+            sources,
+            padding='max_length',
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors='pt'
+        )
+        
+        target_tokens = self.tokenizer(
+            targets,
+            padding='max_length',
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors='pt'
+        )
+        
+        # Process all target tokens at once
+        target_tokens['input_ids'] = self._ensure_ref_token_batch(target_tokens['input_ids'])
+        
+        # Check citation tokens for all sources at once
+        has_citation = (source_tokens['input_ids'] == self.cite_token_id).any(dim=1)
+        
+        processed_samples = []
+        stats = DatasetStats(total_samples=len(sources))
+        
+        for idx in range(len(sources)):
+            if has_citation[idx]:
+                sample = {
+                    'source_input_ids': source_tokens['input_ids'][idx],
+                    'source_attention_mask': source_tokens['attention_mask'][idx],
+                    'target_input_ids': target_tokens['input_ids'][idx],
+                    'target_attention_mask': target_tokens['attention_mask'][idx]
+                }
+                processed_samples.append(sample)
+                stats.update(processed=1)
+            else:
+                stats.update(skipped_no_cite=1)
+        
+        return processed_samples, stats
+
+    def _ensure_ref_token_batch(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Ensure reference token is present in batch of sequences."""
+        batch_size = tokens.size(0)
+        
+        # Find all ref token positions in batch
+        ref_positions = (tokens == self.ref_token_id).nonzero(as_tuple=True)
+        batch_indices = ref_positions[0].unique()
+        
+        # Handle sequences without ref token
+        missing_ref = torch.ones(batch_size, dtype=torch.bool)
+        missing_ref[batch_indices] = False
+        
+        if missing_ref.any():
+            # Find last non-pad position for sequences missing ref token
+            pad_mask = (tokens != self.tokenizer.pad_token_id)
+            last_nonpad = pad_mask.long().argmax(dim=1)
+            
+            # Add ref token at last non-pad position
+            missing_indices = missing_ref.nonzero(as_tuple=True)[0]
+            tokens[missing_indices, last_nonpad[missing_indices]] = self.ref_token_id
+        
+        # Handle multiple ref tokens
+        ref_counts = (tokens == self.ref_token_id).sum(dim=1)
+        multiple_refs = ref_counts > 1
+        
+        if multiple_refs.any():
+            for idx in multiple_refs.nonzero(as_tuple=True)[0]:
+                ref_pos = (tokens[idx] == self.ref_token_id).nonzero(as_tuple=True)[0]
+                # Keep only the last ref token
+                tokens[idx, ref_pos[:-1]] = self.tokenizer.convert_tokens_to_ids(self.tokenizer.unk_token)
+        
+        return tokens
+
 class CitationDataset(Dataset):
-    """Dataset for citation matching."""
+    """Dataset for citation matching with optimized batch processing."""
     
     def __init__(
         self,
         sources: List[str],
         targets: List[str],
         tokenizer: AutoTokenizer,
-        config: ModelConfig,
+        config: "ModelConfig",
+        batch_size: int = 1024,
         verbose: bool = True
     ):
         assert len(sources) == len(targets), "Sources and targets must have same length"
         self.config = config
-        self.tokenizer = tokenizer
+        self.processor = BatchProcessor(
+            tokenizer=tokenizer,
+            max_length=config.max_length,
+            cite_token=config.cite_token,
+            ref_token=config.ref_token,
+            batch_size=batch_size
+        )
         self.processed_samples = self._preprocess_samples(sources, targets, verbose)
 
     def _preprocess_samples(
@@ -204,96 +328,51 @@ class CitationDataset(Dataset):
         targets: List[str],
         verbose: bool
     ) -> List[Dict[str, torch.Tensor]]:
-        """Preprocess and validate all samples."""
+        """Preprocess samples in batches."""
+        total_samples = len(sources)
+        batch_size = self.processor.batch_size
         processed_samples = []
-        stats = {'skipped_no_cite': 0, 'skipped_errors': 0, 'processed': 0}
+        total_stats = DatasetStats(total_samples=total_samples)
         
-        for idx, (source, target) in enumerate(zip(sources, targets)):
-            try:
-                sample = self._process_single_sample(source, target)
-                if sample:
-                    processed_samples.append(sample)
-                    stats['processed'] += 1
-                else:
-                    stats['skipped_no_cite'] += 1
-            except Exception as e:
-                stats['skipped_errors'] += 1
-                if verbose:
-                    print(f"Error processing sample {idx}: {str(e)}")
+        # Process in batches with progress bar
+        iterator = range(0, total_samples, batch_size)
+        if verbose:
+            iterator = tqdm(iterator, desc="Processing samples", unit="batch")
+        
+        for start_idx in iterator:
+            end_idx = min(start_idx + batch_size, total_samples)
+            batch_sources = sources[start_idx:end_idx]
+            batch_targets = targets[start_idx:end_idx]
             
-            if verbose and (idx + 1) % 10000 == 0:
-                print(f"Processed {idx + 1} samples...")
+            try:
+                batch_samples, batch_stats = self.processor.process_batch(
+                    batch_sources,
+                    batch_targets
+                )
+                processed_samples.extend(batch_samples)
+                total_stats.update(
+                    processed=batch_stats.processed,
+                    skipped_no_cite=batch_stats.skipped_no_cite,
+                    skipped_errors=batch_stats.skipped_errors
+                )
+                
+            except Exception as e:
+                if verbose:
+                    print(f"Error processing batch {start_idx}-{end_idx}: {str(e)}")
+                total_stats.update(skipped_errors=end_idx - start_idx)
         
         if verbose:
-            print(f"Preprocessing stats: {stats}")
+            print("\nPreprocessing Statistics:")
+            print(str(total_stats))
         
         return processed_samples
-
-    def _process_single_sample(
-        self,
-        source: str,
-        target: str
-    ) -> Optional[Dict[str, torch.Tensor]]:
-        """Process a single source-target pair."""
-        # Tokenize inputs
-        source_tokens = self.tokenizer(
-            source,
-            padding='max_length',
-            truncation=True,
-            max_length=self.config.max_length,
-            return_tensors='pt'
-        )
-        
-        target_tokens = self.tokenizer(
-            target,
-            padding='max_length',
-            truncation=True,
-            max_length=self.config.max_length,
-            return_tensors='pt'
-        )
-        
-        # Ensure reference token in target
-        target_tokens['input_ids'] = self._ensure_ref_token(target_tokens['input_ids'])
-        
-        # Check if citation token exists in source
-        cite_token_id = self.tokenizer.convert_tokens_to_ids(self.config.cite_token)
-        if cite_token_id not in source_tokens['input_ids'][0]:
-            return None
-        
-        return {
-            'source_input_ids': source_tokens['input_ids'].squeeze(0),
-            'source_attention_mask': source_tokens['attention_mask'].squeeze(0),
-            'target_input_ids': target_tokens['input_ids'].squeeze(0),
-            'target_attention_mask': target_tokens['attention_mask'].squeeze(0)
-        }
-
-    def _ensure_ref_token(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Ensure reference token is present in the sequence."""
-        ref_token_id = self.tokenizer.convert_tokens_to_ids(self.config.ref_token)
-        pad_token_id = self.tokenizer.pad_token_id
-        
-        for i in range(tokens.size(0)):
-            sequence = tokens[i]
-            ref_positions = (sequence == ref_token_id).nonzero()
-            
-            if len(ref_positions) == 0:
-                # Add ref token at last non-pad position
-                non_pad_positions = (sequence != pad_token_id).nonzero()
-                if len(non_pad_positions) > 0:
-                    last_non_pad_pos = non_pad_positions[-1]
-                    sequence[last_non_pad_pos] = ref_token_id
-            elif len(ref_positions) > 1:
-                # Keep only the last ref token
-                for pos in ref_positions[:-1]:
-                    sequence[pos] = self.tokenizer.convert_tokens_to_ids(self.tokenizer.unk_token)
-        
-        return tokens
 
     def __len__(self) -> int:
         return len(self.processed_samples)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         return self.processed_samples[idx]
+
 
 def create_dataloader(
     dataset: CitationDataset,
