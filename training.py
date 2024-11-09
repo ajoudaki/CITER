@@ -238,6 +238,7 @@ def train_model(
             print(f"Validation Loss: {metrics.val_loss:.4f}")
             print(f"Best Top-1 Accuracy: {metrics.top_k_accuracy[1]:.4f}")
             print(f"Mean Reciprocal Rank: {metrics.mrr:.4f}")
+            print(f"Validation Size: {metrics.val_size}")
             # top k accuracies
             [print(f"Top-{k} Accuracy: {v:.3f}") for k, v in metrics.top_k_accuracy.items()]
     
