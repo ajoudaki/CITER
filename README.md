@@ -12,8 +12,9 @@ This repository contains a deep learning model for matching citations in Wikiped
 - Comprehensive evaluation metrics for citation matching
 
 ## Project Structure
+```text
 citation-matcher/
 ├── data_processing.py
 ├── modeling.py
 ├── training.py
-└── main.ipynb: main 
+└── main.ipynb: main```
