@@ -1,6 +1,5 @@
 # Citation Matcher
 
-## Overview
 This repository contains a deep learning model for matching citations in Wikipedia articles. The system learns to identify and link appropriate citations by understanding the context in which they appear and the content of the cited articles. The main idea is to implement this as a retrieval: we want the model to be able to embed the citing page (with the text of citation masked) and the target in a vector space, such that these vectors are close. Thus, given a page with a reference masked, we can retrieve pages that are likely to be at that location. 
 
 ## Predicting citations as a retrieval problem
@@ -25,4 +24,5 @@ citation-matcher/
 ├── data_processing.py
 ├── modeling.py
 ├── training.py
-└── main.ipynb: main```
+└── main.ipynb
+```
