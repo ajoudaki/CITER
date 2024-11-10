@@ -1,0 +1,810 @@
+from dataclasses import dataclass
+from typing import List, Dict, Tuple, Iterator, Union, Optional
+import xml.etree.ElementTree as ET
+import bz2
+import json
+import sqlite3
+from pathlib import Path
+import re
+import numpy as np
+import torch
+import torch.nn as nn
+from transformers import AutoTokenizer, AutoModel
+from torch.utils.data import Dataset, DataLoader
+from tqdm.auto import tqdm
+import os
+import logging
+from datetime import datetime
+
+@dataclass
+class WikiArticle:
+    """Represents a Wikipedia article with its metadata."""
+    title: str
+    text: str
+    timestamp: str
+    is_redirect: bool
+
+class WikiDumpProcessor:
+    """Processes Wikipedia XML dumps and extracts articles."""
+    
+    def __init__(self, dump_path: str):
+        self.dump_path = dump_path
+        self._ns = {'mw': 'http://www.mediawiki.org/xml/export-0.10/'}
+        self._skip_prefixes = {
+            'Wikipedia:', 'Template:', 'Category:', 'Portal:', 'File:', 
+            'MediaWiki:', 'Help:', 'Book:', 'Draft:', 'TimedText:', 
+            'Module:', 'Special:'
+        }
+
+    def iter_articles(self, skip_redirects: bool = True) -> Iterator[WikiArticle]:
+        """Iterates through valid articles in the dump."""
+        dump_file = bz2.BZ2File(self.dump_path) if self.dump_path.endswith('.bz2') else open(self.dump_path, 'rb')
+        
+        for _, elem in ET.iterparse(dump_file, events=('end',)):
+            if not elem.tag.endswith('page'):
+                continue
+
+            # Extract basic article data
+            title = elem.find('.//mw:title', self._ns).text
+            if any(title.startswith(prefix) for prefix in self._skip_prefixes):
+                elem.clear()
+                continue
+
+            # Get revision data
+            rev = elem.find('.//mw:revision', self._ns)
+            text = rev.find('mw:text', self._ns).text if rev is not None else ''
+            timestamp = rev.find('mw:timestamp', self._ns).text if rev is not None else ''
+            is_redirect = bool(re.match(r'#REDIRECT', text or '', re.IGNORECASE))
+
+            if skip_redirects and is_redirect:
+                elem.clear()
+                continue
+
+            yield WikiArticle(title=title, text=text, timestamp=timestamp, is_redirect=is_redirect)
+            elem.clear()
+
+class ArticleStorage:
+    """Handles storage and retrieval of Wikipedia articles."""
+    
+    def __init__(self, processor: WikiDumpProcessor):
+        self.processor = processor
+
+    def save_to_jsonl(self, output_path: Union[str, Path], sample_size: Optional[int] = None) -> int:
+        """Saves articles to a JSONL file."""
+        count = 0
+        with open(output_path, 'w', encoding='utf-8') as f:
+            for i, article in enumerate(self.processor.iter_articles()):
+                if sample_size is not None and i >= sample_size:
+                    break
+                json.dump(article.__dict__, f, ensure_ascii=False)
+                f.write('\n')
+                count += 1
+        return count
+
+    def save_to_sqlite(self, db_path: Union[str, Path], sample_size: Optional[int] = None,
+                      batch_size: int = 1000) -> int:
+        """Saves articles to a SQLite database."""
+        conn = sqlite3.connect(db_path)
+        c = conn.cursor()
+        
+        c.execute('''CREATE TABLE IF NOT EXISTS articles
+                    (title TEXT PRIMARY KEY, text TEXT, timestamp TEXT, is_redirect INTEGER)''')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_title ON articles(title)')
+        
+        count = 0
+        batch = []
+        
+        try:
+            for i, article in enumerate(self.processor.iter_articles()):
+                if sample_size is not None and i >= sample_size:
+                    break
+                    
+                batch.append((article.title, article.text, article.timestamp, 
+                            1 if article.is_redirect else 0))
+                
+                if len(batch) >= batch_size:
+                    c.executemany('INSERT OR REPLACE INTO articles VALUES (?, ?, ?, ?)', batch)
+                    conn.commit()
+                    count += len(batch)
+                    batch = []
+            
+            if batch:
+                c.executemany('INSERT OR REPLACE INTO articles VALUES (?, ?, ?, ?)', batch)
+                conn.commit()
+                count += len(batch)
+                
+        finally:
+            conn.close()
+            
+        return count
+
+class CitationDataPreprocessor:
+    """Prepares citation data for model training."""
+    
+    def __init__(self, articles_dict: Dict[str, str]):
+        self.articles_dict = articles_dict
+
+    def create_citation_pairs(self, sample_size: int = 1000, cite_samples_per_article: int = 1) -> Tuple[List[str], List[str]]:
+        """Creates source-target pairs for citation matching."""
+        articles = np.random.permutation(list(self.articles_dict.keys()))[:sample_size]
+        sources, targets = [], []
+        
+        for title in articles:
+            text = self.articles_dict[title]
+            citations = [cit.split('|')[0] for cit in re.findall(r'\[\[(.*?)\]\]', text)]
+            valid_citations = [c for c in citations if c.lower() in self.articles_dict]
+            
+            if not valid_citations:
+                continue
+                
+            for citation in np.random.choice(valid_citations, 
+                                           min(cite_samples_per_article, len(valid_citations)), 
+                                           replace=False):
+                try:
+                    # Clean and prepare content
+                    source_text = self._clean_wiki_text(text)
+                    source_text = source_text.replace(f"[[{citation}]]", "<CITE>")
+                    target_text = f"{self._clean_wiki_text(self.articles_dict[citation.lower()])} <REF>"
+                    
+                    sources.append(source_text)
+                    targets.append(target_text)
+                except Exception:
+                    continue
+        
+        return sources, targets
+
+    @staticmethod
+    def _clean_wiki_text(text: str) -> str:
+        """Cleans wiki content by removing metadata and formatting."""
+        # Find main content starting from first bold title
+        match = re.search(r"'''([^']+?)'''", text)
+        if match:
+            text = text[match.start():]
+        
+        # Remove wiki elements and clean up
+        text = re.sub(r'\[\[Category:.*?\]\]|\[\[File:.*?\]\]|\{\{stub\}\}', '', text)
+        return '\n'.join(line for line in text.split('\n') if line.strip())
+    
+@dataclass
+class ModelConfig:
+    """Configuration for the citation matching model."""
+    model_name: str = "bert-base-uncased"
+    max_length: int = 512
+    cite_token: str = "<CITE>"
+    ref_token: str = "<REF>"
+    temperature: float = 0.07
+    device: Optional[torch.device] = None
+
+    def __post_init__(self):
+        if self.device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+class CitationMatcher(nn.Module):
+    """Main citation matching model with integrated text encoding."""
+    
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.config = config
+        
+        # Initialize tokenizer and add special tokens
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            config.model_name,
+            use_fast=True,
+            add_prefix_space=True
+        )
+        self.tokenizer.add_special_tokens({
+            'additional_special_tokens': [config.cite_token, config.ref_token]
+        })
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        
+        # Initialize model
+        self.model = AutoModel.from_pretrained(config.model_name).to(config.device)
+        self.model.resize_token_embeddings(len(self.tokenizer))
+
+    def _extract_token_embedding(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        token_id: int
+    ) -> torch.Tensor:
+        """Extracts and normalizes embeddings for a specific token."""
+        batch_size = input_ids.size(0)
+        embeddings = []
+        
+        for batch_idx in range(batch_size):
+            token_positions = (input_ids[batch_idx] == token_id).nonzero()
+            if len(token_positions) == 0:
+                raise ValueError(f"Token ID {token_id} not found in sequence {batch_idx}")
+            position = token_positions[-1].item()
+            embeddings.append(hidden_states[batch_idx, position, :])
+        
+        embeddings = torch.stack(embeddings)
+        return nn.functional.normalize(embeddings, dim=-1)
+
+    def _encode_text(self, text: str, token_id: int) -> torch.Tensor:
+        """Encodes text and extracts normalized token embedding."""
+        inputs = self.tokenizer(
+            text,
+            padding=True,
+            truncation=True,
+            max_length=self.config.max_length,
+            return_tensors="pt"
+        ).to(self.config.device)
+        
+        outputs = self.model(**inputs, return_dict=True)
+        return self._extract_token_embedding(
+            outputs.last_hidden_state,
+            inputs['input_ids'],
+            token_id
+        )
+
+    def forward(
+        self,
+        source_contexts: List[str],
+        target_pages: List[str]
+    ) -> torch.Tensor:
+        """Compute similarity between source and target pages."""
+        cite_token_id = self.tokenizer.convert_tokens_to_ids(self.config.cite_token)
+        ref_token_id = self.tokenizer.convert_tokens_to_ids(self.config.ref_token)
+        
+        # Encode all texts
+        source_embeddings = torch.cat([
+            self._encode_text(ctx, cite_token_id) for ctx in source_contexts
+        ], dim=0)
+        
+        target_embeddings = torch.cat([
+            self._encode_text(page, ref_token_id) for page in target_pages
+        ], dim=0)
+        
+        # Compute similarity matrix
+        return torch.matmul(
+            source_embeddings,
+            target_embeddings.transpose(0, 1)
+        ) / self.config.temperature
+
+class CitationDataset(Dataset):
+    """Dataset for citation matching with optimized batch processing."""
+    
+    def __init__(
+        self,
+        sources: List[str],
+        targets: List[str],
+        tokenizer: AutoTokenizer,
+        config: ModelConfig,
+        batch_size: int = 1024,
+        verbose: bool = True
+    ):
+        assert len(sources) == len(targets), "Sources and targets must have same length"
+        self.processed_samples = self._preprocess_samples(
+            sources, targets, tokenizer, config, batch_size, verbose
+        )
+
+    def _ensure_ref_token_batch(
+        self,
+        tokens: torch.Tensor,
+        ref_token_id: int,
+        pad_token_id: int
+    ) -> torch.Tensor:
+        """Ensure reference token is present in batch of sequences."""
+        # Find sequences missing ref token
+        has_ref = (tokens == ref_token_id).any(dim=1)
+        missing_ref = ~has_ref
+
+        if missing_ref.any():
+            # Find last non-pad position for sequences missing ref token
+            pad_mask = (tokens != pad_token_id)
+            last_nonpad = pad_mask.long().argmax(dim=1)
+            
+            # Add ref token at last non-pad position
+            missing_indices = missing_ref.nonzero(as_tuple=True)[0]
+            tokens[missing_indices, last_nonpad[missing_indices]] = ref_token_id
+        
+        return tokens
+
+    def _preprocess_samples(
+        self,
+        sources: List[str],
+        targets: List[str],
+        tokenizer: AutoTokenizer,
+        config: ModelConfig,
+        batch_size: int,
+        verbose: bool
+    ) -> List[Dict[str, torch.Tensor]]:
+        """Preprocess samples with optimized batch processing."""
+        total_samples = len(sources)
+        processed_samples = []
+        total_processed = 0
+        total_skipped = 0
+        
+        # Process in batches
+        iterator = range(0, total_samples, batch_size)
+        if verbose:
+            iterator = tqdm(iterator, desc="Processing samples", unit="batch")
+        
+        cite_token_id = tokenizer.convert_tokens_to_ids(config.cite_token)
+        ref_token_id = tokenizer.convert_tokens_to_ids(config.ref_token)
+        
+        for start_idx in iterator:
+            end_idx = min(start_idx + batch_size, total_samples)
+            batch_sources = sources[start_idx:end_idx]
+            batch_targets = targets[start_idx:end_idx]
+            
+            # Batch tokenization
+            source_tokens = tokenizer(
+                batch_sources,
+                padding='max_length',
+                truncation=True,
+                max_length=config.max_length,
+                return_tensors='pt'
+            )
+            
+            target_tokens = tokenizer(
+                batch_targets,
+                padding='max_length',
+                truncation=True,
+                max_length=config.max_length,
+                return_tensors='pt'
+            )
+            
+            # Process source tokens
+            has_citation = (source_tokens['input_ids'] == cite_token_id).any(dim=1)
+            valid_indices = has_citation.nonzero(as_tuple=True)[0]
+            
+            # Update statistics
+            total_processed += len(valid_indices)
+            total_skipped += len(batch_sources) - len(valid_indices)
+            
+            if len(valid_indices) == 0:
+                continue
+            
+            # Ensure ref token in target sequences
+            target_tokens['input_ids'] = self._ensure_ref_token_batch(
+                target_tokens['input_ids'],
+                ref_token_id,
+                tokenizer.pad_token_id
+            )
+            
+            # Create samples for valid sequences
+            for idx in valid_indices:
+                processed_samples.append({
+                    'source_input_ids': source_tokens['input_ids'][idx],
+                    'source_attention_mask': source_tokens['attention_mask'][idx],
+                    'target_input_ids': target_tokens['input_ids'][idx],
+                    'target_attention_mask': target_tokens['attention_mask'][idx]
+                })
+        
+        if verbose:
+            print(f"\nProcessed {total_processed} samples")
+            print(f"Skipped {total_skipped} samples without citation")
+        
+        return processed_samples
+
+    def __len__(self) -> int:
+        return len(self.processed_samples)
+
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        return self.processed_samples[idx]
+
+def create_dataloader(
+    dataset: CitationDataset,
+    batch_size: int,
+    shuffle: bool = True,
+    num_workers: int = 4
+) -> DataLoader:
+    """Creates a DataLoader for the citation dataset."""
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        collate_fn=lambda batch: {
+            key: torch.stack([item[key] for item in batch])
+            for key in batch[0].keys()
+        },
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2
+    )
+
+
+@dataclass
+class TrainingConfig:
+    """Configuration for model training."""
+    batch_size: int = 32
+    num_epochs: int = 10
+    learning_rate: float = 1.5e-4
+    temperature: float = 0.1
+    num_workers: int = 4
+    gradient_clip_value: float = 1.0
+    scheduler_patience: int = 2
+    scheduler_factor: float = 0.5
+    eval_k_values: List[int] = None
+
+    def __post_init__(self):
+        if self.eval_k_values is None:
+            self.eval_k_values = [1, 3, 5, 10, 50]
+
+@dataclass
+class TrainingMetrics:
+    """Stores training and validation metrics."""
+    train_loss: float
+    val_loss: float
+    top_k_accuracy: Dict[int, float]
+    mrr: float
+    median_rank: float
+    mean_rank: float
+    val_size: int
+
+class Trainer:
+    """Unified trainer class handling both training and validation."""
+    
+    def __init__(self, model: nn.Module, config: TrainingConfig, save_dir: Path, device: torch.device):
+        self.model = model
+        self.config = config
+        self.save_dir = Path(save_dir)
+        self.device = device
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.criterion = nn.CrossEntropyLoss()
+        self.optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer,
+            mode='min',
+            factor=config.scheduler_factor,
+            patience=config.scheduler_patience,
+            verbose=True
+        )
+
+    def _get_embeddings(self, batch: Dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Get embeddings for source and target texts."""
+        batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
+        
+        with torch.set_grad_enabled(self.model.training):
+            # Get source embeddings
+            source_out = self.model.model(
+                input_ids=batch['source_input_ids'],
+                attention_mask=batch['source_attention_mask'],
+                output_hidden_states=True,
+                return_dict=True
+            )
+            source_emb = self.model._extract_token_embedding(
+                source_out.last_hidden_state,
+                batch['source_input_ids'],
+                self.model.tokenizer.convert_tokens_to_ids(self.model.config.cite_token)
+            )
+            
+            # Get target embeddings
+            target_out = self.model.model(
+                input_ids=batch['target_input_ids'],
+                attention_mask=batch['target_attention_mask'],
+                output_hidden_states=True,
+                return_dict=True
+            )
+            target_emb = self.model._extract_token_embedding(
+                target_out.last_hidden_state,
+                batch['target_input_ids'],
+                self.model.tokenizer.convert_tokens_to_ids(self.model.config.ref_token)
+            )
+            
+        return source_emb, target_emb
+
+    def train_epoch(self, train_loader: DataLoader) -> float:
+        """Train for one epoch."""
+        self.model.train()
+        total_loss = 0
+        num_batches = 0
+        
+        for batch in tqdm(train_loader, desc='Training'):
+            source_emb, target_emb = self._get_embeddings(batch)
+            
+            # Compute loss
+            similarity = torch.matmul(source_emb, target_emb.transpose(0, 1)) / self.config.temperature
+            labels = torch.arange(similarity.size(0)).to(self.device)
+            loss = self.criterion(similarity, labels)
+            
+            # Optimize
+            self.optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(),
+                self.config.gradient_clip_value
+            )
+            self.optimizer.step()
+            
+            total_loss += loss.item()
+            num_batches += 1
+            
+        return total_loss / num_batches
+
+    def validate(self, val_loader: DataLoader, epoch: int) -> TrainingMetrics:
+        """Validate model and compute metrics."""
+        self.model.eval()
+        
+        # Collect all embeddings
+        all_source_embs = []
+        all_target_embs = []
+        total_loss = 0
+        num_batches = 0
+        
+        for batch in tqdm(val_loader, desc='Validation'):
+            source_emb, target_emb = self._get_embeddings(batch)
+            
+            # Compute validation loss
+            similarity = torch.matmul(source_emb, target_emb.transpose(0, 1)) / self.config.temperature
+            labels = torch.arange(similarity.size(0)).to(self.device)
+            loss = self.criterion(similarity, labels)
+            
+            total_loss += loss.item()
+            num_batches += 1
+            
+            all_source_embs.append(source_emb.cpu())
+            all_target_embs.append(target_emb.cpu())
+        
+        # Concatenate all embeddings
+        source_embeddings = torch.cat(all_source_embs, dim=0)
+        target_embeddings = torch.cat(all_target_embs, dim=0)
+        
+        # Compute metrics
+        metrics = self._compute_metrics(source_embeddings, target_embeddings)
+        metrics.val_loss = total_loss / num_batches
+        
+        # Update scheduler and save model
+        self.scheduler.step(metrics.val_loss)
+        self._save_checkpoint(metrics, epoch)
+        
+        return metrics
+
+    def _compute_metrics(self, source_embs: torch.Tensor, target_embs: torch.Tensor) -> TrainingMetrics:
+        """Compute all validation metrics."""
+        total_samples = source_embs.size(0)
+        chunk_size = 512
+        all_rankings = []
+        
+        # Compute rankings in chunks to avoid OOM
+        for i in range(0, total_samples, chunk_size):
+            chunk_end = min(i + chunk_size, total_samples)
+            source_chunk = source_embs[i:chunk_end].to(self.device)
+            
+            similarity = torch.matmul(source_chunk, target_embs.to(self.device).t()) / self.config.temperature
+            rankings = torch.argsort(similarity, dim=-1, descending=True)
+            all_rankings.append(rankings.cpu())
+            
+            del similarity, source_chunk
+            torch.cuda.empty_cache()
+        
+        rankings = torch.cat(all_rankings, dim=0)
+        
+        # Calculate metrics
+        correct_at_k = {k: 0 for k in self.config.eval_k_values}
+        reciprocal_ranks = []
+        ranks = []
+        
+        for i in range(total_samples):
+            rank = (rankings[i] == i).nonzero().item() + 1
+            ranks.append(rank)
+            reciprocal_ranks.append(1.0 / rank)
+            
+            for k in self.config.eval_k_values:
+                if rank <= k:
+                    correct_at_k[k] += 1
+        
+        return TrainingMetrics(
+            train_loss=0.0,  # Set by train_model
+            val_loss=0.0,    # Set by validate
+            top_k_accuracy={k: count / total_samples for k, count in correct_at_k.items()},
+            mrr=float(np.mean(reciprocal_ranks)),
+            median_rank=float(np.median(ranks)),
+            mean_rank=float(np.mean(ranks)),
+            val_size=total_samples
+        )
+
+    def _save_checkpoint(self, metrics: TrainingMetrics, epoch: int):
+        """Save model checkpoint and metrics."""
+        torch.save(
+            self.model.state_dict(),
+            self.save_dir / f'model_epoch_{epoch}.pt'
+        )
+        torch.save(
+            metrics.__dict__,
+            self.save_dir / f'metrics_epoch_{epoch}.pt'
+        )
+
+def train_model(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: Optional[DataLoader],
+    config: TrainingConfig,
+    save_dir: Path,
+    device: torch.device
+) -> List[TrainingMetrics]:
+    """Main training loop."""
+    trainer = Trainer(model, config, save_dir, device)
+    metrics_history = []
+    
+    for epoch in range(config.num_epochs):
+        print(f"\nEpoch {epoch + 1}/{config.num_epochs}")
+        
+        # Training phase
+        train_loss = trainer.train_epoch(train_loader)
+        
+        # Validation phase
+        if val_loader:
+            metrics = trainer.validate(val_loader, epoch)
+            metrics.train_loss = train_loss
+            metrics_history.append(metrics)
+            
+            print(f"\nEpoch {epoch + 1} Summary:")
+            print(f"Training Loss: {train_loss:.4f}")
+            print(f"Validation Loss: {metrics.val_loss:.4f}")
+            print(f"Best Top-1 Accuracy: {metrics.top_k_accuracy[1]:.4f}")
+            print(f"Mean Reciprocal Rank: {metrics.mrr:.4f}")
+            print(f"Validation Size: {metrics.val_size}")
+            # top k accuracies
+            [print(f"Top-{k} Accuracy: {v:.3f}") for k, v in metrics.top_k_accuracy.items()]
+    
+    return metrics_history
+
+def setup_logging(output_dir: Path) -> None:
+    """Configure logging for the training process."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(output_dir / 'training.log'),
+            logging.StreamHandler()
+        ]
+    )
+
+def setup_environment() -> None:
+    """Configure training environment."""
+    # Set environment variables
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    
+    # Set random seeds for reproducibility
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+
+def create_output_directory() -> Path:
+    """Create and return output directory for this training run."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = Path(f"training_runs/run_{timestamp}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+def load_and_prepare_data(
+    jsonl_path: str,
+    train_sample_size: int,
+    val_sample_size: int
+) -> tuple:
+    """Load and prepare training and validation data."""
+    logging.info("Loading articles from JSONL file...")
+    articles_dict = {}
+    with open(jsonl_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            article = json.loads(line)
+            articles_dict[article['title'].lower()] = article['text']
+    
+    logging.info(f"Loaded {len(articles_dict)} articles")
+    
+    # Prepare citation data
+    preprocessor = CitationDataPreprocessor(articles_dict)
+    
+    logging.info("Preparing training data...")
+    train_sources, train_targets = preprocessor.create_citation_pairs(
+        sample_size=train_sample_size,
+        cite_samples_per_article=1
+    )
+
+    S = set(train_sources)
+    T = set(train_targets)
+    
+    logging.info("Preparing validation data...")
+    val_sources, val_targets = preprocessor.create_citation_pairs(
+        sample_size=val_sample_size,
+        cite_samples_per_article=10
+    )
+
+    # Remove any validation samples that are also in the training set
+    val_sources, val_targets = zip(*[
+        (source, target) for source, target in zip(val_sources, val_targets)
+        if source not in S and target not in T
+    ])
+    
+    return train_sources, train_targets, val_sources, val_targets
+
+
+def main():
+    # Setup
+    output_dir = create_output_directory()
+    setup_logging(output_dir)
+    setup_environment()
+    
+    # Configuration
+    model_config = ModelConfig(
+        model_name="bert-base-uncased",
+        max_length=512,
+        cite_token="<CITE>",
+        ref_token="<REF>",
+        temperature=0.07
+    )
+    
+    training_config = TrainingConfig(
+        batch_size=32,
+        num_epochs=10,
+        learning_rate=1.5e-4,
+        temperature=0.1,
+        num_workers=4,
+        gradient_clip_value=1.0,
+        scheduler_patience=2,
+        scheduler_factor=0.5,
+        eval_k_values=[1, 5, 10, 50]
+    )
+    
+    # Data preparation
+    train_sources, train_targets, val_sources, val_targets = load_and_prepare_data(
+        jsonl_path='./data/wiki_articles.jsonl',
+        train_sample_size=500,
+        val_sample_size=100
+    )
+    
+    # Model initialization
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logging.info(f"Using device: {device}")
+    
+    model = CitationMatcher(model_config).to(device)
+    
+    # Create datasets and dataloaders
+    train_dataset = CitationDataset(
+        sources=train_sources,
+        targets=train_targets,
+        tokenizer=model.tokenizer,
+        config=model_config,
+        verbose=True
+    )
+    
+    val_dataset = CitationDataset(
+        sources=val_sources,
+        targets=val_targets,
+        tokenizer=model.tokenizer,
+        config=model_config,
+        verbose=True
+    )
+    
+    train_loader = create_dataloader(
+        dataset=train_dataset,
+        batch_size=training_config.batch_size,
+        shuffle=True,
+        num_workers=training_config.num_workers
+    )
+    
+    val_loader = create_dataloader(
+        dataset=val_dataset,
+        batch_size=training_config.batch_size * 2,
+        shuffle=False,
+        num_workers=training_config.num_workers
+    )
+    
+    # Training
+    logging.info("Starting training...")
+    metrics_history = train_model(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        config=training_config,
+        save_dir=output_dir / 'checkpoints',
+        device=device
+    )
+    
+    # Save training history
+    torch.save(
+        {
+            'metrics_history': [metric.__dict__ for metric in metrics_history],
+            'model_config': model_config.__dict__,
+            'training_config': training_config.__dict__
+        },
+        output_dir / 'training_history.pt'
+    )
+    
+    logging.info(f"Training completed. Results saved to {output_dir}")
