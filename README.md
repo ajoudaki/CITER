@@ -17,12 +17,3 @@ This repository contains a deep learning model for matching citations in Wikiped
     - Top-k accuracy: the recall of finding the right target, if we look at the first $k$ closest vectors
     - Mean Reciprocal Rank: the mean value of $\frac1N \sum_i 1/r_i$ where, where $r_i$ is the rank of the true target for source $i$
 
-
-## Project Structure
-```text
-citation-matcher/
-├── data_processing.py
-├── modeling.py
-├── training.py
-└── main.ipynb
-```
