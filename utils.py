@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Dict, Tuple, Iterator, Union, Optional
 import xml.etree.ElementTree as ET
 import bz2
@@ -9,12 +9,14 @@ import re
 import numpy as np
 import torch
 import torch.nn as nn
-from transformers import AutoTokenizer, AutoModel
 from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer, AutoModel
 from tqdm.auto import tqdm
 import os
 import logging
 from datetime import datetime
+import torch.cuda.amp  # For automatic mixed precision
+import yaml
 
 @dataclass
 class WikiArticle:
@@ -23,6 +25,88 @@ class WikiArticle:
     text: str
     timestamp: str
     is_redirect: bool
+
+@dataclass
+class ModelConfig:
+    """Configuration for the citation matching model."""
+    model_name: str = "bert-base-uncased"
+    max_length: int = 512
+    cite_token: str = "<CITE>"
+    ref_token: str = "<REF>"
+    temperature: float = 0.07
+    device: Optional[torch.device] = None
+
+    def __post_init__(self):
+        if self.device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+@dataclass
+class TrainingConfig:
+    """Configuration for model training."""
+    batch_size: int = 32
+    num_epochs: int = 10
+    learning_rate: float = 1.5e-4
+    temperature: float = 0.1
+    num_workers: int = 4
+    gradient_clip_value: float = 1.0
+    scheduler_patience: int = 2
+    scheduler_factor: float = 0.5
+    eval_k_values: List[int] = field(default_factory=lambda: [1, 3, 5, 10, 50])
+
+@dataclass
+class DataConfig:
+    """Configuration for data preparation and loading."""
+    data_path: str = "./data/wiki_articles.jsonl"
+    train_sample_size: int = 1000
+    val_sample_size: int = 100
+    val_samples_per_article: int = 10
+    train_samples_per_article: int = 1
+
+@dataclass
+class ExperimentConfig:
+    """Unified configuration for the entire experiment."""
+    experiment_name: str
+    output_dir: str = "experiments"
+    model: ModelConfig = field(default_factory=ModelConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
+    data: DataConfig = field(default_factory=DataConfig)
+
+    @classmethod
+    def from_yaml(cls, yaml_path: str) -> 'ExperimentConfig':
+        """Load configuration from a YAML file."""
+        with open(yaml_path, 'r') as f:
+            config_dict = yaml.safe_load(f)
+
+        # Create nested dataclass instances
+        model_config = ModelConfig(**config_dict.get('model', {}))
+        training_config = TrainingConfig(**config_dict.get('training', {}))
+        data_config = DataConfig(**config_dict.get('data', {}))
+
+        return cls(
+            experiment_name=config_dict['experiment_name'],
+            output_dir=config_dict.get('output_dir', 'experiments'),
+            model=model_config,
+            training=training_config,
+            data=data_config
+        )
+
+    def save_yaml(self, output_path: str) -> None:
+        """Save configuration to a YAML file."""
+        config_dict = {
+            'experiment_name': self.experiment_name,
+            'output_dir': self.output_dir,
+            'model': {k: v for k, v in self.model.__dict__.items() if not k.startswith('_')},
+            'training': self.training.__dict__,
+            'data': self.data.__dict__
+        }
+        
+        # Remove device from model config as it can't be serialized
+        if 'device' in config_dict['model']:
+            del config_dict['model']['device']
+
+        with open(output_path, 'w') as f:
+            yaml.dump(config_dict, f, default_flow_style=False)
+
 
 class WikiDumpProcessor:
     """Processes Wikipedia XML dumps and extracts articles."""
@@ -165,19 +249,6 @@ class CitationDataPreprocessor:
         text = re.sub(r'\[\[Category:.*?\]\]|\[\[File:.*?\]\]|\{\{stub\}\}', '', text)
         return '\n'.join(line for line in text.split('\n') if line.strip())
     
-@dataclass
-class ModelConfig:
-    """Configuration for the citation matching model."""
-    model_name: str = "bert-base-uncased"
-    max_length: int = 512
-    cite_token: str = "<CITE>"
-    ref_token: str = "<REF>"
-    temperature: float = 0.07
-    device: Optional[torch.device] = None
-
-    def __post_init__(self):
-        if self.device is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 class CitationMatcher(nn.Module):
     """Main citation matching model with integrated text encoding."""
@@ -407,23 +478,6 @@ def create_dataloader(
         prefetch_factor=2
     )
 
-
-@dataclass
-class TrainingConfig:
-    """Configuration for model training."""
-    batch_size: int = 32
-    num_epochs: int = 10
-    learning_rate: float = 1.5e-4
-    temperature: float = 0.1
-    num_workers: int = 4
-    gradient_clip_value: float = 1.0
-    scheduler_patience: int = 2
-    scheduler_factor: float = 0.5
-    eval_k_values: List[int] = None
-
-    def __post_init__(self):
-        if self.eval_k_values is None:
-            self.eval_k_values = [1, 3, 5, 10, 50]
 
 @dataclass
 class TrainingMetrics:
@@ -676,7 +730,9 @@ def create_output_directory() -> Path:
 def load_and_prepare_data(
     jsonl_path: str,
     train_sample_size: int,
-    val_sample_size: int
+    val_sample_size: int,
+    train_samples_per_article: int = 1,
+    val_samples_per_article: int = 10
 ) -> tuple:
     """Load and prepare training and validation data."""
     logging.info("Loading articles from JSONL file...")
@@ -694,7 +750,7 @@ def load_and_prepare_data(
     logging.info("Preparing training data...")
     train_sources, train_targets = preprocessor.create_citation_pairs(
         sample_size=train_sample_size,
-        cite_samples_per_article=1
+        cite_samples_per_article=train_samples_per_article
     )
 
     S = set(train_sources)
@@ -703,7 +759,7 @@ def load_and_prepare_data(
     logging.info("Preparing validation data...")
     val_sources, val_targets = preprocessor.create_citation_pairs(
         sample_size=val_sample_size,
-        cite_samples_per_article=10
+        cite_samples_per_article=val_samples_per_article
     )
 
     # Remove any validation samples that are also in the training set
@@ -714,53 +770,43 @@ def load_and_prepare_data(
     
     return train_sources, train_targets, val_sources, val_targets
 
-
-def main():
+def main(config_path: Optional[str] = None) -> List[TrainingMetrics]:
+    """Main training pipeline with configuration support."""
+    # Load configuration
+    if config_path:
+        config = ExperimentConfig.from_yaml(config_path)
+    else:
+        config = ExperimentConfig(experiment_name="default_experiment")
+    
+    # Create output directory
+    output_dir = Path(config.output_dir) / config.experiment_name
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save configuration
+    config.save_yaml(output_dir / "config.yaml")
+    
     # Setup
-    output_dir = create_output_directory()
     setup_logging(output_dir)
     setup_environment()
     
-    # Configuration
-    model_config = ModelConfig(
-        model_name="bert-base-uncased",
-        max_length=512,
-        cite_token="<CITE>",
-        ref_token="<REF>",
-        temperature=0.07
-    )
-    
-    training_config = TrainingConfig(
-        batch_size=32,
-        num_epochs=10,
-        learning_rate=1.5e-4,
-        temperature=0.1,
-        num_workers=4,
-        gradient_clip_value=1.0,
-        scheduler_patience=2,
-        scheduler_factor=0.5,
-        eval_k_values=[1, 5, 10, 50]
-    )
-    
     # Data preparation
     train_sources, train_targets, val_sources, val_targets = load_and_prepare_data(
-        jsonl_path='./data/wiki_articles.jsonl',
-        train_sample_size=500,
-        val_sample_size=100
+        jsonl_path=config.data.data_path,
+        train_sample_size=config.data.train_sample_size,
+        val_sample_size=config.data.val_sample_size,
+        train_samples_per_article=config.data.train_samples_per_article,
+        val_samples_per_article=config.data.val_samples_per_article
     )
     
     # Model initialization
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logging.info(f"Using device: {device}")
-    
-    model = CitationMatcher(model_config).to(device)
+    model = CitationMatcher(config.model).to(config.model.device)
     
     # Create datasets and dataloaders
     train_dataset = CitationDataset(
         sources=train_sources,
         targets=train_targets,
         tokenizer=model.tokenizer,
-        config=model_config,
+        config=config.model,
         verbose=True
     )
     
@@ -768,22 +814,22 @@ def main():
         sources=val_sources,
         targets=val_targets,
         tokenizer=model.tokenizer,
-        config=model_config,
+        config=config.model,
         verbose=True
     )
     
     train_loader = create_dataloader(
         dataset=train_dataset,
-        batch_size=training_config.batch_size,
+        batch_size=config.training.batch_size,
         shuffle=True,
-        num_workers=training_config.num_workers
+        num_workers=config.training.num_workers
     )
     
     val_loader = create_dataloader(
         dataset=val_dataset,
-        batch_size=training_config.batch_size * 2,
+        batch_size=config.training.batch_size * 2,
         shuffle=False,
-        num_workers=training_config.num_workers
+        num_workers=config.training.num_workers
     )
     
     # Training
@@ -792,19 +838,21 @@ def main():
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
-        config=training_config,
+        config=config.training,
         save_dir=output_dir / 'checkpoints',
-        device=device
+        device=config.model.device
     )
     
     # Save training history
     torch.save(
         {
             'metrics_history': [metric.__dict__ for metric in metrics_history],
-            'model_config': model_config.__dict__,
-            'training_config': training_config.__dict__
+            'model_config': config.model.__dict__,
+            'training_config': config.training.__dict__,
+            'data_config': config.data.__dict__
         },
         output_dir / 'training_history.pt'
     )
     
     logging.info(f"Training completed. Results saved to {output_dir}")
+    return metrics_history
