@@ -73,7 +73,7 @@ class CitationMatcher(nn.Module):
             return_tensors="pt"
         ).to(self.config.device)
         
-        outputs = self.model(**inputs, output_hidden_states=True, return_dict=True)
+        outputs = self.model(**inputs, return_dict=True)
         return self._extract_token_embedding(
             outputs.last_hidden_state,
             inputs['input_ids'],
