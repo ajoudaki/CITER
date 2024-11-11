@@ -17,3 +17,27 @@ This repository contains a deep learning model for matching citations in Wikiped
     - Top-k accuracy: the recall of finding the right target, if we look at the first $k$ closest vectors
     - Mean Reciprocal Rank: the mean value of $\frac1N \sum_i 1/r_i$ where, where $r_i$ is the rank of the true target for source $i$
 
+```mermaid
+graph TD
+    subgraph "Source Pages"
+        S1["The cat is a domestic<br/>species of [&lt;CITE&gt;] mammal"]
+        S2["Mount Everest is in<br/>the [&lt;CITE&gt;] range"]
+    end
+    subgraph "Similarity Matrix"
+        M["     v₁     v₂    <br/>u₁  0.89   0.15<br/>u₂  0.12   0.92"]
+    end
+    subgraph "Target Pages"
+        T1["Mammals are vertebrate<br/>animals with hair. [&lt;REF&gt;]"]
+        T2["The Himalayas contain the<br/>world's highest peaks. [&lt;REF&gt;]"]
+    end
+    S1 --> M
+    S2 --> M
+    M --> T1
+    M --> T2
+    classDef sourceClass fill:#e3f2fd,stroke:#1565c0
+    classDef targetClass fill:#e8f5e9,stroke:#2e7d32
+    classDef matrixClass fill:#fff3e0,stroke:#f57c0
+    class S1,S2 sourceClass
+    class T1,T2 targetClass
+    class M matrixClass
+```
