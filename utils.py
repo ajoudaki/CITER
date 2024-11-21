@@ -202,7 +202,7 @@ class ArticleStorage:
             
         return count
 
-class CitationDataPreprocessor:
+class WikiProcessor:
     """Prepares citation data for model training."""
     
     def __init__(self, articles_dict: Dict[str, str]):
@@ -215,7 +215,7 @@ class CitationDataPreprocessor:
         
         for title in articles:
             text = self.articles_dict[title]
-            citations = [cit.split('|')[0] for cit in re.findall(r'\[\[(.*?)\]\]', text)]
+            citations = [(cit.split('|')[0] if '|' in cit else cit) for cit in re.findall(r'\[\[(.*?)\]\]', text)]
             valid_citations = [c for c in citations if c.lower() in self.articles_dict]
             
             if not valid_citations:
@@ -373,6 +373,34 @@ class CitationDataset(Dataset):
         
         return tokens
 
+    def _extract_citation_context(self, text: str, cite_token: str, window_tokens: int, tokenizer) -> str:
+        """Extract context window around citation token, handling token lengths properly."""
+        # Find citation token position
+        cite_pos = text.find(cite_token)
+        if cite_pos == -1:
+            return text
+            
+        # Split text into before and after citation
+        before_citation = text[:cite_pos]
+        after_citation = text[cite_pos + len(cite_token):]
+        
+        # Tokenize both parts
+        before_tokens = tokenizer.encode(before_citation, add_special_tokens=False)
+        after_tokens = tokenizer.encode(after_citation, add_special_tokens=False)
+        
+        # Calculate how many tokens to keep on each side
+        tokens_per_side = window_tokens // 2
+        
+        # Take tokens from both sides
+        before_context = before_tokens[-tokens_per_side:] if len(before_tokens) > tokens_per_side else before_tokens
+        after_context = after_tokens[:tokens_per_side] if len(after_tokens) > tokens_per_side else after_tokens
+        
+        # Decode back to text
+        before_text = tokenizer.decode(before_context)
+        after_text = tokenizer.decode(after_context)
+        
+        return before_text + cite_token + after_text
+
     def _preprocess_samples(
         self,
         sources: List[str],
@@ -382,7 +410,7 @@ class CitationDataset(Dataset):
         batch_size: int,
         verbose: bool
     ) -> List[Dict[str, torch.Tensor]]:
-        """Preprocess samples with optimized batch processing."""
+        """Preprocess samples with proper token-based context window."""
         total_samples = len(sources)
         processed_samples = []
         total_processed = 0
@@ -396,14 +424,23 @@ class CitationDataset(Dataset):
         cite_token_id = tokenizer.convert_tokens_to_ids(config.cite_token)
         ref_token_id = tokenizer.convert_tokens_to_ids(config.ref_token)
         
+        # Calculate context window in tokens, leaving room for special tokens
+        context_window_size = config.max_length - 2  # Account for [CLS] and [SEP]
+        
         for start_idx in iterator:
             end_idx = min(start_idx + batch_size, total_samples)
             batch_sources = sources[start_idx:end_idx]
             batch_targets = targets[start_idx:end_idx]
             
+            # Extract context for each source text
+            contextualized_sources = [
+                self._extract_citation_context(text, config.cite_token, context_window_size, tokenizer)
+                for text in batch_sources
+            ]
+            
             # Batch tokenization
             source_tokens = tokenizer(
-                batch_sources,
+                contextualized_sources,
                 padding='max_length',
                 truncation=True,
                 max_length=config.max_length,
@@ -418,25 +455,22 @@ class CitationDataset(Dataset):
                 return_tensors='pt'
             )
             
-            # Process source tokens
+            # Rest of processing remains the same...
             has_citation = (source_tokens['input_ids'] == cite_token_id).any(dim=1)
             valid_indices = has_citation.nonzero(as_tuple=True)[0]
             
-            # Update statistics
             total_processed += len(valid_indices)
             total_skipped += len(batch_sources) - len(valid_indices)
             
             if len(valid_indices) == 0:
                 continue
-            
-            # Ensure ref token in target sequences
+                
             target_tokens['input_ids'] = self._ensure_ref_token_batch(
                 target_tokens['input_ids'],
                 ref_token_id,
                 tokenizer.pad_token_id
             )
             
-            # Create samples for valid sequences
             for idx in valid_indices:
                 processed_samples.append({
                     'source_input_ids': source_tokens['input_ids'][idx],
@@ -450,6 +484,84 @@ class CitationDataset(Dataset):
             print(f"Skipped {total_skipped} samples without citation")
         
         return processed_samples
+
+    # def _preprocess_samples(
+    #     self,
+    #     sources: List[str],
+    #     targets: List[str],
+    #     tokenizer: AutoTokenizer,
+    #     config: ModelConfig,
+    #     batch_size: int,
+    #     verbose: bool
+    # ) -> List[Dict[str, torch.Tensor]]:
+    #     """Preprocess samples with optimized batch processing."""
+    #     total_samples = len(sources)
+    #     processed_samples = []
+    #     total_processed = 0
+    #     total_skipped = 0
+        
+    #     # Process in batches
+    #     iterator = range(0, total_samples, batch_size)
+    #     if verbose:
+    #         iterator = tqdm(iterator, desc="Processing samples", unit="batch")
+        
+    #     cite_token_id = tokenizer.convert_tokens_to_ids(config.cite_token)
+    #     ref_token_id = tokenizer.convert_tokens_to_ids(config.ref_token)
+        
+    #     for start_idx in iterator:
+    #         end_idx = min(start_idx + batch_size, total_samples)
+    #         batch_sources = sources[start_idx:end_idx]
+    #         batch_targets = targets[start_idx:end_idx]
+            
+    #         # Batch tokenization
+    #         source_tokens = tokenizer(
+    #             batch_sources,
+    #             padding='max_length',
+    #             truncation=True,
+    #             max_length=config.max_length,
+    #             return_tensors='pt'
+    #         )
+            
+    #         target_tokens = tokenizer(
+    #             batch_targets,
+    #             padding='max_length',
+    #             truncation=True,
+    #             max_length=config.max_length,
+    #             return_tensors='pt'
+    #         )
+            
+    #         # Process source tokens
+    #         has_citation = (source_tokens['input_ids'] == cite_token_id).any(dim=1)
+    #         valid_indices = has_citation.nonzero(as_tuple=True)[0]
+            
+    #         # Update statistics
+    #         total_processed += len(valid_indices)
+    #         total_skipped += len(batch_sources) - len(valid_indices)
+            
+    #         if len(valid_indices) == 0:
+    #             continue
+            
+    #         # Ensure ref token in target sequences
+    #         target_tokens['input_ids'] = self._ensure_ref_token_batch(
+    #             target_tokens['input_ids'],
+    #             ref_token_id,
+    #             tokenizer.pad_token_id
+    #         )
+            
+    #         # Create samples for valid sequences
+    #         for idx in valid_indices:
+    #             processed_samples.append({
+    #                 'source_input_ids': source_tokens['input_ids'][idx],
+    #                 'source_attention_mask': source_tokens['attention_mask'][idx],
+    #                 'target_input_ids': target_tokens['input_ids'][idx],
+    #                 'target_attention_mask': target_tokens['attention_mask'][idx]
+    #             })
+        
+    #     if verbose:
+    #         print(f"\nProcessed {total_processed} samples")
+    #         print(f"Skipped {total_skipped} samples without citation")
+        
+    #     return processed_samples
 
     def __len__(self) -> int:
         return len(self.processed_samples)
@@ -490,16 +602,119 @@ class TrainingMetrics:
     mean_rank: float
     val_size: int
 
-class Trainer:
-    """Unified trainer class handling both training and validation."""
+def setup_logging(output_dir: Path) -> None:
+    """Configure logging for the training process."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler(output_dir / 'training.log'),
+            logging.StreamHandler()
+        ]
+    )
+
+def create_output_directory() -> Path:
+    """Create and return output directory for this training run."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = Path(f"training_runs/run_{timestamp}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
+
+def load_and_prepare_data(
+    jsonl_path: str,
+    train_sample_size: int,
+    val_sample_size: int,
+    train_samples_per_article: int = 1,
+    val_samples_per_article: int = 10
+) -> tuple:
+    """Load and prepare training and validation data."""
+    logging.info("Loading articles from JSONL file...")
+    articles_dict = {}
+    with open(jsonl_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            article = json.loads(line)
+            articles_dict[article['title'].lower()] = article['text']
     
-    def __init__(self, model: nn.Module, config: TrainingConfig, save_dir: Path, device: torch.device):
-        self.model = model
+    logging.info(f"Loaded {len(articles_dict)} articles")
+    
+    # Prepare citation data
+    preprocessor = WikiProcessor(articles_dict)
+    
+    logging.info("Preparing training data...")
+    train_sources, train_targets = preprocessor.create_citation_pairs(
+        sample_size=train_sample_size,
+        cite_samples_per_article=train_samples_per_article
+    )
+
+    S = set(train_sources)
+    T = set(train_targets)
+    
+    logging.info("Preparing validation data...")
+    val_sources, val_targets = preprocessor.create_citation_pairs(
+        sample_size=val_sample_size,
+        cite_samples_per_article=val_samples_per_article
+    )
+
+    # Remove any validation samples that are also in the training set
+    val_sources, val_targets = zip(*[
+        (source, target) for source, target in zip(val_sources, val_targets)
+        if source not in S and target not in T
+    ])
+    
+    return train_sources, train_targets, val_sources, val_targets
+
+
+# New imports needed at the top of the file
+from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
+from typing import Optional, Dict, List, Tuple, Union
+import torch.distributed as dist
+from pathlib import Path
+# Add this at the top of the file with other imports
+from functools import lru_cache
+# Add at the top of your file
+from dataclasses import dataclass, field
+from accelerate.state import AcceleratorState
+from accelerate.utils import DistributedDataParallelKwargs
+
+@dataclass
+class AcceleratorConfig:
+    """Configuration for Accelerator initialization."""
+    mixed_precision: str = 'fp16'
+    gradient_accumulation_steps: int = 1
+    device_placement: bool = True
+    kwargs_handlers: list = field(default_factory=lambda: [
+        DistributedDataParallelKwargs(find_unused_parameters=True)
+    ])
+
+def initialize_accelerator(config: AcceleratorConfig = None) -> Accelerator:
+    """Initialize accelerator with given configuration."""
+    if AcceleratorState._shared_state:
+        # If accelerator is already initialized, return current instance
+        return Accelerator()
+    
+    if config is None:
+        config = AcceleratorConfig()
+    
+    return Accelerator(
+        mixed_precision=config.mixed_precision,
+        gradient_accumulation_steps=config.gradient_accumulation_steps,
+        device_placement=config.device_placement,
+        kwargs_handlers=config.kwargs_handlers
+    )
+class Trainer:
+    """Updated trainer class with consistent Accelerator initialization."""
+    
+    def __init__(self, model: nn.Module, config: TrainingConfig, save_dir: Path):
         self.config = config
-        self.save_dir = Path(save_dir)
-        self.device = device
-        self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.save_dir = Path(save_dir) if save_dir else None
+        if self.save_dir:
+            self.save_dir.mkdir(parents=True, exist_ok=True)
         
+        # Get existing or create new accelerator
+        self.accelerator = initialize_accelerator()
+        
+        # Prepare model and optimizer
         self.criterion = nn.CrossEntropyLoss()
         self.optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -509,10 +724,16 @@ class Trainer:
             patience=config.scheduler_patience,
             verbose=True
         )
+        
+        # Prepare for distributed training
+        self.model, self.optimizer, self.criterion = self.accelerator.prepare(
+            model, self.optimizer, self.criterion
+        )
 
-    def _get_embeddings(self, batch: Dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    def _get_embeddings(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Get embeddings for source and target texts."""
-        batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
+        # Move batch to device using accelerator
+        batch = {k: v for k, v in batch.items()}
         
         with torch.set_grad_enabled(self.model.training):
             # Get source embeddings
@@ -544,36 +765,52 @@ class Trainer:
         return source_emb, target_emb
 
     def train_epoch(self, train_loader: DataLoader) -> float:
-        """Train for one epoch."""
+        """Train for one epoch with Accelerator."""
         self.model.train()
         total_loss = 0
         num_batches = 0
+        
+        # Wrap dataloader with accelerator
+        train_loader = self.accelerator.prepare(train_loader)
         
         for batch in tqdm(train_loader, desc='Training'):
             source_emb, target_emb = self._get_embeddings(batch)
             
             # Compute loss
             similarity = torch.matmul(source_emb, target_emb.transpose(0, 1)) / self.config.temperature
-            labels = torch.arange(similarity.size(0)).to(self.device)
+            labels = torch.arange(similarity.size(0)).to(similarity.device)
             loss = self.criterion(similarity, labels)
             
-            # Optimize
-            self.optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(),
-                self.config.gradient_clip_value
-            )
+            # Optimize with accelerator
+            self.accelerator.backward(loss)
+            if self.accelerator.sync_gradients:
+                self.accelerator.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.config.gradient_clip_value
+                )
             self.optimizer.step()
+            self.optimizer.zero_grad()
             
             total_loss += loss.item()
             num_batches += 1
             
+        # Gather losses from all processes
+        if dist.is_initialized():
+            total_loss = torch.tensor(total_loss).to(self.accelerator.device)
+            num_batches = torch.tensor(num_batches).to(self.accelerator.device)
+            dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+            dist.all_reduce(num_batches, op=dist.ReduceOp.SUM)
+            total_loss = total_loss.item()
+            num_batches = num_batches.item()
+            
         return total_loss / num_batches
 
-    def validate(self, val_loader: DataLoader, epoch: int) -> TrainingMetrics:
-        """Validate model and compute metrics."""
+    def validate(self, val_loader: DataLoader, epoch: int) -> Optional[TrainingMetrics]:
+        """Validate model with Accelerate support."""
         self.model.eval()
+        
+        # Prepare validation dataloader
+        val_loader = self.accelerator.prepare(val_loader)
         
         # Collect all embeddings
         all_source_embs = []
@@ -586,28 +823,44 @@ class Trainer:
             
             # Compute validation loss
             similarity = torch.matmul(source_emb, target_emb.transpose(0, 1)) / self.config.temperature
-            labels = torch.arange(similarity.size(0)).to(self.device)
+            labels = torch.arange(similarity.size(0)).to(similarity.device)
             loss = self.criterion(similarity, labels)
             
             total_loss += loss.item()
             num_batches += 1
             
+            # Gather embeddings from all processes
+            source_emb = self.accelerator.gather(source_emb)
+            target_emb = self.accelerator.gather(target_emb)
+            
             all_source_embs.append(source_emb.cpu())
             all_target_embs.append(target_emb.cpu())
+        
+        # Gather losses from all processes
+        if dist.is_initialized():
+            total_loss = torch.tensor(total_loss).to(self.accelerator.device)
+            num_batches = torch.tensor(num_batches).to(self.accelerator.device)
+            dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
+            dist.all_reduce(num_batches, op=dist.ReduceOp.SUM)
+            total_loss = total_loss.item()
+            num_batches = num_batches.item()
         
         # Concatenate all embeddings
         source_embeddings = torch.cat(all_source_embs, dim=0)
         target_embeddings = torch.cat(all_target_embs, dim=0)
         
-        # Compute metrics
-        metrics = self._compute_metrics(source_embeddings, target_embeddings)
-        metrics.val_loss = total_loss / num_batches
-        
-        # Update scheduler and save model
-        self.scheduler.step(metrics.val_loss)
-        self._save_checkpoint(metrics, epoch)
-        
-        return metrics
+        # Compute metrics only on main process
+        if self.accelerator.is_main_process:
+            metrics = self._compute_metrics(source_embeddings, target_embeddings)
+            metrics.val_loss = total_loss / num_batches
+            
+            # Update scheduler and save model
+            self.scheduler.step(metrics.val_loss)
+            if self.save_dir:
+                self._save_checkpoint(metrics, epoch)
+            
+            return metrics
+        return None
 
     def _compute_metrics(self, source_embs: torch.Tensor, target_embs: torch.Tensor) -> TrainingMetrics:
         """Compute all validation metrics."""
@@ -618,9 +871,9 @@ class Trainer:
         # Compute rankings in chunks to avoid OOM
         for i in range(0, total_samples, chunk_size):
             chunk_end = min(i + chunk_size, total_samples)
-            source_chunk = source_embs[i:chunk_end].to(self.device)
+            source_chunk = source_embs[i:chunk_end].to(self.accelerator.device)
             
-            similarity = torch.matmul(source_chunk, target_embs.to(self.device).t()) / self.config.temperature
+            similarity = torch.matmul(source_chunk, target_embs.to(self.accelerator.device).t()) / self.config.temperature
             rankings = torch.argsort(similarity, dim=-1, descending=True)
             all_rankings.append(rankings.cpu())
             
@@ -655,29 +908,43 @@ class Trainer:
 
     def _save_checkpoint(self, metrics: TrainingMetrics, epoch: int):
         """Save model checkpoint and metrics."""
-        torch.save(
-            self.model.state_dict(),
-            self.save_dir / f'model_epoch_{epoch}.pt'
-        )
-        torch.save(
-            metrics.__dict__,
-            self.save_dir / f'metrics_epoch_{epoch}.pt'
-        )
+        if self.accelerator.is_main_process and self.save_dir:
+            # Get unwrapped model
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
+            torch.save(
+                unwrapped_model.state_dict(),
+                self.save_dir / f'model_epoch_{epoch}.pt'
+            )
+            torch.save(
+                metrics.__dict__,
+                self.save_dir / f'metrics_epoch_{epoch}.pt'
+            )
+
+def setup_environment() -> None:
+    """Configure training environment."""
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    
+    # Initialize accelerator
+    accelerator = initialize_accelerator()
+    if accelerator.is_main_process:
+        torch.manual_seed(42)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(42)
 
 def train_model(
     model: nn.Module,
     train_loader: DataLoader,
     val_loader: Optional[DataLoader],
     config: TrainingConfig,
-    save_dir: Path,
-    device: torch.device
+    save_dir: Path
 ) -> List[TrainingMetrics]:
-    """Main training loop."""
-    trainer = Trainer(model, config, save_dir, device)
+    """Main training loop with Accelerate integration."""
+    trainer = Trainer(model, config, save_dir)
     metrics_history = []
     
     for epoch in range(config.num_epochs):
-        print(f"\nEpoch {epoch + 1}/{config.num_epochs}")
+        if trainer.accelerator.is_main_process:
+            print(f"\nEpoch {epoch + 1}/{config.num_epochs}")
         
         # Training phase
         train_loss = trainer.train_epoch(train_loader)
@@ -685,111 +952,46 @@ def train_model(
         # Validation phase
         if val_loader:
             metrics = trainer.validate(val_loader, epoch)
-            metrics.train_loss = train_loss
-            metrics_history.append(metrics)
             
-            print(f"\nEpoch {epoch + 1} Summary:")
-            print(f"Training Loss: {train_loss:.4f}")
-            print(f"Validation Loss: {metrics.val_loss:.4f}")
-            print(f"Best Top-1 Accuracy: {metrics.top_k_accuracy[1]:.4f}")
-            print(f"Mean Reciprocal Rank: {metrics.mrr:.4f}")
-            print(f"Validation Size: {metrics.val_size}")
-            # top k accuracies
-            [print(f"Top-{k} Accuracy: {v:.3f}") for k, v in metrics.top_k_accuracy.items()]
+            # Only log metrics on main process
+            if trainer.accelerator.is_main_process and metrics is not None:
+                metrics.train_loss = train_loss
+                metrics_history.append(metrics)
+                
+                print(f"\nEpoch {epoch + 1} Summary:")
+                print(f"Training Loss: {train_loss:.4f}")
+                print(f"Validation Loss: {metrics.val_loss:.4f}")
+                print(f"Best Top-1 Accuracy: {metrics.top_k_accuracy[1]:.4f}")
+                print(f"Mean Reciprocal Rank: {metrics.mrr:.4f}")
+                print(f"Validation Size: {metrics.val_size}")
+                [print(f"Top-{k} Accuracy: {v:.3f}") for k, v in metrics.top_k_accuracy.items()]
     
     return metrics_history
 
-def setup_logging(output_dir: Path) -> None:
-    """Configure logging for the training process."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(output_dir / 'training.log'),
-            logging.StreamHandler()
-        ]
-    )
-
-def setup_environment() -> None:
-    """Configure training environment."""
-    # Set environment variables
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    
-    # Set random seeds for reproducibility
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(42)
-
-def create_output_directory() -> Path:
-    """Create and return output directory for this training run."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(f"training_runs/run_{timestamp}")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    return output_dir
-
-def load_and_prepare_data(
-    jsonl_path: str,
-    train_sample_size: int,
-    val_sample_size: int,
-    train_samples_per_article: int = 1,
-    val_samples_per_article: int = 10
-) -> tuple:
-    """Load and prepare training and validation data."""
-    logging.info("Loading articles from JSONL file...")
-    articles_dict = {}
-    with open(jsonl_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            article = json.loads(line)
-            articles_dict[article['title'].lower()] = article['text']
-    
-    logging.info(f"Loaded {len(articles_dict)} articles")
-    
-    # Prepare citation data
-    preprocessor = CitationDataPreprocessor(articles_dict)
-    
-    logging.info("Preparing training data...")
-    train_sources, train_targets = preprocessor.create_citation_pairs(
-        sample_size=train_sample_size,
-        cite_samples_per_article=train_samples_per_article
-    )
-
-    S = set(train_sources)
-    T = set(train_targets)
-    
-    logging.info("Preparing validation data...")
-    val_sources, val_targets = preprocessor.create_citation_pairs(
-        sample_size=val_sample_size,
-        cite_samples_per_article=val_samples_per_article
-    )
-
-    # Remove any validation samples that are also in the training set
-    val_sources, val_targets = zip(*[
-        (source, target) for source, target in zip(val_sources, val_targets)
-        if source not in S and target not in T
-    ])
-    
-    return train_sources, train_targets, val_sources, val_targets
-
 def main(config_path: Optional[str] = None) -> List[TrainingMetrics]:
-    """Main training pipeline with configuration support."""
+    """Main training pipeline with consistent Accelerator initialization."""
+    # Initialize accelerator first
+    accelerator = initialize_accelerator()
+    
     # Load configuration
     if config_path:
         config = ExperimentConfig.from_yaml(config_path)
     else:
-        config = ExperimentConfig(experiment_name="default_experiment")
+        config = ExperimentConfig(experiment_name="configs/default_experiment")
     
-    # Create output directory
-    output_dir = Path(config.output_dir) / config.experiment_name
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Create output directory - only on main process
+    if accelerator.is_main_process:
+        output_dir = Path(config.output_dir) / config.experiment_name
+        output_dir.mkdir(parents=True, exist_ok=True)
+        # Save configuration
+        config.save_yaml(output_dir / "config.yaml")
+        # Setup logging
+        setup_logging(output_dir)
     
-    # Save configuration
-    config.save_yaml(output_dir / "config.yaml")
-    
-    # Setup
-    setup_logging(output_dir)
+    # Setup environment
     setup_environment()
     
-    # Data preparation
+    # Rest of the main function remains the same...
     train_sources, train_targets, val_sources, val_targets = load_and_prepare_data(
         jsonl_path=config.data.data_path,
         train_sample_size=config.data.train_sample_size,
@@ -798,16 +1000,14 @@ def main(config_path: Optional[str] = None) -> List[TrainingMetrics]:
         val_samples_per_article=config.data.val_samples_per_article
     )
     
-    # Model initialization
-    model = CitationMatcher(config.model).to(config.model.device)
+    model = CitationMatcher(config.model)
     
-    # Create datasets and dataloaders
     train_dataset = CitationDataset(
         sources=train_sources,
         targets=train_targets,
         tokenizer=model.tokenizer,
         config=config.model,
-        verbose=True
+        verbose=accelerator.is_main_process
     )
     
     val_dataset = CitationDataset(
@@ -815,7 +1015,7 @@ def main(config_path: Optional[str] = None) -> List[TrainingMetrics]:
         targets=val_targets,
         tokenizer=model.tokenizer,
         config=config.model,
-        verbose=True
+        verbose=accelerator.is_main_process
     )
     
     train_loader = create_dataloader(
@@ -832,27 +1032,27 @@ def main(config_path: Optional[str] = None) -> List[TrainingMetrics]:
         num_workers=config.training.num_workers
     )
     
-    # Training
-    logging.info("Starting training...")
+    if accelerator.is_main_process:
+        logging.info("Starting training...")
+    
     metrics_history = train_model(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
         config=config.training,
-        save_dir=output_dir / 'checkpoints',
-        device=config.model.device
+        save_dir=output_dir / 'checkpoints' if accelerator.is_main_process else None
     )
     
-    # Save training history
-    torch.save(
-        {
-            'metrics_history': [metric.__dict__ for metric in metrics_history],
-            'model_config': config.model.__dict__,
-            'training_config': config.training.__dict__,
-            'data_config': config.data.__dict__
-        },
-        output_dir / 'training_history.pt'
-    )
+    if accelerator.is_main_process:
+        torch.save(
+            {
+                'metrics_history': [metric.__dict__ for metric in metrics_history],
+                'model_config': config.model.__dict__,
+                'training_config': config.training.__dict__,
+                'data_config': config.data.__dict__
+            },
+            output_dir / 'training_history.pt'
+        )
+        logging.info(f"Training completed. Results saved to {output_dir}")
     
-    logging.info(f"Training completed. Results saved to {output_dir}")
     return metrics_history

@@ -22,6 +22,6 @@ training:
 data:
   data_path: ./data/wiki_articles.jsonl
   train_sample_size: 10000
-  val_sample_size: 50000
-  val_samples_per_article: 3
+  val_sample_size: 5000
+  val_samples_per_article: 5
   train_samples_per_article: 1

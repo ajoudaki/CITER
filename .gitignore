@@ -24,6 +24,7 @@ venv/
 
 # Data and model files
 data/
+cache/** 
 models/
 
 # Logs and output files
