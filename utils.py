@@ -1,21 +1,34 @@
-from dataclasses import dataclass, field
-from typing import List, Dict, Tuple, Iterator, Union, Optional
-import xml.etree.ElementTree as ET
+# Standard library imports
 import bz2
 import json
-import sqlite3
-from pathlib import Path
+import logging
+import os
 import re
+import sqlite3
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Iterator, List, Optional, Tuple, Union
+import xml.etree.ElementTree as ET
+
+# Third-party imports
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer, AutoModel
-from tqdm.auto import tqdm
-import os
-import logging
-from datetime import datetime
-import torch.cuda.amp  # For automatic mixed precision
+import torch.nn.functional as F
+from torch.cuda.amp import GradScaler, autocast
+from torch.optim import AdamW
+from torch.utils.data import DataLoader, Dataset
+from transformers import (
+    AutoConfig,
+    AutoModel,
+    AutoTokenizer,
+    PreTrainedModel,
+    PretrainedConfig,
+    Trainer,
+    TrainingArguments
+)
+import tqdm 
 import yaml
 
 @dataclass
@@ -25,88 +38,6 @@ class WikiArticle:
     text: str
     timestamp: str
     is_redirect: bool
-
-@dataclass
-class ModelConfig:
-    """Configuration for the citation matching model."""
-    model_name: str = "bert-base-uncased"
-    max_length: int = 512
-    cite_token: str = "<CITE>"
-    ref_token: str = "<REF>"
-    temperature: float = 0.07
-    device: Optional[torch.device] = None
-
-    def __post_init__(self):
-        if self.device is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-@dataclass
-class TrainingConfig:
-    """Configuration for model training."""
-    batch_size: int = 32
-    num_epochs: int = 10
-    learning_rate: float = 1.5e-4
-    temperature: float = 0.1
-    num_workers: int = 4
-    gradient_clip_value: float = 1.0
-    scheduler_patience: int = 2
-    scheduler_factor: float = 0.5
-    eval_k_values: List[int] = field(default_factory=lambda: [1, 3, 5, 10, 50])
-
-@dataclass
-class DataConfig:
-    """Configuration for data preparation and loading."""
-    data_path: str = "./data/wiki_articles.jsonl"
-    train_sample_size: int = 1000
-    val_sample_size: int = 100
-    val_samples_per_article: int = 10
-    train_samples_per_article: int = 1
-
-@dataclass
-class ExperimentConfig:
-    """Unified configuration for the entire experiment."""
-    experiment_name: str
-    output_dir: str = "experiments"
-    model: ModelConfig = field(default_factory=ModelConfig)
-    training: TrainingConfig = field(default_factory=TrainingConfig)
-    data: DataConfig = field(default_factory=DataConfig)
-
-    @classmethod
-    def from_yaml(cls, yaml_path: str) -> 'ExperimentConfig':
-        """Load configuration from a YAML file."""
-        with open(yaml_path, 'r') as f:
-            config_dict = yaml.safe_load(f)
-
-        # Create nested dataclass instances
-        model_config = ModelConfig(**config_dict.get('model', {}))
-        training_config = TrainingConfig(**config_dict.get('training', {}))
-        data_config = DataConfig(**config_dict.get('data', {}))
-
-        return cls(
-            experiment_name=config_dict['experiment_name'],
-            output_dir=config_dict.get('output_dir', 'experiments'),
-            model=model_config,
-            training=training_config,
-            data=data_config
-        )
-
-    def save_yaml(self, output_path: str) -> None:
-        """Save configuration to a YAML file."""
-        config_dict = {
-            'experiment_name': self.experiment_name,
-            'output_dir': self.output_dir,
-            'model': {k: v for k, v in self.model.__dict__.items() if not k.startswith('_')},
-            'training': self.training.__dict__,
-            'data': self.data.__dict__
-        }
-        
-        # Remove device from model config as it can't be serialized
-        if 'device' in config_dict['model']:
-            del config_dict['model']['device']
-
-        with open(output_path, 'w') as f:
-            yaml.dump(config_dict, f, default_flow_style=False)
-
 
 class WikiDumpProcessor:
     """Processes Wikipedia XML dumps and extracts articles."""
@@ -202,857 +133,718 @@ class ArticleStorage:
             
         return count
 
+
+
 class WikiProcessor:
     """Prepares citation data for model training."""
-    
-    def __init__(self, articles_dict: Dict[str, str]):
-        self.articles_dict = articles_dict
 
-    def create_citation_pairs(self, sample_size: int = 1000, cite_samples_per_article: int = 1) -> Tuple[List[str], List[str]]:
-        """Creates source-target pairs for citation matching."""
-        articles = np.random.permutation(list(self.articles_dict.keys()))[:sample_size]
-        sources, targets = [], []
+    def __init__(self, jsonl_path: str = "data/wiki_articles.jsonl"):
         
-        for title in articles:
-            text = self.articles_dict[title]
-            citations = [(cit.split('|')[0] if '|' in cit else cit) for cit in re.findall(r'\[\[(.*?)\]\]', text)]
-            valid_citations = [c for c in citations if c.lower() in self.articles_dict]
-            
-            if not valid_citations:
-                continue
-                
-            for citation in np.random.choice(valid_citations, 
-                                           min(cite_samples_per_article, len(valid_citations)), 
-                                           replace=False):
-                try:
-                    # Clean and prepare content
-                    source_text = self._clean_wiki_text(text)
-                    source_text = source_text.replace(f"[[{citation}]]", "<CITE>")
-                    target_text = f"{self._clean_wiki_text(self.articles_dict[citation.lower()])} <REF>"
-                    
-                    sources.append(source_text)
-                    targets.append(target_text)
-                except Exception:
-                    continue
-        
-        return sources, targets
+        # Load articles
+        logging.info("Loading articles from JSONL file...")
+        self.articles_dict = {}
+        self.id2ref = {}
+        self.ref2id = {}
+        with open(jsonl_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                article = json.loads(line)
+                ref = article['title'].lower()
+                id = len(self.articles_dict) + 1
+                self.articles_dict[ref] = self.clean_wiki_text(article['text'])
+                self.ref2id[ref] = id 
+                self.id2ref[id] = ref
+        logging.info(f"Loaded {len(self.articles_dict)} articles.")
+
+    def _find_citations(self,text):
+        citations = []
+        for match in re.finditer(r'\[\[(.*?)\]\]', text):
+            match_text = match.group(1)
+            citation = match_text.split('|') if '|' in match_text else [match_text]
+            citation = [(c.split('#')[0] if '#' in c else c) for c in citation]
+            ref = None
+            for cit in citation:
+                if cit.lower() in self.articles_dict:
+                    ref = cit.lower()
+                    break
+            if ref:
+                citations.append((match.start(), match.end(), self.ref2id[ref]))
+        return citations
 
     @staticmethod
-    def _clean_wiki_text(text: str) -> str:
+    def clean_wiki_text(text: str) -> str:
         """Cleans wiki content by removing metadata and formatting."""
         # Find main content starting from first bold title
         match = re.search(r"'''([^']+?)'''", text)
         if match:
             text = text[match.start():]
-        
+
         # Remove wiki elements and clean up
-        text = re.sub(r'\[\[Category:.*?\]\]|\[\[File:.*?\]\]|\{\{stub\}\}', '', text)
+        text = re.sub(r'\[\[File:.*\]\]|\[\[Category:.*\]\]|\{\{stub.*\}\}', '', text)
         return '\n'.join(line for line in text.split('\n') if line.strip())
+
+    def find_source_citations(self) -> Tuple[List[str], List[Tuple[List[str], int, int]]]:
+        """Creates source-target pairs for citation matching."""
+
+        articles = list(self.articles_dict.keys())
+        sources = []
+        citation_data = []
+
+        for title in articles:
+            text = self.articles_dict[title]
+            source_text = self.clean_wiki_text(text)
+            citations = self._find_citations(source_text)            
+            sources.append(source_text)
+            citation_data.append(citations)
+
+        return sources, citation_data
+
+def get_cache_path(sources, model_name: str, cache_dir: str) -> str:
+    """Generate a unique cache path based on input data and model name."""
+    # Create a hash of the sources and model name
+    content_hash = hashlib.md5(str(sources).encode()).hexdigest()
+    model_hash = hashlib.md5(model_name.encode()).hexdigest()[:8]
+    return os.path.join(cache_dir, f"tokenized_{model_hash}_{content_hash}.pt")
+
+def tokenize_sources(sources=None, citation_data=None, tokenizer=None, batch_size=1000, cache_dir="cache", cache_path=None):
+    # Generate cache path
+    if cache_path is None:
+        cache_path = get_cache_path(sources, tokenizer.name_or_path, cache_dir)
     
-
-class CitationMatcher(nn.Module):
-    """Main citation matching model with integrated text encoding."""
+    # Check if cached results exist
+    if os.path.exists(cache_path):
+        logging.info(f"Loading cached tokenized results from {cache_path}")
+        return torch.load(cache_path, weights_only=False)
     
-    def __init__(self, config: ModelConfig):
-        super().__init__()
-        self.config = config
+    logging.info("Tokenizing sources...")
+    # Process in batches
+    all_results = []
+    for batch_start in tqdm.tqdm(range(0, len(sources), batch_size), total=len(sources)//batch_size):
+        batch_end = min(batch_start + batch_size, len(sources))
+        batch_sources = sources[batch_start:batch_end]
+        batch_citations = citation_data[batch_start:batch_end]
         
-        # Initialize tokenizer and add special tokens
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            config.model_name,
-            use_fast=True,
-            add_prefix_space=True
+        # Batch encode
+        batch_encoded = tokenizer.batch_encode_plus(
+            batch_sources,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+            padding=False,
+            return_tensors=None
         )
-        self.tokenizer.add_special_tokens({
-            'additional_special_tokens': [config.cite_token, config.ref_token]
-        })
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
         
-        # Initialize model
-        self.model = AutoModel.from_pretrained(config.model_name).to(config.device)
-        self.model.resize_token_embeddings(len(self.tokenizer))
+        # Process each item in the batch
+        for idx in range(len(batch_sources)):
+            offset_mapping = batch_encoded["offset_mapping"][idx]
+            input_ids = batch_encoded["input_ids"][idx]
+            
+            # Create offset to index mapping
+            off2i = {s:i for i, (s,_) in enumerate(offset_mapping)}
+            off2i.update({e:i+1 for i, (_,e) in enumerate(offset_mapping)})
+            
+            # Create citation tokens array
+            mask_tokens = np.zeros(len(input_ids), dtype=int)
+            cite_tokens = np.zeros(len(input_ids), dtype=int)
+            
+            # Fill in citations
+            for i, j, art_id in batch_citations[idx]:
+                s, e = off2i[i], off2i[j]
+                cite_tokens[s] = art_id
+                mask_tokens[s:e] = art_id
+            
+            # Store results
+            all_results.append({
+                'input_ids': np.array(input_ids),
+                'cite_tokens': cite_tokens,
+                'mask_tokens': mask_tokens,
+                'attention_mask': batch_encoded["attention_mask"][idx] if "attention_mask" in batch_encoded else None
+            })
 
-    def _extract_token_embedding(
-        self,
-        hidden_states: torch.Tensor,
-        input_ids: torch.Tensor,
-        token_id: int
-    ) -> torch.Tensor:
-        """Extracts and normalizes embeddings for a specific token."""
-        batch_size = input_ids.size(0)
-        embeddings = []
-        
-        for batch_idx in range(batch_size):
-            token_positions = (input_ids[batch_idx] == token_id).nonzero()
-            if len(token_positions) == 0:
-                raise ValueError(f"Token ID {token_id} not found in sequence {batch_idx}")
-            position = token_positions[-1].item()
-            embeddings.append(hidden_states[batch_idx, position, :])
-        
-        embeddings = torch.stack(embeddings)
-        return nn.functional.normalize(embeddings, dim=-1)
+    # Cache the results
+    os.makedirs(cache_dir, exist_ok=True)
+    torch.save(all_results, cache_path)
+    logging.info(f"Cached tokenized results to {cache_path}")
+    
+    return all_results
 
-    def _encode_text(self, text: str, token_id: int) -> torch.Tensor:
-        """Encodes text and extracts normalized token embedding."""
-        inputs = self.tokenizer(
-            text,
-            padding=True,
-            truncation=True,
-            max_length=self.config.max_length,
-            return_tensors="pt"
-        ).to(self.config.device)
-        
-        outputs = self.model(**inputs, return_dict=True)
-        return self._extract_token_embedding(
-            outputs.last_hidden_state,
-            inputs['input_ids'],
-            token_id
-        )
+def collate(results, tokenizer, config):
+    cite_token = tokenizer.convert_tokens_to_ids(config.cite_token)
+    ref_token = tokenizer.convert_tokens_to_ids(config.ref_token)
+    bracket_tokens = tokenizer.convert_tokens_to_ids(['[',']'])
+    pad_token = tokenizer.pad_token_id
 
-    def forward(
-        self,
-        source_contexts: List[str],
-        target_pages: List[str]
-    ) -> torch.Tensor:
-        """Compute similarity between source and target pages."""
-        cite_token_id = self.tokenizer.convert_tokens_to_ids(self.config.cite_token)
-        ref_token_id = self.tokenizer.convert_tokens_to_ids(self.config.ref_token)
+    collated_data = []
+    # id_to_tokenized = {i: result for i, result in enumerate(results)}
+    
+    for i in tqdm.tqdm(range(len(results))):
+        result = results[i]
+        if config.collate_sample_size and len(collated_data)>config.collate_sample_size:
+            break
         
-        # Encode all texts
-        source_embeddings = torch.cat([
-            self._encode_text(ctx, cite_token_id) for ctx in source_contexts
-        ], dim=0)
-        
-        target_embeddings = torch.cat([
-            self._encode_text(page, ref_token_id) for page in target_pages
-        ], dim=0)
-        
-        # Compute similarity matrix
-        return torch.matmul(
-            source_embeddings,
-            target_embeddings.transpose(0, 1)
-        ) / self.config.temperature
+        # Process each source segment
+        for s in range(0, len(result['input_ids']), int((1-config.overlap)*config.source_len)):
+            e = s + config.source_len
+            
+            # Get source segment
+            input_ids = result['input_ids'][s:e].copy()
+            cite_tokens = result['cite_tokens'][s:e]
+            mask_tokens = result['mask_tokens'][s:e]
+            
+            # Skip if segment is too short
+            if len(input_ids) < config.source_len // 2:
+                continue
+                
+            # Get all citations from this segment
+            present_citations = np.unique(cite_tokens[cite_tokens > 0])
+            if len(present_citations) > config.max_targets:
+                present_citations = np.random.choice(present_citations, config.max_targets, replace=False)
+            max_targets = min(config.max_targets, len(present_citations))
 
-class CitationDataset(Dataset):
-    """Dataset for citation matching with optimized batch processing."""
+            # Skip if segment is too short
+            if len(input_ids) < config.source_len // 2:
+                continue
+            # Skip if no citations
+            if max_targets == 0:
+                continue
+            
+            # Initialize target arrays
+            target_ids = np.full((max_targets, config.target_len), pad_token, dtype=np.int64)
+            target_attention_mask = np.zeros((max_targets, config.target_len), dtype=np.int64)
+            
+            
+            # Prepare source: 
+            # only keep citation tokens that are sampled to be masked 
+            cite_tokens_mask = np.isin(cite_tokens, present_citations)
+            # don't mask citations that are not sampled 
+            mask_tokens = np.where(np.isin(mask_tokens, present_citations), mask_tokens, 0)
+            # remove brackets from the rest of the text 
+            mask_tokens = np.where(np.isin(input_ids,bracket_tokens),1, mask_tokens)
+            # don't mask the citation tokens 
+            mask_tokens[cite_tokens_mask] = 0
+            # set the citation tokens (first token of a citation range) as special token <CITE> 
+            input_ids[cite_tokens_mask] = cite_token
+            # mask all tokens in a citation, except for the first (special) token 
+            source_ids = input_ids[mask_tokens == 0]
+
+            # keep the cited article ids in the text in the order they appear (with repeats)
+            # & keep the unique cited artile ids 
+            # this will enable us to link each special cite token to a target via the article id
+            target_art_ids = present_citations
+            cited_art_ids = cite_tokens[cite_tokens_mask]
+            
+            # Pad or truncate source
+            if len(source_ids) > config.source_len:
+                source_ids = source_ids[:config.source_len]
+            elif len(source_ids) < config.source_len:
+                source_ids = np.pad(source_ids, 
+                                  (0, config.source_len - len(source_ids)),
+                                  'constant', 
+                                  constant_values=pad_token)
+            
+            # Create source attention mask
+            attention_mask = (source_ids != pad_token).astype(np.int64)
+            
+            # Process each target
+            for idx, citation_id in enumerate(present_citations):
+                # Get pre-tokenized target content
+                # ids are 1-indexed 
+                target_data = results[citation_id - 1]
+                target_tokens = target_data['input_ids']
+                
+                # Truncate if needed and add ref_token
+                if len(target_tokens) >= config.target_len - 1:
+                    target_tokens = target_tokens[:config.target_len-1]
+                target_tokens = np.append(target_tokens, ref_token)
+                
+                # Pad to target_len
+                if len(target_tokens) < config.target_len:
+                    target_tokens = np.pad(target_tokens,
+                                         (0, config.target_len - len(target_tokens)),
+                                         'constant',
+                                         constant_values=pad_token)
+                
+                # Store in target arrays
+                target_ids[idx] = target_tokens
+                target_attention_mask[idx] = (target_tokens != pad_token)
+                # citation_ids[idx] = citation_id
+
+
+            # Store the collected data
+            collated_data.append({
+                'source_art_id': i+1,
+                'source_ids': torch.tensor(source_ids, dtype=torch.long),
+                'cited_art_ids': torch.tensor(cited_art_ids, dtype=torch.long),
+                'target_art_ids': torch.tensor(target_art_ids, dtype=torch.long),
+                'target_ids': torch.tensor(target_ids, dtype=torch.long),
+                'attention_mask': torch.tensor(attention_mask, dtype=torch.long),
+                'target_attention_mask': torch.tensor(target_attention_mask, dtype=torch.long),
+            })
+    
+    return collated_data
+
+class CitationDataset(torch.utils.data.Dataset):
+    """Dataset for citation data with stacked targets."""
+    
+    def __init__(self, collated_data):
+        self.data = collated_data
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        return self.data[idx]
+
+def citation_collate_fn(batch):
+    # Stack sources normally
+    source_ids = torch.stack([item['source_ids'] for item in batch])
+    cited_art_ids = torch.cat([item['cited_art_ids'] for item in batch])
+    attention_mask = torch.stack([item['attention_mask'] for item in batch])
+    
+    # Concatenate targets
+    target_art_ids_all = torch.cat([item['target_art_ids'] for item in batch])
+    target_ids = torch.cat([item['target_ids'] for item in batch])
+    target_attention_mask = torch.cat([item['target_attention_mask'] for item in batch])
+
+    # Get unique indices and inverse indices
+    target_art_ids, unique_indices = np.unique(target_art_ids_all.numpy(), return_index=True)
+    target_art_ids = torch.tensor(target_art_ids)
+    unique_indices = torch.tensor(unique_indices)
+    
+    # Use unique indices to get corresponding targets
+    target_ids = target_ids[unique_indices]
+    target_attention_mask = target_attention_mask[unique_indices]
+
+    id2i = {id.item():i for i,id in enumerate(target_art_ids)}
+    labels = torch.tensor([id2i[id.item()] for id in cited_art_ids],dtype=torch.long)
+
+      
+    return {
+        'source_ids': source_ids,
+        'cited_art_ids': cited_art_ids,
+        'target_art_ids': target_art_ids,
+        'target_ids': target_ids,
+        'attention_mask': attention_mask,
+        'target_attention_mask': target_attention_mask,
+        'labels': labels,
+    }
+
+
+
+class CitationConfig(PretrainedConfig):
+    """Configuration class for CitationModel."""
+    model_type = "citation"
     
     def __init__(
         self,
-        sources: List[str],
-        targets: List[str],
-        tokenizer: AutoTokenizer,
-        config: ModelConfig,
-        batch_size: int = 1024,
-        verbose: bool = True
+        base_model_name="bert-base-uncased",
+        vocab_size=30522,
+        cite_token_id=None,
+        ref_token_id=None,
+        temperature=0.07,
+        **kwargs
     ):
-        assert len(sources) == len(targets), "Sources and targets must have same length"
-        self.processed_samples = self._preprocess_samples(
-            sources, targets, tokenizer, config, batch_size, verbose
-        )
-
-    def _ensure_ref_token_batch(
-        self,
-        tokens: torch.Tensor,
-        ref_token_id: int,
-        pad_token_id: int
-    ) -> torch.Tensor:
-        """Ensure reference token is present in batch of sequences."""
-        # Find sequences missing ref token
-        has_ref = (tokens == ref_token_id).any(dim=1)
-        missing_ref = ~has_ref
-
-        if missing_ref.any():
-            # Find last non-pad position for sequences missing ref token
-            pad_mask = (tokens != pad_token_id)
-            last_nonpad = pad_mask.long().argmax(dim=1)
-            
-            # Add ref token at last non-pad position
-            missing_indices = missing_ref.nonzero(as_tuple=True)[0]
-            tokens[missing_indices, last_nonpad[missing_indices]] = ref_token_id
-        
-        return tokens
-
-    def _extract_citation_context(self, text: str, cite_token: str, window_tokens: int, tokenizer) -> str:
-        """Extract context window around citation token, handling token lengths properly."""
-        # Find citation token position
-        cite_pos = text.find(cite_token)
-        if cite_pos == -1:
-            return text
-            
-        # Split text into before and after citation
-        before_citation = text[:cite_pos]
-        after_citation = text[cite_pos + len(cite_token):]
-        
-        # Tokenize both parts
-        before_tokens = tokenizer.encode(before_citation, add_special_tokens=False)
-        after_tokens = tokenizer.encode(after_citation, add_special_tokens=False)
-        
-        # Calculate how many tokens to keep on each side
-        tokens_per_side = window_tokens // 2
-        
-        # Take tokens from both sides
-        before_context = before_tokens[-tokens_per_side:] if len(before_tokens) > tokens_per_side else before_tokens
-        after_context = after_tokens[:tokens_per_side] if len(after_tokens) > tokens_per_side else after_tokens
-        
-        # Decode back to text
-        before_text = tokenizer.decode(before_context)
-        after_text = tokenizer.decode(after_context)
-        
-        return before_text + cite_token + after_text
-
-    def _preprocess_samples(
-        self,
-        sources: List[str],
-        targets: List[str],
-        tokenizer: AutoTokenizer,
-        config: ModelConfig,
-        batch_size: int,
-        verbose: bool
-    ) -> List[Dict[str, torch.Tensor]]:
-        """Preprocess samples with proper token-based context window."""
-        total_samples = len(sources)
-        processed_samples = []
-        total_processed = 0
-        total_skipped = 0
-        
-        # Process in batches
-        iterator = range(0, total_samples, batch_size)
-        if verbose:
-            iterator = tqdm(iterator, desc="Processing samples", unit="batch")
-        
-        cite_token_id = tokenizer.convert_tokens_to_ids(config.cite_token)
-        ref_token_id = tokenizer.convert_tokens_to_ids(config.ref_token)
-        
-        # Calculate context window in tokens, leaving room for special tokens
-        context_window_size = config.max_length - 2  # Account for [CLS] and [SEP]
-        
-        for start_idx in iterator:
-            end_idx = min(start_idx + batch_size, total_samples)
-            batch_sources = sources[start_idx:end_idx]
-            batch_targets = targets[start_idx:end_idx]
-            
-            # Extract context for each source text
-            contextualized_sources = [
-                self._extract_citation_context(text, config.cite_token, context_window_size, tokenizer)
-                for text in batch_sources
-            ]
-            
-            # Batch tokenization
-            source_tokens = tokenizer(
-                contextualized_sources,
-                padding='max_length',
-                truncation=True,
-                max_length=config.max_length,
-                return_tensors='pt'
-            )
-            
-            target_tokens = tokenizer(
-                batch_targets,
-                padding='max_length',
-                truncation=True,
-                max_length=config.max_length,
-                return_tensors='pt'
-            )
-            
-            # Rest of processing remains the same...
-            has_citation = (source_tokens['input_ids'] == cite_token_id).any(dim=1)
-            valid_indices = has_citation.nonzero(as_tuple=True)[0]
-            
-            total_processed += len(valid_indices)
-            total_skipped += len(batch_sources) - len(valid_indices)
-            
-            if len(valid_indices) == 0:
-                continue
-                
-            target_tokens['input_ids'] = self._ensure_ref_token_batch(
-                target_tokens['input_ids'],
-                ref_token_id,
-                tokenizer.pad_token_id
-            )
-            
-            for idx in valid_indices:
-                processed_samples.append({
-                    'source_input_ids': source_tokens['input_ids'][idx],
-                    'source_attention_mask': source_tokens['attention_mask'][idx],
-                    'target_input_ids': target_tokens['input_ids'][idx],
-                    'target_attention_mask': target_tokens['attention_mask'][idx]
-                })
-        
-        if verbose:
-            print(f"\nProcessed {total_processed} samples")
-            print(f"Skipped {total_skipped} samples without citation")
-        
-        return processed_samples
-
-    # def _preprocess_samples(
-    #     self,
-    #     sources: List[str],
-    #     targets: List[str],
-    #     tokenizer: AutoTokenizer,
-    #     config: ModelConfig,
-    #     batch_size: int,
-    #     verbose: bool
-    # ) -> List[Dict[str, torch.Tensor]]:
-    #     """Preprocess samples with optimized batch processing."""
-    #     total_samples = len(sources)
-    #     processed_samples = []
-    #     total_processed = 0
-    #     total_skipped = 0
-        
-    #     # Process in batches
-    #     iterator = range(0, total_samples, batch_size)
-    #     if verbose:
-    #         iterator = tqdm(iterator, desc="Processing samples", unit="batch")
-        
-    #     cite_token_id = tokenizer.convert_tokens_to_ids(config.cite_token)
-    #     ref_token_id = tokenizer.convert_tokens_to_ids(config.ref_token)
-        
-    #     for start_idx in iterator:
-    #         end_idx = min(start_idx + batch_size, total_samples)
-    #         batch_sources = sources[start_idx:end_idx]
-    #         batch_targets = targets[start_idx:end_idx]
-            
-    #         # Batch tokenization
-    #         source_tokens = tokenizer(
-    #             batch_sources,
-    #             padding='max_length',
-    #             truncation=True,
-    #             max_length=config.max_length,
-    #             return_tensors='pt'
-    #         )
-            
-    #         target_tokens = tokenizer(
-    #             batch_targets,
-    #             padding='max_length',
-    #             truncation=True,
-    #             max_length=config.max_length,
-    #             return_tensors='pt'
-    #         )
-            
-    #         # Process source tokens
-    #         has_citation = (source_tokens['input_ids'] == cite_token_id).any(dim=1)
-    #         valid_indices = has_citation.nonzero(as_tuple=True)[0]
-            
-    #         # Update statistics
-    #         total_processed += len(valid_indices)
-    #         total_skipped += len(batch_sources) - len(valid_indices)
-            
-    #         if len(valid_indices) == 0:
-    #             continue
-            
-    #         # Ensure ref token in target sequences
-    #         target_tokens['input_ids'] = self._ensure_ref_token_batch(
-    #             target_tokens['input_ids'],
-    #             ref_token_id,
-    #             tokenizer.pad_token_id
-    #         )
-            
-    #         # Create samples for valid sequences
-    #         for idx in valid_indices:
-    #             processed_samples.append({
-    #                 'source_input_ids': source_tokens['input_ids'][idx],
-    #                 'source_attention_mask': source_tokens['attention_mask'][idx],
-    #                 'target_input_ids': target_tokens['input_ids'][idx],
-    #                 'target_attention_mask': target_tokens['attention_mask'][idx]
-    #             })
-        
-    #     if verbose:
-    #         print(f"\nProcessed {total_processed} samples")
-    #         print(f"Skipped {total_skipped} samples without citation")
-        
-    #     return processed_samples
-
-    def __len__(self) -> int:
-        return len(self.processed_samples)
-
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        return self.processed_samples[idx]
-
-def create_dataloader(
-    dataset: CitationDataset,
-    batch_size: int,
-    shuffle: bool = True,
-    num_workers: int = 4
-) -> DataLoader:
-    """Creates a DataLoader for the citation dataset."""
-    return DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        num_workers=num_workers,
-        collate_fn=lambda batch: {
-            key: torch.stack([item[key] for item in batch])
-            for key in batch[0].keys()
-        },
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2
-    )
-
+        super().__init__(**kwargs)
+        self.base_model_name = base_model_name
+        self.vocab_size = vocab_size
+        self.cite_token_id = cite_token_id
+        self.ref_token_id = ref_token_id
+        self.temperature = temperature
 
 @dataclass
-class TrainingMetrics:
-    """Stores training and validation metrics."""
-    train_loss: float
-    val_loss: float
-    top_k_accuracy: Dict[int, float]
-    mrr: float
-    median_rank: float
-    mean_rank: float
-    val_size: int
+class CitationModelOutput:
+    """Custom output class for the citation model."""
+    loss: Optional[torch.FloatTensor] = None
+    logits: torch.FloatTensor = None
+    cite_embeds: Optional[torch.FloatTensor] = None
+    ref_embeds: Optional[torch.FloatTensor] = None
 
-def setup_logging(output_dir: Path) -> None:
-    """Configure logging for the training process."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(output_dir / 'training.log'),
-            logging.StreamHandler()
-        ]
-    )
-
-def create_output_directory() -> Path:
-    """Create and return output directory for this training run."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_dir = Path(f"training_runs/run_{timestamp}")
-    output_dir.mkdir(parents=True, exist_ok=True)
-    return output_dir
-
-def load_and_prepare_data(
-    jsonl_path: str,
-    train_sample_size: int,
-    val_sample_size: int,
-    train_samples_per_article: int = 1,
-    val_samples_per_article: int = 10
-) -> tuple:
-    """Load and prepare training and validation data."""
-    logging.info("Loading articles from JSONL file...")
-    articles_dict = {}
-    with open(jsonl_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            article = json.loads(line)
-            articles_dict[article['title'].lower()] = article['text']
+class CitationModel(nn.Module):
+    """Custom model for citation matching using transformer embeddings."""
     
-    logging.info(f"Loaded {len(articles_dict)} articles")
-    
-    # Prepare citation data
-    preprocessor = WikiProcessor(articles_dict)
-    
-    logging.info("Preparing training data...")
-    train_sources, train_targets = preprocessor.create_citation_pairs(
-        sample_size=train_sample_size,
-        cite_samples_per_article=train_samples_per_article
-    )
-
-    S = set(train_sources)
-    T = set(train_targets)
-    
-    logging.info("Preparing validation data...")
-    val_sources, val_targets = preprocessor.create_citation_pairs(
-        sample_size=val_sample_size,
-        cite_samples_per_article=val_samples_per_article
-    )
-
-    # Remove any validation samples that are also in the training set
-    val_sources, val_targets = zip(*[
-        (source, target) for source, target in zip(val_sources, val_targets)
-        if source not in S and target not in T
-    ])
-    
-    return train_sources, train_targets, val_sources, val_targets
-
-
-# New imports needed at the top of the file
-from accelerate import Accelerator
-from accelerate.utils import DistributedDataParallelKwargs
-from typing import Optional, Dict, List, Tuple, Union
-import torch.distributed as dist
-from pathlib import Path
-# Add this at the top of the file with other imports
-from functools import lru_cache
-# Add at the top of your file
-from dataclasses import dataclass, field
-from accelerate.state import AcceleratorState
-from accelerate.utils import DistributedDataParallelKwargs
-
-@dataclass
-class AcceleratorConfig:
-    """Configuration for Accelerator initialization."""
-    mixed_precision: str = 'fp16'
-    gradient_accumulation_steps: int = 1
-    device_placement: bool = True
-    kwargs_handlers: list = field(default_factory=lambda: [
-        DistributedDataParallelKwargs(find_unused_parameters=True)
-    ])
-
-def initialize_accelerator(config: AcceleratorConfig = None) -> Accelerator:
-    """Initialize accelerator with given configuration."""
-    if AcceleratorState._shared_state:
-        # If accelerator is already initialized, return current instance
-        return Accelerator()
-    
-    if config is None:
-        config = AcceleratorConfig()
-    
-    return Accelerator(
-        mixed_precision=config.mixed_precision,
-        gradient_accumulation_steps=config.gradient_accumulation_steps,
-        device_placement=config.device_placement,
-        kwargs_handlers=config.kwargs_handlers
-    )
-class Trainer:
-    """Updated trainer class with consistent Accelerator initialization."""
-    
-    def __init__(self, model: nn.Module, config: TrainingConfig, save_dir: Path):
+    def __init__(self, config: CitationConfig):
+        super().__init__()
+        
+        # Load base model configuration
+        base_config = AutoConfig.from_pretrained(config.base_model_name)
+        
+        # Store configuration
         self.config = config
-        self.save_dir = Path(save_dir) if save_dir else None
-        if self.save_dir:
-            self.save_dir.mkdir(parents=True, exist_ok=True)
         
-        # Get existing or create new accelerator
-        self.accelerator = initialize_accelerator()
+        # Load base transformer model
+        self.transformer = AutoModel.from_pretrained(config.base_model_name)
         
-        # Prepare model and optimizer
-        self.criterion = nn.CrossEntropyLoss()
-        self.optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer,
-            mode='min',
-            factor=config.scheduler_factor,
-            patience=config.scheduler_patience,
-            verbose=True
+        # Resize token embeddings if needed
+        if config.vocab_size != self.transformer.config.vocab_size:
+            self.transformer.resize_token_embeddings(config.vocab_size)
+    
+    def get_citation_masks(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Create mask for citation token positions."""
+        return input_ids == self.config.cite_token_id
+    
+    def get_reference_masks(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Create mask for reference token positions."""
+        return input_ids == self.config.ref_token_id
+    
+    def forward(
+        self,
+        source_ids: torch.Tensor,
+        target_ids: torch.Tensor,
+        labels: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        target_attention_mask: Optional[torch.Tensor] = None,
+        cited_art_ids: Optional[torch.Tensor] = None,
+        target_art_ids: Optional[torch.Tensor] = None,
+        return_dict: bool = True,
+    ) -> Union[Tuple, CitationModelOutput]:
+        """Forward pass of the model."""
+        
+        # Process source text
+        source_outputs = self.transformer(
+            input_ids=source_ids,
+            attention_mask=attention_mask,
+            return_dict=True
         )
         
-        # Prepare for distributed training
-        self.model, self.optimizer, self.criterion = self.accelerator.prepare(
-            model, self.optimizer, self.criterion
+        # Process target text
+        target_outputs = self.transformer(
+            input_ids=target_ids,
+            attention_mask=target_attention_mask,
+            return_dict=True
         )
+        
+        # Get citation mask and extract citation embeddings
+        cite_mask = self.get_citation_masks(source_ids)
+        cite_embeds = source_outputs.last_hidden_state[cite_mask]
+        
+        # Get reference mask and extract reference embeddings
+        ref_mask = self.get_reference_masks(target_ids)
+        ref_embeds = target_outputs.last_hidden_state[ref_mask]
+        
+        # Normalize embeddings
+        cite_embeds = F.normalize(cite_embeds, p=2, dim=-1)
+        ref_embeds = F.normalize(ref_embeds, p=2, dim=-1)
+        
+        # Compute similarity scores
+        logits = torch.matmul(cite_embeds, ref_embeds.t()) / self.config.temperature
 
-    def _get_embeddings(self, batch: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Get embeddings for source and target texts."""
-        # Move batch to device using accelerator
-        batch = {k: v for k, v in batch.items()}
+        # compute the loss 
+        loss = F.cross_entropy(logits, labels)
         
-        with torch.set_grad_enabled(self.model.training):
-            # Get source embeddings
-            source_out = self.model.model(
-                input_ids=batch['source_input_ids'],
-                attention_mask=batch['source_attention_mask'],
-                output_hidden_states=True,
+        if return_dict:
+            return CitationModelOutput(
+                loss=loss,
+                logits=logits,
+                cite_embeds=cite_embeds,
+                ref_embeds=ref_embeds
+            )
+        
+        return (loss, logits, cite_embeds, ref_embeds)
+
+def compute_retrieval_metrics(logits, labels, ks=[1, 5, 10, 50, 100, 1000]):
+    """
+    Compute various retrieval metrics including top-k accuracy and MRR.
+    
+    Args:
+        logits: Tensor of similarity scores [num_queries, num_targets]
+        labels: Tensor of correct target indices [num_queries]
+        ks: List of k values for top-k accuracy
+        
+    Returns:
+        Dictionary containing various retrieval metrics
+    """
+    # Get rankings of correct targets
+    correct_scores = logits[torch.arange(logits.size(0)), labels]
+    rankings = (logits >= correct_scores.unsqueeze(1)).sum(1)
+    
+    # Compute MRR
+    mrr = (1.0 / rankings).mean().item()
+    
+    # Compute top-k accuracy for different k values
+    metrics = {'mrr': mrr}
+    for k in ks:
+        if k <= logits.size(1):  # Only compute if k is not larger than number of targets
+            top_k_acc = (rankings <= k).float().mean().item()
+            metrics[f'top_{k}_accuracy'] = top_k_acc
+    
+    return metrics
+
+def validate_citation_model(
+    model,
+    val_dataloader,
+    device: str = None,
+    return_embeddings: bool = False,
+    k_values: List[int] = [1, 5, 10, 50, 100, 1000]
+):
+    """
+    Validates citation model performance by computing loss and various retrieval metrics.
+    
+    Args:
+        model: The citation model to validate
+        val_dataloader: DataLoader containing validation data
+        device: Device to run validation on
+        return_embeddings: Whether to return computed embeddings
+        k_values: List of k values for top-k accuracy computation
+        
+    Returns:
+        dict containing validation metrics and optionally embeddings
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    model.eval()
+    
+    # Lists to store accumulated embeddings and IDs
+    all_cite_embeds = []
+    all_ref_embeds = []
+    all_cited_art_ids = []
+    all_target_art_ids = []
+    
+    # Accumulate embeddings and IDs
+    with torch.no_grad():
+        for batch in tqdm.tqdm(val_dataloader, desc="Computing embeddings"):
+            # Move batch to device
+            batch = {k: v.to(device) for k, v in batch.items()}
+            
+            # Process source text
+            source_outputs = model.transformer(
+                input_ids=batch['source_ids'],
+                attention_mask=batch['attention_mask'],
                 return_dict=True
             )
-            source_emb = self.model._extract_token_embedding(
-                source_out.last_hidden_state,
-                batch['source_input_ids'],
-                self.model.tokenizer.convert_tokens_to_ids(self.model.config.cite_token)
-            )
             
-            # Get target embeddings
-            target_out = self.model.model(
-                input_ids=batch['target_input_ids'],
+            # Process target text
+            target_outputs = model.transformer(
+                input_ids=batch['target_ids'],
                 attention_mask=batch['target_attention_mask'],
-                output_hidden_states=True,
                 return_dict=True
             )
-            target_emb = self.model._extract_token_embedding(
-                target_out.last_hidden_state,
-                batch['target_input_ids'],
-                self.model.tokenizer.convert_tokens_to_ids(self.model.config.ref_token)
-            )
             
-        return source_emb, target_emb
+            # Get citation mask and extract citation embeddings
+            cite_mask = model.get_citation_masks(batch['source_ids'])
+            cite_embeds = source_outputs.last_hidden_state[cite_mask]
+            
+            # Get reference mask and extract reference embeddings
+            ref_mask = model.get_reference_masks(batch['target_ids'])
+            ref_embeds = target_outputs.last_hidden_state[ref_mask]
+            
+            # Normalize embeddings
+            cite_embeds = F.normalize(cite_embeds, p=2, dim=-1).cpu()
+            ref_embeds = F.normalize(ref_embeds, p=2, dim=-1).cpu()
+            
+            # Store embeddings and IDs
+            all_cite_embeds.append(cite_embeds.cpu())
+            all_ref_embeds.append(ref_embeds.cpu())
+            all_cited_art_ids.append(batch['cited_art_ids'].cpu())
+            all_target_art_ids.append(batch['target_art_ids'].cpu())
+    
+    # Concatenate all accumulated tensors
+    cite_embeds = torch.cat(all_cite_embeds)
+    ref_embeds = torch.cat(all_ref_embeds)
+    cited_art_ids = torch.cat(all_cited_art_ids)
+    target_art_ids = torch.cat(all_target_art_ids)
+    
+    # Get unique target art IDs and create mapping
+    target_art_ids_unique, unique_indices = np.unique(target_art_ids.numpy(), return_index=True)
+    target_art_ids_unique = torch.tensor(target_art_ids_unique)
+    ref_embeds_unique = ref_embeds[torch.tensor(unique_indices)]
+    
+    # Create ID to index mapping
+    id2i = {id.item(): i for i, id in enumerate(target_art_ids_unique)}
+    labels = torch.tensor([id2i[id.item()] for id in cited_art_ids], dtype=torch.long)
+    
+    # Compute similarity scores
+    logits = torch.matmul(cite_embeds, ref_embeds_unique.t()) / model.config.temperature
+    
+    # Compute loss
+    loss = F.cross_entropy(logits, labels)
+    
+    # Compute accuracy
+    predictions = torch.argmax(logits, dim=-1)
+    accuracy = (predictions == labels).float().mean().item()
+    
+    # Compute retrieval metrics
+    retrieval_metrics = compute_retrieval_metrics(logits.cpu(), labels.cpu(), ks=k_values)
+    
+    # Prepare results dictionary
+    results = {
+        'loss': loss.item(),
+        'accuracy': accuracy,
+        'num_citations': len(cited_art_ids),
+        'num_unique_targets': len(target_art_ids_unique),
+        'mrr': retrieval_metrics['mrr']
+    }
+    
+    # Add top-k accuracies to results
+    for k in k_values:
+        if f'top_{k}_accuracy' in retrieval_metrics:
+            results[f'top_{k}_accuracy'] = retrieval_metrics[f'top_{k}_accuracy']
+    
+    if return_embeddings:
+        results.update({
+            'cite_embeds': cite_embeds.cpu(),
+            'ref_embeds': ref_embeds_unique.cpu(),
+            'cited_art_ids': cited_art_ids,
+            'target_art_ids': target_art_ids_unique,
+            'logits': logits.cpu(),
+            'labels': labels.cpu()
+        })
+    
+    return results
 
-    def train_epoch(self, train_loader: DataLoader) -> float:
-        """Train for one epoch with Accelerator."""
-        self.model.train()
-        total_loss = 0
-        num_batches = 0
+def train_citation_model(
+    model,
+    results,
+    tokenizer,
+    config,
+    train_ratio: float = 0.8,
+    num_epochs: int = 5,
+    learning_rate: float = 1.5e-4,
+    weight_decay: float = 0.01,
+    warmup_steps: int = 0,
+    device: str = None,
+    save_path: str = "citation_model.pt",
+    batch_size: int = 128,
+    temperatures = [],
+    k_values = [1, 5, 10, 50, 100, 1000]
+):
+    # Set device
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    
+    # Initialize gradient scaler for mixed precision training
+    scaler = GradScaler()
+    
+    # Move model to device
+    model = model.to(device)
+    
+    # Enable memory efficient training
+    model.transformer.gradient_checkpointing_enable()
+    
+    # Initialize optimizer
+    optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    
+    # Training loop
+    best_val_metrics = {'loss': float('inf')}
+    
+    for epoch in range(num_epochs):
+        print(f"\nEpoch {epoch + 1}/{num_epochs}")
+        if epoch < len(temperatures):
+            model.config.temperature = temperatures[epoch]
+            print(f"temperature changed to {temperatures[epoch]}")
         
-        # Wrap dataloader with accelerator
-        train_loader = self.accelerator.prepare(train_loader)
+        # Create new collated data for this epoch
+        print("Collating training data with new random masks...")
+        collated = collate(results, tokenizer, config)
+        dataset = CitationDataset(collated)
+        train_size = int(len(dataset) * train_ratio)
+        train_dataset = dataset[:train_size]
+        val_dataset = dataset[train_size:]
         
-        for batch in tqdm(train_loader, desc='Training'):
-            source_emb, target_emb = self._get_embeddings(batch)
-            
-            # Compute loss
-            similarity = torch.matmul(source_emb, target_emb.transpose(0, 1)) / self.config.temperature
-            labels = torch.arange(similarity.size(0)).to(similarity.device)
-            loss = self.criterion(similarity, labels)
-            
-            # Optimize with accelerator
-            self.accelerator.backward(loss)
-            if self.accelerator.sync_gradients:
-                self.accelerator.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.config.gradient_clip_value
-                )
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-            
-            total_loss += loss.item()
-            num_batches += 1
-            
-        # Gather losses from all processes
-        if dist.is_initialized():
-            total_loss = torch.tensor(total_loss).to(self.accelerator.device)
-            num_batches = torch.tensor(num_batches).to(self.accelerator.device)
-            dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-            dist.all_reduce(num_batches, op=dist.ReduceOp.SUM)
-            total_loss = total_loss.item()
-            num_batches = num_batches.item()
-            
-        return total_loss / num_batches
-
-    def validate(self, val_loader: DataLoader, epoch: int) -> Optional[TrainingMetrics]:
-        """Validate model with Accelerate support."""
-        self.model.eval()
-        
-        # Prepare validation dataloader
-        val_loader = self.accelerator.prepare(val_loader)
-        
-        # Collect all embeddings
-        all_source_embs = []
-        all_target_embs = []
-        total_loss = 0
-        num_batches = 0
-        
-        for batch in tqdm(val_loader, desc='Validation'):
-            source_emb, target_emb = self._get_embeddings(batch)
-            
-            # Compute validation loss
-            similarity = torch.matmul(source_emb, target_emb.transpose(0, 1)) / self.config.temperature
-            labels = torch.arange(similarity.size(0)).to(similarity.device)
-            loss = self.criterion(similarity, labels)
-            
-            total_loss += loss.item()
-            num_batches += 1
-            
-            # Gather embeddings from all processes
-            source_emb = self.accelerator.gather(source_emb)
-            target_emb = self.accelerator.gather(target_emb)
-            
-            all_source_embs.append(source_emb.cpu())
-            all_target_embs.append(target_emb.cpu())
-        
-        # Gather losses from all processes
-        if dist.is_initialized():
-            total_loss = torch.tensor(total_loss).to(self.accelerator.device)
-            num_batches = torch.tensor(num_batches).to(self.accelerator.device)
-            dist.all_reduce(total_loss, op=dist.ReduceOp.SUM)
-            dist.all_reduce(num_batches, op=dist.ReduceOp.SUM)
-            total_loss = total_loss.item()
-            num_batches = num_batches.item()
-        
-        # Concatenate all embeddings
-        source_embeddings = torch.cat(all_source_embs, dim=0)
-        target_embeddings = torch.cat(all_target_embs, dim=0)
-        
-        # Compute metrics only on main process
-        if self.accelerator.is_main_process:
-            metrics = self._compute_metrics(source_embeddings, target_embeddings)
-            metrics.val_loss = total_loss / num_batches
-            
-            # Update scheduler and save model
-            self.scheduler.step(metrics.val_loss)
-            if self.save_dir:
-                self._save_checkpoint(metrics, epoch)
-            
-            return metrics
-        return None
-
-    def _compute_metrics(self, source_embs: torch.Tensor, target_embs: torch.Tensor) -> TrainingMetrics:
-        """Compute all validation metrics."""
-        total_samples = source_embs.size(0)
-        chunk_size = 512
-        all_rankings = []
-        
-        # Compute rankings in chunks to avoid OOM
-        for i in range(0, total_samples, chunk_size):
-            chunk_end = min(i + chunk_size, total_samples)
-            source_chunk = source_embs[i:chunk_end].to(self.accelerator.device)
-            
-            similarity = torch.matmul(source_chunk, target_embs.to(self.accelerator.device).t()) / self.config.temperature
-            rankings = torch.argsort(similarity, dim=-1, descending=True)
-            all_rankings.append(rankings.cpu())
-            
-            del similarity, source_chunk
-            torch.cuda.empty_cache()
-        
-        rankings = torch.cat(all_rankings, dim=0)
-        
-        # Calculate metrics
-        correct_at_k = {k: 0 for k in self.config.eval_k_values}
-        reciprocal_ranks = []
-        ranks = []
-        
-        for i in range(total_samples):
-            rank = (rankings[i] == i).nonzero().item() + 1
-            ranks.append(rank)
-            reciprocal_ranks.append(1.0 / rank)
-            
-            for k in self.config.eval_k_values:
-                if rank <= k:
-                    correct_at_k[k] += 1
-        
-        return TrainingMetrics(
-            train_loss=0.0,  # Set by train_model
-            val_loss=0.0,    # Set by validate
-            top_k_accuracy={k: count / total_samples for k, count in correct_at_k.items()},
-            mrr=float(np.mean(reciprocal_ranks)),
-            median_rank=float(np.median(ranks)),
-            mean_rank=float(np.mean(ranks)),
-            val_size=total_samples
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            collate_fn=citation_collate_fn
         )
 
-    def _save_checkpoint(self, metrics: TrainingMetrics, epoch: int):
-        """Save model checkpoint and metrics."""
-        if self.accelerator.is_main_process and self.save_dir:
-            # Get unwrapped model
-            unwrapped_model = self.accelerator.unwrap_model(self.model)
-            torch.save(
-                unwrapped_model.state_dict(),
-                self.save_dir / f'model_epoch_{epoch}.pt'
-            )
-            torch.save(
-                metrics.__dict__,
-                self.save_dir / f'metrics_epoch_{epoch}.pt'
-            )
-
-def setup_environment() -> None:
-    """Configure training environment."""
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    
-    # Initialize accelerator
-    accelerator = initialize_accelerator()
-    if accelerator.is_main_process:
-        torch.manual_seed(42)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(42)
-
-def train_model(
-    model: nn.Module,
-    train_loader: DataLoader,
-    val_loader: Optional[DataLoader],
-    config: TrainingConfig,
-    save_dir: Path
-) -> List[TrainingMetrics]:
-    """Main training loop with Accelerate integration."""
-    trainer = Trainer(model, config, save_dir)
-    metrics_history = []
-    
-    for epoch in range(config.num_epochs):
-        if trainer.accelerator.is_main_process:
-            print(f"\nEpoch {epoch + 1}/{config.num_epochs}")
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=batch_size * 2, # use larger batch for validation (no gradients) 
+            shuffle=False,
+            collate_fn=citation_collate_fn
+        )
         
         # Training phase
-        train_loss = trainer.train_epoch(train_loader)
+        model.train()
+        total_train_loss = 0
+        train_steps = 0
+        
+        progress_bar = tqdm.tqdm(train_dataloader, desc="Training")
+        
+        for batch in progress_bar:
+            # Move batch to device
+            batch = {k: v.to(device) for k, v in batch.items()}
+            
+            # Clear gradients
+            optimizer.zero_grad()
+            
+            # Forward pass with mixed precision
+            with torch.amp.autocast('cuda'):
+                outputs = model(**batch)
+                loss = outputs.loss
+            
+            # Backward pass with gradient scaling
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            
+            # Update tracking variables
+            total_train_loss += loss.item()
+            train_steps += 1
+            
+            # Update progress bar
+            progress_bar.set_postfix({'loss': loss.item()})
+        
+        avg_train_loss = total_train_loss / train_steps
+        print(f"\nAverage training loss: {avg_train_loss:.4f}")
         
         # Validation phase
-        if val_loader:
-            metrics = trainer.validate(val_loader, epoch)
-            
-            # Only log metrics on main process
-            if trainer.accelerator.is_main_process and metrics is not None:
-                metrics.train_loss = train_loss
-                metrics_history.append(metrics)
-                
-                print(f"\nEpoch {epoch + 1} Summary:")
-                print(f"Training Loss: {train_loss:.4f}")
-                print(f"Validation Loss: {metrics.val_loss:.4f}")
-                print(f"Best Top-1 Accuracy: {metrics.top_k_accuracy[1]:.4f}")
-                print(f"Mean Reciprocal Rank: {metrics.mrr:.4f}")
-                print(f"Validation Size: {metrics.val_size}")
-                [print(f"Top-{k} Accuracy: {v:.3f}") for k, v in metrics.top_k_accuracy.items()]
-    
-    return metrics_history
-
-def main(config_path: Optional[str] = None) -> List[TrainingMetrics]:
-    """Main training pipeline with consistent Accelerator initialization."""
-    # Initialize accelerator first
-    accelerator = initialize_accelerator()
-    
-    # Load configuration
-    if config_path:
-        config = ExperimentConfig.from_yaml(config_path)
-    else:
-        config = ExperimentConfig(experiment_name="configs/default_experiment")
-    
-    # Create output directory - only on main process
-    if accelerator.is_main_process:
-        output_dir = Path(config.output_dir) / config.experiment_name
-        output_dir.mkdir(parents=True, exist_ok=True)
-        # Save configuration
-        config.save_yaml(output_dir / "config.yaml")
-        # Setup logging
-        setup_logging(output_dir)
-    
-    # Setup environment
-    setup_environment()
-    
-    # Rest of the main function remains the same...
-    train_sources, train_targets, val_sources, val_targets = load_and_prepare_data(
-        jsonl_path=config.data.data_path,
-        train_sample_size=config.data.train_sample_size,
-        val_sample_size=config.data.val_sample_size,
-        train_samples_per_article=config.data.train_samples_per_article,
-        val_samples_per_article=config.data.val_samples_per_article
-    )
-    
-    model = CitationMatcher(config.model)
-    
-    train_dataset = CitationDataset(
-        sources=train_sources,
-        targets=train_targets,
-        tokenizer=model.tokenizer,
-        config=config.model,
-        verbose=accelerator.is_main_process
-    )
-    
-    val_dataset = CitationDataset(
-        sources=val_sources,
-        targets=val_targets,
-        tokenizer=model.tokenizer,
-        config=config.model,
-        verbose=accelerator.is_main_process
-    )
-    
-    train_loader = create_dataloader(
-        dataset=train_dataset,
-        batch_size=config.training.batch_size,
-        shuffle=True,
-        num_workers=config.training.num_workers
-    )
-    
-    val_loader = create_dataloader(
-        dataset=val_dataset,
-        batch_size=config.training.batch_size * 2,
-        shuffle=False,
-        num_workers=config.training.num_workers
-    )
-    
-    if accelerator.is_main_process:
-        logging.info("Starting training...")
-    
-    metrics_history = train_model(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        config=config.training,
-        save_dir=output_dir / 'checkpoints' if accelerator.is_main_process else None
-    )
-    
-    if accelerator.is_main_process:
-        torch.save(
-            {
-                'metrics_history': [metric.__dict__ for metric in metrics_history],
-                'model_config': config.model.__dict__,
-                'training_config': config.training.__dict__,
-                'data_config': config.data.__dict__
-            },
-            output_dir / 'training_history.pt'
+        print("\nRunning validation...")
+        model.eval()
+        
+        val_metrics = validate_citation_model(
+            model=model,
+            val_dataloader=val_dataloader,
+            device=device,
+            k_values=k_values
         )
-        logging.info(f"Training completed. Results saved to {output_dir}")
+        
+        print(f"\nValidation metrics:")
+        print(f"  Loss: {val_metrics['loss']:.4f}")
+        print(f"  Accuracy (top-1): {val_metrics['accuracy']:.4f}")
+        print(f"  Mean Reciprocal Rank: {val_metrics['mrr']:.4f}")
+        print(f"  Number of citations: {val_metrics['num_citations']}")
+        print(f"  Number of unique targets: {val_metrics['num_unique_targets']}")
+        print("\nTop-k accuracy:")
+        for k in k_values:
+            if f'top_{k}_accuracy' in val_metrics:
+                print(f"  k={k}: {val_metrics[f'top_{k}_accuracy']:.4f}")
+        
+        # Save best model based on validation loss
+        if val_metrics['loss'] < best_val_metrics['loss']:
+            best_val_metrics = val_metrics
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scaler_state_dict': scaler.state_dict(),
+                'validation_metrics': val_metrics,
+                'temperature': model.config.temperature
+            }, save_path)
+            print(f"\nSaved new best model to {save_path}")
+            print(f"Best validation metrics so far:")
+            print(f"  Loss: {best_val_metrics['loss']:.4f}")
+            print(f"  Accuracy (top-1): {best_val_metrics['accuracy']:.4f}")
+            print(f"  MRR: {best_val_metrics['mrr']:.4f}")
     
-    return metrics_history
+    return model
+
+
+@dataclass
+class ExperimentConfig:
+    """Configuration   the citation matching model."""
+    model_name: str = "bert-base-uncased"
+    max_length: int = 512
+    source_len: int = 512
+    target_len: int = 128
+    max_targets: int = 5
+    overlap: float = 0.5
+    cite_token: str = "<CITE>"
+    ref_token: str = "<REF>"
+    temperature: float = 0.07
+    collate_sample_size: int = None,
+    device: Optional[torch.device] = None
+
+    def __post_init__(self):
+        if self.device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
