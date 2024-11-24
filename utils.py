@@ -539,18 +539,8 @@ class CitationModel(nn.Module):
         
         return (loss, logits, cite_embeds, ref_embeds)
 
+
 def compute_retrieval_metrics(logits, labels, ks=[1, 5, 10, 50, 100, 1000]):
-    """
-    Compute various retrieval metrics including top-k accuracy and MRR.
-    
-    Args:
-        logits: Tensor of similarity scores [num_queries, num_targets]
-        labels: Tensor of correct target indices [num_queries]
-        ks: List of k values for top-k accuracy
-        
-    Returns:
-        Dictionary containing various retrieval metrics
-    """
     # Get rankings of correct targets
     correct_scores = logits[torch.arange(logits.size(0)), labels]
     rankings = (logits >= correct_scores.unsqueeze(1)).sum(1)
@@ -572,21 +562,9 @@ def validate_citation_model(
     val_dataloader,
     device: str = None,
     return_embeddings: bool = False,
-    k_values: List[int] = [1, 5, 10, 50, 100, 1000]
+    k_values: List[int] = [1, 5, 10, 50, 100, 1000],
+    similarity_batch_size: int = 4096
 ):
-    """
-    Validates citation model performance by computing loss and various retrieval metrics.
-    
-    Args:
-        model: The citation model to validate
-        val_dataloader: DataLoader containing validation data
-        device: Device to run validation on
-        return_embeddings: Whether to return computed embeddings
-        k_values: List of k values for top-k accuracy computation
-        
-    Returns:
-        dict containing validation metrics and optionally embeddings
-    """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -601,7 +579,6 @@ def validate_citation_model(
     # Accumulate embeddings and IDs
     with torch.no_grad():
         for batch in tqdm.tqdm(val_dataloader, desc="Computing embeddings"):
-            # Move batch to device
             batch = {k: v.to(device) for k, v in batch.items()}
             
             # Process source text
@@ -627,8 +604,8 @@ def validate_citation_model(
             ref_embeds = target_outputs.last_hidden_state[ref_mask]
             
             # Normalize embeddings
-            cite_embeds = F.normalize(cite_embeds, p=2, dim=-1).cpu()
-            ref_embeds = F.normalize(ref_embeds, p=2, dim=-1).cpu()
+            cite_embeds = F.normalize(cite_embeds, p=2, dim=-1)
+            ref_embeds = F.normalize(ref_embeds, p=2, dim=-1)
             
             # Store embeddings and IDs
             all_cite_embeds.append(cite_embeds.cpu())
@@ -651,24 +628,63 @@ def validate_citation_model(
     id2i = {id.item(): i for i, id in enumerate(target_art_ids_unique)}
     labels = torch.tensor([id2i[id.item()] for id in cited_art_ids], dtype=torch.long)
     
-    # Compute similarity scores
-    logits = torch.matmul(cite_embeds, ref_embeds_unique.t()) / model.config.temperature
+    # Move reference embeddings to device once
+    ref_embeds_unique = ref_embeds_unique.to(device)
     
-    # Compute loss
-    loss = F.cross_entropy(logits, labels)
+    # Initialize arrays to store results
+    total_loss = 0
+    total_correct = 0
+    all_predictions = []
+    all_logits_list = []
+    all_labels_list = []
     
-    # Compute accuracy
-    predictions = torch.argmax(logits, dim=-1)
-    accuracy = (predictions == labels).float().mean().item()
+    # Process citation embeddings in batches
+    num_batches = (len(cite_embeds) + similarity_batch_size - 1) // similarity_batch_size
     
-    # Compute retrieval metrics
-    retrieval_metrics = compute_retrieval_metrics(logits.cpu(), labels.cpu(), ks=k_values)
+    for i in tqdm.tqdm(range(num_batches), desc="Computing similarities"):
+        start_idx = i * similarity_batch_size
+        end_idx = min((i + 1) * similarity_batch_size, len(cite_embeds))
+        
+        # Move batch of citation embeddings to device
+        cite_embeds_batch = cite_embeds[start_idx:end_idx].to(device)
+        labels_batch = labels[start_idx:end_idx].to(device)
+        
+        # Compute similarity scores for this batch
+        logits_batch = torch.matmul(cite_embeds_batch, ref_embeds_unique.t()) / model.config.temperature
+        
+        # Compute loss for this batch
+        loss_batch = F.cross_entropy(logits_batch, labels_batch)
+        total_loss += loss_batch.item() * len(labels_batch)
+        
+        # Compute predictions and accuracy for this batch
+        predictions_batch = torch.argmax(logits_batch, dim=-1)
+        total_correct += (predictions_batch == labels_batch).sum().item()
+        
+        # Store predictions and logits for later computation
+        all_predictions.append(predictions_batch.cpu())
+        all_logits_list.append(logits_batch.cpu())
+        all_labels_list.append(labels_batch.cpu())
+        
+        # Clear GPU memory
+        del logits_batch, cite_embeds_batch, labels_batch, predictions_batch
+        torch.cuda.empty_cache()
     
-    # Prepare results dictionary
+    # Concatenate all predictions and compute accuracy
+    all_predictions = torch.cat(all_predictions)
+    num_citations = len(cite_embeds)
+    accuracy = total_correct / num_citations
+    avg_loss = total_loss / num_citations
+    
+    # Compute retrieval metrics using concatenated logits
+    all_logits = torch.cat(all_logits_list)
+    all_labels = torch.cat(all_labels_list)
+    retrieval_metrics = compute_retrieval_metrics(all_logits, all_labels, ks=k_values)
+    
+    # Prepare results dictionary (matching original function's output)
     results = {
-        'loss': loss.item(),
+        'loss': avg_loss,
         'accuracy': accuracy,
-        'num_citations': len(cited_art_ids),
+        'num_citations': num_citations,
         'num_unique_targets': len(target_art_ids_unique),
         'mrr': retrieval_metrics['mrr']
     }
@@ -684,11 +700,12 @@ def validate_citation_model(
             'ref_embeds': ref_embeds_unique.cpu(),
             'cited_art_ids': cited_art_ids,
             'target_art_ids': target_art_ids_unique,
-            'logits': logits.cpu(),
+            'logits': torch.cat(all_logits_list),  # Full logits matrix
             'labels': labels.cpu()
         })
     
     return results
+    
 
 def train_citation_model(
     model,
@@ -721,7 +738,12 @@ def train_citation_model(
     model.transformer.gradient_checkpointing_enable()
     
     # Initialize optimizer
-    optimizer = AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    optimizer = AdamW(
+        model.parameters(), 
+        lr=learning_rate, 
+        weight_decay=weight_decay,
+        eps=1e-8  # Increased epsilon for FP16 training stability
+    )
     
     # Training loop
     best_val_metrics = {'loss': float('inf')}
@@ -744,6 +766,8 @@ def train_citation_model(
             train_dataset,
             batch_size=batch_size,
             shuffle=True,
+            num_workers=4,  # Parallel data loading
+            pin_memory=True,  # Pin memory for faster GPU transfer
             collate_fn=citation_collate_fn
         )
 
@@ -751,6 +775,8 @@ def train_citation_model(
             val_dataset,
             batch_size=batch_size * 2, # use larger batch for validation (no gradients) 
             shuffle=False,
+            num_workers=4,  # Parallel data loading
+            pin_memory=True,  # Pin memory for faster GPU transfer
             collate_fn=citation_collate_fn
         )
         
@@ -790,6 +816,7 @@ def train_citation_model(
         
         # Validation phase
         print("\nRunning validation...")
+        torch.cuda.empty_cache()
         model.eval()
         
         val_metrics = validate_citation_model(
