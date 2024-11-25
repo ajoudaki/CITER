@@ -18,5 +18,5 @@ This repository contains a deep learning model for matching citations in Wikiped
     - Mean Reciprocal Rank: the mean value of $\frac1N \sum_i 1/r_i$ where, where $r_i$ is the rank of the true target for source $i$
    
 Illustration of the main idea:   
-![Illustration of the idea](./idea.png)
+![Illustration of the idea](./misc/idea.png)
 
