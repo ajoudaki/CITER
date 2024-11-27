@@ -22,10 +22,15 @@ training_runs/**
 venv/
 .env
 
+# wandb files
+wandb/
+
 # Data and model files
 data/
-cache/** 
+cache/
 models/
+checkpoints/
+experiments/
 
 # Logs and output files
 logs/
