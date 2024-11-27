@@ -1,11 +1,12 @@
 # Standard library imports
+import random 
 import bz2
 import json
 import logging
 import os
 import re
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple, Union
@@ -197,6 +198,14 @@ class WikiProcessor:
             citation_data.append(citations)
 
         return sources, citation_data
+
+
+# experiment related 
+
+@dataclass
+class ExperimentConfig:
+    pass
+
 
 def get_cache_path(sources, model_name: str, cache_dir: str) -> str:
     """Generate a unique cache path based on input data and model name."""
@@ -429,26 +438,6 @@ def citation_collate_fn(batch):
 
 
 
-class CitationConfig(PretrainedConfig):
-    """Configuration class for CitationModel."""
-    model_type = "citation"
-    
-    def __init__(
-        self,
-        base_model_name="bert-base-uncased",
-        vocab_size=30522,
-        cite_token_id=None,
-        ref_token_id=None,
-        temperature=0.07,
-        **kwargs
-    ):
-        super().__init__(**kwargs)
-        self.base_model_name = base_model_name
-        self.vocab_size = vocab_size
-        self.cite_token_id = cite_token_id
-        self.ref_token_id = ref_token_id
-        self.temperature = temperature
-
 @dataclass
 class CitationModelOutput:
     """Custom output class for the citation model."""
@@ -460,21 +449,25 @@ class CitationModelOutput:
 class CitationModel(nn.Module):
     """Custom model for citation matching using transformer embeddings."""
     
-    def __init__(self, config: CitationConfig):
+    def __init__(self, config: ExperimentConfig):
         super().__init__()
         
         # Load base model configuration
-        base_config = AutoConfig.from_pretrained(config.base_model_name)
+        base_config = AutoConfig.from_pretrained(config.model_name)
         
         # Store configuration
         self.config = config
         
         # Load base transformer model
-        self.transformer = AutoModel.from_pretrained(config.base_model_name)
+        self.transformer = AutoModel.from_pretrained(config.model_name)
         
         # Resize token embeddings if needed
         if config.vocab_size != self.transformer.config.vocab_size:
             self.transformer.resize_token_embeddings(config.vocab_size)
+
+        # Add learnable logit scale parameter
+        self.logit_scale = nn.Parameter(torch.ones([]) * config.initial_logit_scale)
+
     
     def get_citation_masks(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Create mask for citation token positions."""
@@ -523,8 +516,11 @@ class CitationModel(nn.Module):
         cite_embeds = F.normalize(cite_embeds, p=2, dim=-1)
         ref_embeds = F.normalize(ref_embeds, p=2, dim=-1)
         
-        # Compute similarity scores
-        logits = torch.matmul(cite_embeds, ref_embeds.t()) / self.config.temperature
+        # Clamp logit scale to prevent numerical instability
+        logit_scale = torch.clamp(self.logit_scale, 0, torch.log(torch.tensor(20.0)))
+        
+        # Compute similarity scores with learned scale
+        logits = torch.matmul(cite_embeds, ref_embeds.t()) * logit_scale.exp()
 
         # compute the loss 
         loss = F.cross_entropy(logits, labels)
@@ -557,13 +553,14 @@ def compute_retrieval_metrics(logits, labels, ks=[1, 5, 10, 50, 100, 1000]):
     
     return metrics
 
+
 def validate_citation_model(
     model,
     val_dataloader,
     device: str = None,
     return_embeddings: bool = False,
     k_values: List[int] = [1, 5, 10, 50, 100, 1000],
-    similarity_batch_size: int = 4096
+    similarity_batch_size: int = 512
 ):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -579,7 +576,9 @@ def validate_citation_model(
     # Accumulate embeddings and IDs
     with torch.no_grad():
         for batch in tqdm.tqdm(val_dataloader, desc="Computing embeddings"):
-            batch = {k: v.to(device) for k, v in batch.items()}
+            # Move batch to device and convert to FP16
+            batch = {k: (v.to(device, dtype=torch.float16) if isinstance(v, torch.FloatTensor) 
+                        else v.to(device)) for k, v in batch.items()}
             
             # Process source text
             source_outputs = model.transformer(
@@ -595,23 +594,25 @@ def validate_citation_model(
                 return_dict=True
             )
             
-            # Get citation mask and extract citation embeddings
+            # Extract embeddings with masks
             cite_mask = model.get_citation_masks(batch['source_ids'])
             cite_embeds = source_outputs.last_hidden_state[cite_mask]
-            
-            # Get reference mask and extract reference embeddings
             ref_mask = model.get_reference_masks(batch['target_ids'])
             ref_embeds = target_outputs.last_hidden_state[ref_mask]
             
-            # Normalize embeddings
-            cite_embeds = F.normalize(cite_embeds, p=2, dim=-1)
-            ref_embeds = F.normalize(ref_embeds, p=2, dim=-1)
+            # Normalize and move to CPU immediately
+            cite_embeds = F.normalize(cite_embeds, p=2, dim=-1).cpu()
+            ref_embeds = F.normalize(ref_embeds, p=2, dim=-1).cpu()
             
-            # Store embeddings and IDs
-            all_cite_embeds.append(cite_embeds.cpu())
-            all_ref_embeds.append(ref_embeds.cpu())
+            # Store embeddings and IDs on CPU
+            all_cite_embeds.append(cite_embeds)
+            all_ref_embeds.append(ref_embeds)
             all_cited_art_ids.append(batch['cited_art_ids'].cpu())
             all_target_art_ids.append(batch['target_art_ids'].cpu())
+            
+            # Clear GPU cache after each batch
+            del source_outputs, target_outputs, cite_embeds, ref_embeds
+            torch.cuda.empty_cache()
     
     # Concatenate all accumulated tensors
     cite_embeds = torch.cat(all_cite_embeds)
@@ -628,59 +629,59 @@ def validate_citation_model(
     id2i = {id.item(): i for i, id in enumerate(target_art_ids_unique)}
     labels = torch.tensor([id2i[id.item()] for id in cited_art_ids], dtype=torch.long)
     
-    # Move reference embeddings to device once
-    ref_embeds_unique = ref_embeds_unique.to(device)
-    
-    # Initialize arrays to store results
+    # Process in smaller batches for similarity computation
     total_loss = 0
     total_correct = 0
     all_predictions = []
-    all_logits_list = []
-    all_labels_list = []
+    logits_list = []  # Store logits temporarily for metrics computation
+    labels_list = []  # Store labels temporarily for metrics computation
     
-    # Process citation embeddings in batches
     num_batches = (len(cite_embeds) + similarity_batch_size - 1) // similarity_batch_size
+    logit_scale = torch.clamp(model.logit_scale, 0, torch.log(torch.tensor(20.0)))
+    
+    # Move ref_embeds to GPU once
+    ref_embeds_unique = ref_embeds_unique.to(device)
     
     for i in tqdm.tqdm(range(num_batches), desc="Computing similarities"):
         start_idx = i * similarity_batch_size
         end_idx = min((i + 1) * similarity_batch_size, len(cite_embeds))
         
-        # Move batch of citation embeddings to device
+        # Process batch
         cite_embeds_batch = cite_embeds[start_idx:end_idx].to(device)
         labels_batch = labels[start_idx:end_idx].to(device)
         
-        # Compute similarity scores for this batch
-        logits_batch = torch.matmul(cite_embeds_batch, ref_embeds_unique.t()) / model.config.temperature
+        # Compute similarities and loss
+        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+            logits_batch = torch.matmul(cite_embeds_batch, ref_embeds_unique.t()) * logit_scale.exp()
+            loss_batch = F.cross_entropy(logits_batch, labels_batch)
         
-        # Compute loss for this batch
-        loss_batch = F.cross_entropy(logits_batch, labels_batch)
         total_loss += loss_batch.item() * len(labels_batch)
-        
-        # Compute predictions and accuracy for this batch
         predictions_batch = torch.argmax(logits_batch, dim=-1)
         total_correct += (predictions_batch == labels_batch).sum().item()
         
-        # Store predictions and logits for later computation
+        # Store predictions and move to CPU
         all_predictions.append(predictions_batch.cpu())
-        all_logits_list.append(logits_batch.cpu())
-        all_labels_list.append(labels_batch.cpu())
+        logits_list.append(logits_batch.cpu())
+        labels_list.append(labels_batch.cpu())
         
         # Clear GPU memory
         del logits_batch, cite_embeds_batch, labels_batch, predictions_batch
         torch.cuda.empty_cache()
     
-    # Concatenate all predictions and compute accuracy
-    all_predictions = torch.cat(all_predictions)
+    # Compute final metrics
     num_citations = len(cite_embeds)
     accuracy = total_correct / num_citations
     avg_loss = total_loss / num_citations
     
-    # Compute retrieval metrics using concatenated logits
-    all_logits = torch.cat(all_logits_list)
-    all_labels = torch.cat(all_labels_list)
+    # Compute retrieval metrics
+    all_logits = torch.cat(logits_list)
+    all_labels = torch.cat(labels_list)
     retrieval_metrics = compute_retrieval_metrics(all_logits, all_labels, ks=k_values)
     
-    # Prepare results dictionary (matching original function's output)
+    # Clear temporary lists
+    del logits_list, labels_list
+    torch.cuda.empty_cache()
+    
     results = {
         'loss': avg_loss,
         'accuracy': accuracy,
@@ -689,96 +690,383 @@ def validate_citation_model(
         'mrr': retrieval_metrics['mrr']
     }
     
-    # Add top-k accuracies to results
+    # Add top-k accuracies
     for k in k_values:
         if f'top_{k}_accuracy' in retrieval_metrics:
             results[f'top_{k}_accuracy'] = retrieval_metrics[f'top_{k}_accuracy']
     
     if return_embeddings:
         results.update({
-            'cite_embeds': cite_embeds.cpu(),
+            'cite_embeds': cite_embeds,
             'ref_embeds': ref_embeds_unique.cpu(),
             'cited_art_ids': cited_art_ids,
             'target_art_ids': target_art_ids_unique,
-            'logits': torch.cat(all_logits_list),  # Full logits matrix
-            'labels': labels.cpu()
+            'logits': all_logits,
+            'labels': labels
         })
     
-    return results
+    # Final cleanup
+    del cite_embeds, ref_embeds, ref_embeds_unique
+    torch.cuda.empty_cache()
     
+    return results
+
+
+@dataclass
+class ExperimentConfig:
+    # Model configuration
+    model_name: str = "bert-base-uncased"
+    vocab_size: Optional[int] = None
+    initial_logit_scale: float = np.log(1/0.07)
+    
+    # Random seed configuration
+    seed: int = 42
+    
+    # Token configuration
+    cite_token: str = "<CITE>"
+    ref_token: str = "<REF>"
+    cite_token_id: Optional[int] = None
+    ref_token_id: Optional[int] = None
+    
+    # Text processing configuration
+    max_length: int = 512
+    source_len: int = 512
+    target_len: int = 128
+    max_targets: int = 5
+    overlap: float = 0.5
+    
+    # Training configuration
+    num_epochs: int = 100
+    learning_rate: float = 1.5e-4
+    logits_learning_rate: float = 1.5e-2
+    max_grad_norm: float = 1.0
+    Adam_eps: float = 1e-8
+    weight_decay: float = 0.01
+    warmup_steps: int = 0
+    batch_size: int = 200
+    train_ratio: float = 0.5
+    collate_sample_size: Optional[int] = None
+    
+    # Evaluation configuration
+    k_values: List[int] = field(default_factory=lambda: [1, 5, 10, 50, 100, 1000])
+    
+    # Checkpoint configuration
+    checkpoint_dir: str = "./checkpoints"
+    checkpoint_every: int = 1000
+    project_name: str = "citation-matching"
+    run_name: Optional[str] = None
+    resume_from: Optional[str] = None
+    
+    # Hardware configuration
+    device: Optional[torch.device] = None
+    
+    def __post_init__(self):
+        if self.device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    def get_checkpoint_dir(self) -> Path:
+        if self.project_name and self.run_name:
+            checkpoint_path = Path(self.checkpoint_dir) / self.project_name / self.run_name
+        elif self.project_name:
+            checkpoint_path = Path(self.checkpoint_dir) / self.project_name
+        else:
+            checkpoint_path = Path(self.checkpoint_dir)
+        checkpoint_path.mkdir(parents=True, exist_ok=True)
+        return checkpoint_path
+    
+    def save(self, path: Path):
+        with open(path / "config.yaml", 'w') as f:
+            yaml.dump(asdict(self), f)
+    
+    @classmethod
+    def load(cls, path: Path) -> 'ExperimentConfig':
+        with open(path / "config.yaml", 'r') as f:
+            config_dict = yaml.safe_load(f)
+        return cls(**config_dict)
+    
+    def set_seed(self):
+        random.seed(self.seed)
+        np.random.seed(self.seed)
+        torch.manual_seed(self.seed)
+        torch.cuda.manual_seed_all(self.seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+class Experiment:
+    def __init__(self, config: ExperimentConfig):
+        self.config = config
+        
+        # Initialize tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+        self.tokenizer.add_special_tokens({
+            'additional_special_tokens': [config.cite_token, config.ref_token]
+        })
+        
+        # Update config with tokenizer-dependent values
+        config.cite_token_id = self.tokenizer.convert_tokens_to_ids(config.cite_token)
+        config.ref_token_id = self.tokenizer.convert_tokens_to_ids(config.ref_token)
+        config.vocab_size = len(self.tokenizer)
+        
+        # Initialize model
+        self.model = CitationModel(config)
+        
+        # Load checkpoint if specified
+        if config.resume_from:
+            self.load_checkpoint(config.resume_from)
+    
+    def get_checkpoint_path(self, step: Optional[int] = None, epoch: Optional[int] = None, is_best: bool = False) -> Path:
+        checkpoint_dir = self.config.get_checkpoint_dir()
+        
+        if is_best:
+            return checkpoint_dir / "best_model.pt"
+        elif step is not None:
+            return checkpoint_dir / f"checkpoint-step-{step}.pt"
+        elif epoch is not None:
+            return checkpoint_dir / f"checkpoint-epoch-{epoch}.pt"
+        else:
+            raise ValueError("Must specify either step, epoch, or is_best=True")
+    
+    def save_checkpoint(self, 
+                       path: Path, 
+                       optimizer: Optional[torch.optim.Optimizer] = None,
+                       scaler: Optional[GradScaler] = None,
+                       epoch: Optional[int] = None,
+                       batch_in_epoch: Optional[int] = None,
+                       global_step: Optional[int] = None,
+                       val_metrics: Optional[dict] = None,
+                       best_val_metrics: Optional[dict] = None,
+                       wandb_run_id: Optional[str] = None,
+                       is_best: bool = False):
+        
+        # Save RNG states as numpy arrays
+        rng_state = {
+            'python': random.getstate(),
+            'numpy': np.random.get_state(),
+            'torch': torch.get_rng_state().cpu().numpy(),
+            'cuda': torch.cuda.get_rng_state().cpu().numpy() if torch.cuda.is_available() else None
+        }
+        
+        # Prepare save dictionary
+        save_dict = {
+            'model_state_dict': self.model.state_dict(),
+            'config': self.config,
+            'rng_state': rng_state,
+        }
+        
+        # Add optional states
+        if optimizer is not None:
+            save_dict['optimizer_state_dict'] = optimizer.state_dict()
+        if scaler is not None:
+            save_dict['scaler_state_dict'] = scaler.state_dict()
+        if epoch is not None:
+            save_dict['epoch'] = epoch
+        if batch_in_epoch is not None:
+            save_dict['batch_in_epoch'] = batch_in_epoch
+        if global_step is not None:
+            save_dict['global_step'] = global_step
+        if val_metrics is not None:
+            save_dict['validation_metrics'] = val_metrics
+        if best_val_metrics is not None:
+            save_dict['best_val_metrics'] = best_val_metrics
+        if wandb_run_id is not None:
+            save_dict['wandb_run_id'] = wandb_run_id
+        
+        # Save checkpoint and config
+        torch.save(save_dict, path)
+        self.config.save(path.parent)
+        
+        if is_best:
+            print(f"\nSaved new best model to {path}")
+            if val_metrics:
+                print("Best validation metrics:")
+                for metric in ['loss', 'accuracy', 'mrr']:
+                    if metric in val_metrics:
+                        print(f"  {metric}: {val_metrics[metric]:.4f}")
+    
+    def load_checkpoint(self, checkpoint_path: Union[str, Path]) -> dict:
+        checkpoint_path = Path(checkpoint_path)
+        checkpoint = torch.load(checkpoint_path, map_location=self.config.device)
+        
+        # Load model state
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+
+        # Load config if present
+        if 'config' in checkpoint:
+            resume_from = self.config.resume_from
+            self.config = checkpoint['config']
+            self.config.resume_from = resume_from
+        
+        # Restore RNG states
+        if 'rng_state' in checkpoint:
+            random.setstate(checkpoint['rng_state']['python'])
+            np.random.set_state(checkpoint['rng_state']['numpy'])
+            torch.set_rng_state(torch.tensor(checkpoint['rng_state']['torch'], dtype=torch.uint8))
+            if torch.cuda.is_available() and checkpoint['rng_state']['cuda'] is not None:
+                torch.cuda.set_rng_state(torch.tensor(checkpoint['rng_state']['cuda'], dtype=torch.uint8))
+
+        # Initialize missing fields with defaults if not present
+        default_fields = {
+            'optimizer_state_dict': None,
+            'scaler_state_dict': None,
+            'epoch': 0,
+            'batch_in_epoch': 0,
+            'global_step': 0,
+            'validation_metrics': None,
+            'best_val_metrics': {'loss': float('inf')},
+            'wandb_run_id': None
+        }
+        
+        for field, default_value in default_fields.items():
+            if field not in checkpoint:
+                checkpoint[field] = default_value
+        
+        return checkpoint
+    
+    def get_model(self) -> CitationModel:
+        return self.model
+    
+    def get_tokenizer(self) -> AutoTokenizer:
+        return self.tokenizer
+    
+    def get_results(self, cache_path=None):
+        if cache_path:
+            results = tokenize_sources(cache_path=cache_path)
+        else:
+            preprocessor = WikiProcessor()
+            sources, citation_data = preprocessor.find_source_citations()
+            results = tokenize_sources(sources, citation_data, self.tokenizer, cache_dir="cache")
+        return results
+
+
 
 def train_citation_model(
-    model,
-    results,
-    tokenizer,
-    config,
-    train_ratio: float = 0.8,
-    num_epochs: int = 5,
-    learning_rate: float = 1.5e-4,
-    weight_decay: float = 0.01,
-    warmup_steps: int = 0,
-    device: str = None,
-    save_path: str = "citation_model.pt",
-    batch_size: int = 128,
-    temperatures = [],
-    k_values = [1, 5, 10, 50, 100, 1000]
-):
-    # Set device
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    experiment: Experiment,
+    results: List[dict],
+) -> CitationModel:
+    """
+    Memory-optimized training function with enhanced checkpoint management.
+    """
+    import wandb
+    import gc
     
-    # Initialize gradient scaler for mixed precision training
+    config = experiment.config
+    model = experiment.model
+    tokenizer = experiment.tokenizer
+    
+    # Set random seeds
+    config.set_seed()
+    
+    # Initialize or resume wandb run
+    if config.resume_from:
+        checkpoint = experiment.load_checkpoint(config.resume_from)
+        wandb_run_id = checkpoint['wandb_run_id']
+        print(f"Resuming wandb run: {wandb_run_id}")
+        wandb.init(
+            project=config.project_name,
+            name=config.run_name,
+            id=wandb_run_id,
+            resume="must"
+        )
+    else:
+        wandb.init(
+            project=config.project_name,
+            name=config.run_name,
+            config=config,
+        )
+        
+        # Update run name in config if not set
+        if not config.run_name:
+            config.run_name = wandb.run.name
+    
+    # Initialize training state
+    global_step = 0
+    start_epoch = 0
+    batch_in_epoch = 0
+    best_val_metrics = {'loss': float('inf')}
     scaler = GradScaler()
     
-    # Move model to device
-    model = model.to(device)
-    
-    # Enable memory efficient training
+    # Move model to device and enable memory efficient training
+    model = model.to(config.device)
     model.transformer.gradient_checkpointing_enable()
     
     # Initialize optimizer
-    optimizer = AdamW(
-        model.parameters(), 
-        lr=learning_rate, 
-        weight_decay=weight_decay,
-        eps=1e-8  # Increased epsilon for FP16 training stability
-    )
+    optimizer = AdamW([
+        {
+            'params': [p for n, p in model.named_parameters() if n != 'logit_scale'],
+            'lr': config.learning_rate,
+            'weight_decay': config.weight_decay,
+            'eps': config.Adam_eps
+        },
+        {
+            'params': [model.logit_scale],
+            'lr': config.logits_learning_rate,
+            'weight_decay': 0
+        }
+    ])
     
-    # Training loop
-    best_val_metrics = {'loss': float('inf')}
+    # Load checkpoint state if resuming
+    if config.resume_from:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        global_step = checkpoint['global_step']
+        start_epoch = checkpoint['epoch']
+        batch_in_epoch = checkpoint['batch_in_epoch']
+        best_val_metrics = checkpoint['best_val_metrics']
+        print(f"Resumed from checkpoint at epoch {start_epoch}, batch {batch_in_epoch}, step {global_step}")
     
-    for epoch in range(num_epochs):
-        print(f"\nEpoch {epoch + 1}/{num_epochs}")
-        if epoch < len(temperatures):
-            model.config.temperature = temperatures[epoch]
-            print(f"temperature changed to {temperatures[epoch]}")
+    for epoch in range(start_epoch, config.num_epochs):
+        print(f"\nEpoch {epoch + 1}/{config.num_epochs}")
         
-        # Create new collated data for this epoch
+        # Log current scale
+        current_scale = model.logit_scale.exp().item()
+        print(f"Current logit scale: {current_scale:.4f}")
+        wandb.log({"logit_scale": current_scale}, step=global_step)
+        
+        # Training data preparation
         print("Collating training data with new random masks...")
         collated = collate(results, tokenizer, config)
         dataset = CitationDataset(collated)
-        train_size = int(len(dataset) * train_ratio)
-        train_dataset = dataset[:train_size]
-        val_dataset = dataset[train_size:]
+        
+        # Create train/val split
+        indices = np.arange(len(dataset))
+        train_size = int(len(dataset) * config.train_ratio)
+        train_indices = indices[:train_size]
+        val_indices = indices[train_size:]
+
+        from torch.utils.data import Subset
+        train_dataset = Subset(dataset, train_indices)
+        val_dataset = Subset(dataset, val_indices)
+        
+        # Create dataloaders
+        generator = torch.Generator()
+        generator.manual_seed(config.seed + epoch)
         
         train_dataloader = DataLoader(
             train_dataset,
-            batch_size=batch_size,
+            batch_size=config.batch_size,
             shuffle=True,
-            num_workers=4,  # Parallel data loading
-            pin_memory=True,  # Pin memory for faster GPU transfer
-            collate_fn=citation_collate_fn
+            num_workers=4,
+            pin_memory=True,
+            drop_last=True,
+            collate_fn=citation_collate_fn,
+            generator=generator
         )
-
+        
         val_dataloader = DataLoader(
             val_dataset,
-            batch_size=batch_size * 2, # use larger batch for validation (no gradients) 
+            batch_size=int(config.batch_size * 1.8),
             shuffle=False,
-            num_workers=4,  # Parallel data loading
-            pin_memory=True,  # Pin memory for faster GPU transfer
+            num_workers=4,
+            pin_memory=True,
+            drop_last=True,
             collate_fn=citation_collate_fn
         )
+        
+        # Clear memory
+        del collated, dataset
+        gc.collect()
+        torch.cuda.empty_cache()
         
         # Training phase
         model.train()
@@ -787,91 +1075,149 @@ def train_citation_model(
         
         progress_bar = tqdm.tqdm(train_dataloader, desc="Training")
         
-        for batch in progress_bar:
-            # Move batch to device
-            batch = {k: v.to(device) for k, v in batch.items()}
+        for batch_idx, batch in enumerate(progress_bar):
+            # Skip previously processed batches if resuming
+            if epoch == start_epoch and batch_idx < batch_in_epoch:
+                continue
             
-            # Clear gradients
+            batch = {k: v.to(config.device) for k, v in batch.items()}
+            
             optimizer.zero_grad()
             
             # Forward pass with mixed precision
-            with torch.amp.autocast('cuda'):
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                 outputs = model(**batch)
                 loss = outputs.loss
             
             # Backward pass with gradient scaling
             scaler.scale(loss).backward()
+            
+            if config.max_grad_norm:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+            
             scaler.step(optimizer)
             scaler.update()
             
-            # Update tracking variables
+            # Update tracking
             total_train_loss += loss.item()
             train_steps += 1
             
-            # Update progress bar
+            # Log metrics
+            wandb.log({
+                "train/batch_loss": loss.item(),
+                'logit_scale': model.logit_scale.item(),
+                "train/learning_rate": optimizer.param_groups[0]["lr"],
+                "train/batch_in_epoch": batch_idx,
+                "epoch": epoch
+            }, step=global_step)
+            
             progress_bar.set_postfix({'loss': loss.item()})
+            
+            # Save checkpoint periodically
+            if global_step > 0 and global_step % config.checkpoint_every == 0:
+                checkpoint_path = experiment.get_checkpoint_path(step=global_step)
+                experiment.save_checkpoint(
+                    checkpoint_path,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    epoch=epoch,
+                    batch_in_epoch=batch_idx,
+                    global_step=global_step,
+                    wandb_run_id=wandb.run.id
+                )
+                print(f"\nSaved checkpoint at step {global_step} to {checkpoint_path}")
+            
+            global_step += 1
+            
+            # Clear memory
+            del outputs, loss, batch
+            torch.cuda.empty_cache()
         
+        # Log epoch-level training metrics
         avg_train_loss = total_train_loss / train_steps
         print(f"\nAverage training loss: {avg_train_loss:.4f}")
+        wandb.log({
+            "train/epoch_loss": avg_train_loss,
+            "epoch": epoch
+        }, step=global_step)
         
         # Validation phase
         print("\nRunning validation...")
         torch.cuda.empty_cache()
         model.eval()
         
-        val_metrics = validate_citation_model(
-            model=model,
-            val_dataloader=val_dataloader,
-            device=device,
-            k_values=k_values
-        )
+        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+            val_metrics = validate_citation_model(
+                model=model,
+                val_dataloader=val_dataloader,
+                device=config.device,
+                k_values=config.k_values
+            )
         
-        print(f"\nValidation metrics:")
-        print(f"  Loss: {val_metrics['loss']:.4f}")
-        print(f"  Accuracy (top-1): {val_metrics['accuracy']:.4f}")
-        print(f"  Mean Reciprocal Rank: {val_metrics['mrr']:.4f}")
-        print(f"  Number of citations: {val_metrics['num_citations']}")
-        print(f"  Number of unique targets: {val_metrics['num_unique_targets']}")
-        print("\nTop-k accuracy:")
-        for k in k_values:
+        # Log validation metrics
+        wandb_val_metrics = {
+            "val/loss": val_metrics['loss'],
+            "val/accuracy": val_metrics['accuracy'],
+            "val/mrr": val_metrics['mrr']
+        }
+        
+        for k in config.k_values:
             if f'top_{k}_accuracy' in val_metrics:
-                print(f"  k={k}: {val_metrics[f'top_{k}_accuracy']:.4f}")
+                wandb_val_metrics[f"val/top_{k}_accuracy"] = val_metrics[f'top_{k}_accuracy']
         
-        # Save best model based on validation loss
+        wandb.log(wandb_val_metrics, step=global_step)
+        
+        # Print validation metrics
+        print(f"\nValidation metrics:")
+        for metric, value in val_metrics.items():
+            if isinstance(value, (int, float)):
+                print(f"  {metric}: {value:.4f}")
+        
+        # Save best model if validation loss improved
         if val_metrics['loss'] < best_val_metrics['loss']:
             best_val_metrics = val_metrics
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scaler_state_dict': scaler.state_dict(),
-                'validation_metrics': val_metrics,
-                'temperature': model.config.temperature
-            }, save_path)
-            print(f"\nSaved new best model to {save_path}")
-            print(f"Best validation metrics so far:")
-            print(f"  Loss: {best_val_metrics['loss']:.4f}")
-            print(f"  Accuracy (top-1): {best_val_metrics['accuracy']:.4f}")
-            print(f"  MRR: {best_val_metrics['mrr']:.4f}")
+            best_model_path = experiment.get_checkpoint_path(is_best=True)
+            experiment.save_checkpoint(
+                best_model_path,
+                optimizer=optimizer,
+                scaler=scaler,
+                epoch=epoch,
+                batch_in_epoch=batch_idx,
+                global_step=global_step,
+                val_metrics=val_metrics,
+                best_val_metrics=best_val_metrics,
+                wandb_run_id=wandb.run.id,
+                is_best=True
+            )
+            
+            # Update wandb summary with best metrics
+            wandb.run.summary.update({
+                "best_val_loss": val_metrics['loss'],
+                "best_val_accuracy": val_metrics['accuracy'],
+                "best_val_mrr": val_metrics['mrr'],
+                "best_model_epoch": epoch,
+                "best_model_step": global_step
+            })
+        
+        # Save epoch checkpoint
+        epoch_checkpoint_path = experiment.get_checkpoint_path(epoch=epoch)
+        experiment.save_checkpoint(
+            epoch_checkpoint_path,
+            optimizer=optimizer,
+            scaler=scaler,
+            epoch=epoch,
+            batch_in_epoch=batch_idx,
+            global_step=global_step,
+            val_metrics=val_metrics,
+            best_val_metrics=best_val_metrics,
+            wandb_run_id=wandb.run.id
+        )
+        
+        # Clear memory after each epoch
+        del val_metrics, train_dataloader, val_dataloader
+        gc.collect()
+        torch.cuda.empty_cache()
     
+    wandb.finish()
     return model
-
-
-@dataclass
-class ExperimentConfig:
-    """Configuration   the citation matching model."""
-    model_name: str = "bert-base-uncased"
-    max_length: int = 512
-    source_len: int = 512
-    target_len: int = 128
-    max_targets: int = 5
-    overlap: float = 0.5
-    cite_token: str = "<CITE>"
-    ref_token: str = "<REF>"
-    temperature: float = 0.07
-    collate_sample_size: int = None,
-    device: Optional[torch.device] = None
-
-    def __post_init__(self):
-        if self.device is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
