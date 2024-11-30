@@ -7,27 +7,23 @@ import os
 import re
 import sqlite3
 from dataclasses import dataclass, field, asdict
-from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple, Union
 import xml.etree.ElementTree as ET
+import hashlib
 
 # Third-party imports
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import GradScaler
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from transformers import (
     AutoConfig,
     AutoModel,
     AutoTokenizer,
-    PreTrainedModel,
-    PretrainedConfig,
-    Trainer,
-    TrainingArguments
 )
 import tqdm 
 import yaml
@@ -206,6 +202,9 @@ class WikiProcessor:
 class ExperimentConfig:
     pass
 
+class Experiment:
+    pass
+
 
 def get_cache_path(sources, model_name: str, cache_dir: str) -> str:
     """Generate a unique cache path based on input data and model name."""
@@ -329,7 +328,7 @@ def collate(results, tokenizer, config):
             mask_tokens = np.where(np.isin(input_ids,bracket_tokens),1, mask_tokens)
             # don't mask the citation tokens 
             mask_tokens[cite_tokens_mask] = 0
-            # set the citation tokens (first token of a citation range) as special token <CITE> 
+            # set the citation tokens (first token of a citation range) as special cite token  
             input_ids[cite_tokens_mask] = cite_token
             # mask all tokens in a citation, except for the first (special) token 
             source_ids = input_ids[mask_tokens == 0]
@@ -390,7 +389,7 @@ def collate(results, tokenizer, config):
     
     return collated_data
 
-class CitationDataset(torch.utils.data.Dataset):
+class CitationDataset(Dataset):
     """Dataset for citation data with stacked targets."""
     
     def __init__(self, collated_data):
@@ -553,17 +552,21 @@ def compute_retrieval_metrics(logits, labels, ks=[1, 5, 10, 50, 100, 1000]):
     
     return metrics
 
-
+def valid_batch(batch, config: ExperimentConfig):
+    c1 = (batch['source_ids']==config.cite_token_id).sum()==batch['cited_art_ids'].shape[0]  # special cite tokens correspond to the cited article ids
+    c2 =  (batch['cited_art_ids'].shape[0]==batch['labels'].shape[0])  # each cited article id has a corresponding target label
+    c3 = (batch['target_ids']==config.ref_token_id).sum()==batch['target_art_ids'].shape[0]  # special ref tokens correspond to the target article ids
+    return c1 and c2 and c3 
+    
 def validate_citation_model(
     model,
     val_dataloader,
-    device: str = None,
     return_embeddings: bool = False,
     k_values: List[int] = [1, 5, 10, 50, 100, 1000],
-    similarity_batch_size: int = 512
+    similarity_batch_size: int = 512,
+    config: ExperimentConfig = None
 ):
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = config.device
     
     model.eval()
     
@@ -576,6 +579,8 @@ def validate_citation_model(
     # Accumulate embeddings and IDs
     with torch.no_grad():
         for batch in tqdm.tqdm(val_dataloader, desc="Computing embeddings"):
+            if not valid_batch(batch, config):
+                continue
             # Move batch to device and convert to FP16
             batch = {k: (v.to(device, dtype=torch.float16) if isinstance(v, torch.FloatTensor) 
                         else v.to(device)) for k, v in batch.items()}
@@ -723,8 +728,8 @@ class ExperimentConfig:
     seed: int = 42
     
     # Token configuration
-    cite_token: str = "<CITE>"
-    ref_token: str = "<REF>"
+    cite_token: str = "[[CITE]]"
+    ref_token: str = "[[REF]]"
     cite_token_id: Optional[int] = None
     ref_token_id: Optional[int] = None
     
@@ -762,7 +767,7 @@ class ExperimentConfig:
     
     def __post_init__(self):
         if self.device is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     
     def get_checkpoint_dir(self) -> Path:
         if self.project_name and self.run_name:
@@ -1075,7 +1080,9 @@ def train_citation_model(
         
         progress_bar = tqdm.tqdm(train_dataloader, desc="Training")
         
-        for batch_idx, batch in enumerate(progress_bar):
+        for batch_idx, batch in enumerate(progress_bar):     
+            if not valid_batch(batch, config):
+                continue
             # Skip previously processed batches if resuming
             if epoch == start_epoch and batch_idx < batch_in_epoch:
                 continue
@@ -1151,8 +1158,8 @@ def train_citation_model(
             val_metrics = validate_citation_model(
                 model=model,
                 val_dataloader=val_dataloader,
-                device=config.device,
-                k_values=config.k_values
+                k_values=config.k_values,
+                config=config,
             )
         
         # Log validation metrics
@@ -1221,3 +1228,34 @@ def train_citation_model(
     
     wandb.finish()
     return model
+
+
+config = ExperimentConfig(
+    project_name="citation-matching",
+    # model_name="google-bert/bert-large-uncased",
+    run_name=None,
+    checkpoint_dir="./checkpoints",
+    checkpoint_every=500,
+    seed=42,
+    collate_sample_size=None,
+    batch_size=290,
+    initial_logit_scale=np.log(1/0.05),
+    train_ratio=.95,
+    learning_rate=1.5e-4,
+    logits_learning_rate=0,
+    max_grad_norm=0.5,
+    device="cuda:0"
+)
+
+
+if __name__ == "__main__":
+    experiment = Experiment(config)
+    results = experiment.get_results(cache_path='./cache/tokenized_1caf5def_eb27a5477eaa3d549aebc4886f3717d1.pt')
+    
+    # Train from scratch
+    trained_model = train_citation_model(experiment, results)
+    
+    # # Or resume from checkpoint
+    # config.resume_from = './checkpoints/citation-matching/icy-water-83/checkpoint-step-2000.pt'
+    # experiment = Experiment(config)
+    # trained_model = train_citation_model(experiment, results)
