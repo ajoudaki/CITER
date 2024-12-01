@@ -15,10 +15,10 @@ from transformers import (
 )
 import tqdm 
 
-from data_utils import CitationExtractor
+from data_processing import CitationExtractor
 from config import TrainingConfig
 from architecture import CitationModel
-from data_utils import prepare_training_data, create_training_batches, citation_collate_fn, CitationDataset
+from data_processing import prepare_training_data, create_training_batches, citation_collate_fn, CitationDataset
 
 
 
