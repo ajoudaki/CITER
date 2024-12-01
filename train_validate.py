@@ -1,35 +1,23 @@
 # Standard library imports
 import random 
-import bz2
-import json
-import logging
-import os
-import re
-import sqlite3
-from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple, Union
-import xml.etree.ElementTree as ET
-import hashlib
+from typing import List, Optional, Union
 
 # Third-party imports
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.cuda.amp import GradScaler
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader 
 from transformers import (
-    AutoConfig,
-    AutoModel,
     AutoTokenizer,
 )
 import tqdm 
-import yaml
 
+from data_utils import CitationExtractor
 from config import TrainingConfig
-from architecture import CitationModel, CitationModelOutput
+from architecture import CitationModel
 from data_utils import prepare_training_data, create_training_batches, citation_collate_fn, CitationDataset
 
 
@@ -541,8 +529,8 @@ class TrainingManager:
                 
                 # Save checkpoint periodically
                 if global_step > 0 and global_step % config.checkpoint_every == 0:
-                    checkpoint_path = experiment.get_checkpoint_path(step=global_step)
-                    experiment.save_checkpoint(
+                    checkpoint_path = self.get_checkpoint_path(step=global_step)
+                    self.save_checkpoint(
                         checkpoint_path,
                         optimizer=optimizer,
                         scaler=scaler,
@@ -605,8 +593,8 @@ class TrainingManager:
             # Save best model if validation loss improved
             if val_metrics['loss'] < best_val_metrics['loss']:
                 best_val_metrics = val_metrics
-                best_model_path = experiment.get_checkpoint_path(is_best=True)
-                experiment.save_checkpoint(
+                best_model_path = self.get_checkpoint_path(is_best=True)
+                self.save_checkpoint(
                     best_model_path,
                     optimizer=optimizer,
                     scaler=scaler,
@@ -629,8 +617,8 @@ class TrainingManager:
                 })
             
             # Save epoch checkpoint
-            epoch_checkpoint_path = experiment.get_checkpoint_path(epoch=epoch)
-            experiment.save_checkpoint(
+            epoch_checkpoint_path = self.get_checkpoint_path(epoch=epoch)
+            self.save_checkpoint(
                 epoch_checkpoint_path,
                 optimizer=optimizer,
                 scaler=scaler,
