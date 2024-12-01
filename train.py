@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 
 from config import TrainingConfig
-from train_validate import TrainingManager
+from trainer import TrainingManager
 
 config = TrainingConfig(
     project_name="citation-matching",
