@@ -2,9 +2,9 @@
 import bz2
 import json
 import logging
-import osimport re
+import re
 import sqlite3
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, List, Optional, Tuple, Union
 import xml.etree.ElementTree as ET
