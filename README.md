@@ -1,4 +1,4 @@
-# CITER: Contrastive Inference in Text Embedding and Reference
+# CiTER: Contrast*i*ve Text Embeddings for Retrieval
 
 This project aims to use language models to predict and understand relationships between documents through citations and references, by learning abstract representations of documents to identify relevant citations and references across different types of content including academic papers, wiki articles, and technical documents. We want the model to be able to embed the citing page (with the text of citation masked) and the target in a vector space, such that these vectors are close. Thus, given a page with a reference masked, we can retrieve pages that are likely to be at that location. 
 
