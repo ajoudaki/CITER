@@ -132,7 +132,7 @@ class ArticleStorage:
 
 
 
-class WikiProcessor:
+class CitationExtractor:
     """Prepares citation data for model training."""
 
     def __init__(self, jsonl_path: str = "data/wiki_articles.jsonl"):
@@ -147,12 +147,12 @@ class WikiProcessor:
                 article = json.loads(line)
                 ref = article['title'].lower()
                 id = len(self.articles_dict) + 1
-                self.articles_dict[ref] = self.clean_wiki_text(article['text'])
+                self.articles_dict[ref] = self.sanitize_wiki_content(article['text'])
                 self.ref2id[ref] = id 
                 self.id2ref[id] = ref
         logging.info(f"Loaded {len(self.articles_dict)} articles.")
 
-    def _find_citations(self,text):
+    def extract_citation_spans(self,text):
         citations = []
         for match in re.finditer(r'\[\[(.*?)\]\]', text):
             match_text = match.group(1)
@@ -168,7 +168,7 @@ class WikiProcessor:
         return citations
 
     @staticmethod
-    def clean_wiki_text(text: str) -> str:
+    def sanitize_wiki_content(text: str) -> str:
         """Cleans wiki content by removing metadata and formatting."""
         # Find main content starting from first bold title
         match = re.search(r"'''([^']+?)'''", text)
@@ -188,8 +188,8 @@ class WikiProcessor:
 
         for title in articles:
             text = self.articles_dict[title]
-            source_text = self.clean_wiki_text(text)
-            citations = self._find_citations(source_text)            
+            source_text = self.sanitize_wiki_content(text)
+            citations = self.extract_citation_spans(source_text)            
             sources.append(source_text)
             citation_data.append(citations)
 
@@ -206,17 +206,17 @@ class Experiment:
     pass
 
 
-def get_cache_path(sources, model_name: str, cache_dir: str) -> str:
+def generate_cache_key(sources, model_name: str, cache_dir: str) -> str:
     """Generate a unique cache path based on input data and model name."""
     # Create a hash of the sources and model name
     content_hash = hashlib.md5(str(sources).encode()).hexdigest()
     model_hash = hashlib.md5(model_name.encode()).hexdigest()[:8]
     return os.path.join(cache_dir, f"tokenized_{model_hash}_{content_hash}.pt")
 
-def tokenize_sources(sources=None, citation_data=None, tokenizer=None, batch_size=1000, cache_dir="cache", cache_path=None):
+def prepare_training_data(sources=None, citation_data=None, tokenizer=None, batch_size=1000, cache_dir="cache", cache_path=None):
     # Generate cache path
     if cache_path is None:
-        cache_path = get_cache_path(sources, tokenizer.name_or_path, cache_dir)
+        cache_path = generate_cache_key(sources, tokenizer.name_or_path, cache_dir)
     
     # Check if cached results exist
     if os.path.exists(cache_path):
@@ -274,7 +274,7 @@ def tokenize_sources(sources=None, citation_data=None, tokenizer=None, batch_siz
     
     return all_results
 
-def collate(results, tokenizer, config):
+def create_training_batches(results, tokenizer, config):
     cite_token = tokenizer.convert_tokens_to_ids(config.cite_token)
     ref_token = tokenizer.convert_tokens_to_ids(config.ref_token)
     bracket_tokens = tokenizer.convert_tokens_to_ids(['[',']'])
@@ -552,13 +552,13 @@ def compute_retrieval_metrics(logits, labels, ks=[1, 5, 10, 50, 100, 1000]):
     
     return metrics
 
-def valid_batch(batch, config: ExperimentConfig):
+def validate_batch_structure(batch, config: ExperimentConfig):
     c1 = (batch['source_ids']==config.cite_token_id).sum()==batch['cited_art_ids'].shape[0]  # special cite tokens correspond to the cited article ids
     c2 =  (batch['cited_art_ids'].shape[0]==batch['labels'].shape[0])  # each cited article id has a corresponding target label
     c3 = (batch['target_ids']==config.ref_token_id).sum()==batch['target_art_ids'].shape[0]  # special ref tokens correspond to the target article ids
     return c1 and c2 and c3 
     
-def validate_citation_model(
+def validate_citation_matcher(
     model,
     val_dataloader,
     return_embeddings: bool = False,
@@ -579,7 +579,7 @@ def validate_citation_model(
     # Accumulate embeddings and IDs
     with torch.no_grad():
         for batch in tqdm.tqdm(val_dataloader, desc="Computing embeddings"):
-            if not valid_batch(batch, config):
+            if not validate_batch_structure(batch, config):
                 continue
             # Move batch to device and convert to FP16
             batch = {k: (v.to(device, dtype=torch.float16) if isinstance(v, torch.FloatTensor) 
@@ -936,16 +936,16 @@ class Experiment:
     
     def get_results(self, cache_path=None):
         if cache_path:
-            results = tokenize_sources(cache_path=cache_path)
+            results = prepare_training_data(cache_path=cache_path)
         else:
-            preprocessor = WikiProcessor()
+            preprocessor = CitationExtractor()
             sources, citation_data = preprocessor.find_source_citations()
-            results = tokenize_sources(sources, citation_data, self.tokenizer, cache_dir="cache")
+            results = prepare_training_data(sources, citation_data, self.tokenizer, cache_dir="cache")
         return results
 
 
 
-def train_citation_model(
+def train_citation_matcher(
     experiment: Experiment,
     results: List[dict],
 ) -> CitationModel:
@@ -1030,8 +1030,8 @@ def train_citation_model(
         
         # Training data preparation
         print("Collating training data with new random masks...")
-        collated = collate(results, tokenizer, config)
-        dataset = CitationDataset(collated)
+        training_batches = create_training_batches(results, tokenizer, config)
+        dataset = CitationDataset(training_batches)
         
         # Create train/val split
         indices = np.arange(len(dataset))
@@ -1081,7 +1081,7 @@ def train_citation_model(
         progress_bar = tqdm.tqdm(train_dataloader, desc="Training")
         
         for batch_idx, batch in enumerate(progress_bar):     
-            if not valid_batch(batch, config):
+            if not validate_batch_structure(batch, config):
                 continue
             # Skip previously processed batches if resuming
             if epoch == start_epoch and batch_idx < batch_in_epoch:
@@ -1155,7 +1155,7 @@ def train_citation_model(
         model.eval()
         
         with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-            val_metrics = validate_citation_model(
+            val_metrics = validate_citation_matcher(
                 model=model,
                 val_dataloader=val_dataloader,
                 k_values=config.k_values,
@@ -1233,17 +1233,17 @@ def train_citation_model(
 config = ExperimentConfig(
     project_name="citation-matching",
     # model_name="google-bert/bert-large-uncased",
-    model_name="FacebookAI/roberta-base",
+    # model_name="FacebookAI/roberta-base",
     # run_name=None,
     checkpoint_dir="./checkpoints",
     checkpoint_every=500,
     seed=42,
-    collate_sample_size=None,
+    collate_sample_size=2000,
     batch_size=290,
     initial_logit_scale=np.log(1/0.05),
     train_ratio=.95,
-    # learning_rate=1.5e-4,
-    learning_rate=2e-5,
+    learning_rate=1.5e-4,
+    # learning_rate=2e-5,
     logits_learning_rate=0,
     max_grad_norm=0.5,
     device="cuda:0"
@@ -1255,9 +1255,9 @@ if __name__ == "__main__":
     results = experiment.get_results(cache_path='./cache/tokenized_1caf5def_eb27a5477eaa3d549aebc4886f3717d1.pt')
     
     # Train from scratch
-    trained_model = train_citation_model(experiment, results)
+    trained_model = train_citation_matcher(experiment, results)
     
     # # Or resume from checkpoint
     # config.resume_from = './checkpoints/citation-matching/icy-water-83/checkpoint-step-2000.pt'
     # experiment = Experiment(config)
-    # trained_model = train_citation_model(experiment, results)
+    # trained_model = train_citation_matcher(experiment, results)
