@@ -1,6 +1,6 @@
 # Standard library imports
-from dataclasses import dataclass, field, asdict
-from typing import Dict, Iterator, List, Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import Optional, Tuple, Union
 
 # Third-party imports
 import torch

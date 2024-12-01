@@ -1,14 +1,12 @@
 # Standard library imports
 import logging
 import os
-from typing import Dict, Iterator, List, Optional, Tuple, Union
-import xml.etree.ElementTree as ET
 import hashlib
 
 # Third-party imports
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import Dataset
 import tqdm 
 
 
