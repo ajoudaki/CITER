@@ -1,13 +1,6 @@
 # Standard library imports
-import random 
-import bz2
-import json
 import logging
 import os
-import re
-import sqlite3
-from dataclasses import dataclass, field, asdict
-from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Tuple, Union
 import xml.etree.ElementTree as ET
 import hashlib
@@ -15,18 +8,8 @@ import hashlib
 # Third-party imports
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.cuda.amp import GradScaler
-from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
-from transformers import (
-    AutoConfig,
-    AutoModel,
-    AutoTokenizer,
-)
 import tqdm 
-import yaml
 
 
 def generate_cache_key(sources, model_name: str, cache_dir: str) -> str:
