@@ -429,13 +429,6 @@ def citation_collate_fn(batch):
 
 
 @dataclass
-class ExperimentConfig:
-    pass
-
-class Experiment:
-    pass
-
-@dataclass
 class CitationModelOutput:
     """Custom output class for the citation model."""
     loss: Optional[torch.FloatTensor] = None
@@ -446,7 +439,7 @@ class CitationModelOutput:
 class CitationModel(nn.Module):
     """Custom model for citation matching using transformer embeddings."""
     
-    def __init__(self, config: ExperimentConfig):
+    def __init__(self, config: TrainingConfig):
         super().__init__()
         
         # Load base model configuration
@@ -533,6 +526,118 @@ class CitationModel(nn.Module):
         return (loss, logits, cite_embeds, ref_embeds)
 
 
+@dataclass
+class TrainingConfig:
+    # Model configuration
+    model_name: str = "bert-base-uncased"
+    vocab_size: Optional[int] = None
+    initial_logit_scale: float = np.log(1/0.07)
+    
+    # Random seed configuration
+    seed: int = 42
+    
+    # Token configuration
+    cite_token: str = "[[CITE]]"
+    ref_token: str = "[[REF]]"
+    cite_token_id: Optional[int] = None
+    ref_token_id: Optional[int] = None
+    
+    # Text processing configuration
+    max_length: int = 512
+    source_len: int = 512
+    target_len: int = 128
+    max_targets: int = 5
+    overlap: float = 0.5
+    
+    # Training configuration
+    num_epochs: int = 100
+    learning_rate: float = 1.5e-4
+    logits_learning_rate: float = 1.5e-2
+    max_grad_norm: float = 1.0
+    Adam_eps: float = 1e-8
+    weight_decay: float = 0.01
+    warmup_steps: int = 0
+    batch_size: int = 200
+    train_ratio: float = 0.5
+    collate_sample_size: Optional[int] = None
+    
+    # Evaluation configuration
+    k_values: List[int] = field(default_factory=lambda: [1, 5, 10, 50, 100, 1000])
+    
+    # Checkpoint configuration
+    root_dir: Path = Path(".")  # Default to current directory
+    project_name: str = "citation-matching"
+    
+    @property
+    def data_dir(self) -> Path:
+        return self.root_dir / "data"
+    
+    @property
+    def output_dir(self) -> Path:
+        return self.root_dir / "outputs"
+    
+    @property
+    def checkpoint_dir(self) -> Path:
+        return self.output_dir / "checkpoints" / self.project_name
+        
+    @property
+    def cache_dir(self) -> Path:
+        return self.data_dir / "cache"
+        
+    @property
+    def raw_data_dir(self) -> Path:
+        return self.data_dir / "raw"
+        
+    @property
+    def processed_data_dir(self) -> Path:
+        return self.data_dir / "processed"
+
+    checkpoint_every: int = 1000
+    project_name: str = "citation-matching"
+    run_name: Optional[str] = None
+    resume_from: Optional[str] = None
+    
+    # Hardware configuration
+    device: Optional[torch.device] = None
+    
+    def __post_init__(self):
+        if self.device is None:
+            self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    
+    def get_checkpoint_dir(self) -> Path:
+        if self.project_name and self.run_name:
+            checkpoint_path = Path(self.checkpoint_dir) / self.project_name / self.run_name
+        elif self.project_name:
+            checkpoint_path = Path(self.checkpoint_dir) / self.project_name
+        else:
+            checkpoint_path = Path(self.checkpoint_dir)
+        checkpoint_path.mkdir(parents=True, exist_ok=True)
+        return checkpoint_path
+    
+    def save(self, path: Path):
+        with open(path / "config.yaml", 'w') as f:
+            yaml.dump(asdict(self), f)
+    
+    @classmethod
+    def load(cls, path: Path) -> 'TrainingConfig':
+        with open(path / "config.yaml", 'r') as f:
+            config_dict = yaml.safe_load(f)
+        return cls(**config_dict)
+    
+    def set_seed(self):
+        random.seed(self.seed)
+        np.random.seed(self.seed)
+        torch.manual_seed(self.seed)
+        torch.cuda.manual_seed_all(self.seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+def validate_batch_structure(batch, config: TrainingConfig):
+    c1 = (batch['source_ids']==config.cite_token_id).sum()==batch['cited_art_ids'].shape[0]  # special cite tokens correspond to the cited article ids
+    c2 =  (batch['cited_art_ids'].shape[0]==batch['labels'].shape[0])  # each cited article id has a corresponding target label
+    c3 = (batch['target_ids']==config.ref_token_id).sum()==batch['target_art_ids'].shape[0]  # special ref tokens correspond to the target article ids
+    return c1 and c2 and c3 
+
 def compute_retrieval_metrics(logits, labels, ks=[1, 5, 10, 50, 100, 1000]):
     # Get rankings of correct targets
     correct_scores = logits[torch.arange(logits.size(0)), labels]
@@ -550,11 +655,6 @@ def compute_retrieval_metrics(logits, labels, ks=[1, 5, 10, 50, 100, 1000]):
     
     return metrics
 
-def validate_batch_structure(batch, config: ExperimentConfig):
-    c1 = (batch['source_ids']==config.cite_token_id).sum()==batch['cited_art_ids'].shape[0]  # special cite tokens correspond to the cited article ids
-    c2 =  (batch['cited_art_ids'].shape[0]==batch['labels'].shape[0])  # each cited article id has a corresponding target label
-    c3 = (batch['target_ids']==config.ref_token_id).sum()==batch['target_art_ids'].shape[0]  # special ref tokens correspond to the target article ids
-    return c1 and c2 and c3 
     
 def validate_citation_matcher(
     model,
@@ -562,7 +662,7 @@ def validate_citation_matcher(
     return_embeddings: bool = False,
     k_values: List[int] = [1, 5, 10, 50, 100, 1000],
     similarity_batch_size: int = 512,
-    config: ExperimentConfig = None
+    config: TrainingConfig = None
 ):
     device = config.device
     
@@ -715,115 +815,9 @@ def validate_citation_matcher(
     return results
 
 
-@dataclass
-class ExperimentConfig:
-    # Model configuration
-    model_name: str = "bert-base-uncased"
-    vocab_size: Optional[int] = None
-    initial_logit_scale: float = np.log(1/0.07)
-    
-    # Random seed configuration
-    seed: int = 42
-    
-    # Token configuration
-    cite_token: str = "[[CITE]]"
-    ref_token: str = "[[REF]]"
-    cite_token_id: Optional[int] = None
-    ref_token_id: Optional[int] = None
-    
-    # Text processing configuration
-    max_length: int = 512
-    source_len: int = 512
-    target_len: int = 128
-    max_targets: int = 5
-    overlap: float = 0.5
-    
-    # Training configuration
-    num_epochs: int = 100
-    learning_rate: float = 1.5e-4
-    logits_learning_rate: float = 1.5e-2
-    max_grad_norm: float = 1.0
-    Adam_eps: float = 1e-8
-    weight_decay: float = 0.01
-    warmup_steps: int = 0
-    batch_size: int = 200
-    train_ratio: float = 0.5
-    collate_sample_size: Optional[int] = None
-    
-    # Evaluation configuration
-    k_values: List[int] = field(default_factory=lambda: [1, 5, 10, 50, 100, 1000])
-    
-    # Checkpoint configuration
-    root_dir: Path = Path(".")  # Default to current directory
-    project_name: str = "citation-matching"
-    
-    @property
-    def data_dir(self) -> Path:
-        return self.root_dir / "data"
-    
-    @property
-    def output_dir(self) -> Path:
-        return self.root_dir / "outputs"
-    
-    @property
-    def checkpoint_dir(self) -> Path:
-        return self.output_dir / "checkpoints" / self.project_name
-        
-    @property
-    def cache_dir(self) -> Path:
-        return self.data_dir / "cache"
-        
-    @property
-    def raw_data_dir(self) -> Path:
-        return self.data_dir / "raw"
-        
-    @property
-    def processed_data_dir(self) -> Path:
-        return self.data_dir / "processed"
 
-    checkpoint_every: int = 1000
-    project_name: str = "citation-matching"
-    run_name: Optional[str] = None
-    resume_from: Optional[str] = None
-    
-    # Hardware configuration
-    device: Optional[torch.device] = None
-    
-    def __post_init__(self):
-        if self.device is None:
-            self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    
-    def get_checkpoint_dir(self) -> Path:
-        if self.project_name and self.run_name:
-            checkpoint_path = Path(self.checkpoint_dir) / self.project_name / self.run_name
-        elif self.project_name:
-            checkpoint_path = Path(self.checkpoint_dir) / self.project_name
-        else:
-            checkpoint_path = Path(self.checkpoint_dir)
-        checkpoint_path.mkdir(parents=True, exist_ok=True)
-        return checkpoint_path
-    
-    def save(self, path: Path):
-        with open(path / "config.yaml", 'w') as f:
-            yaml.dump(asdict(self), f)
-    
-    @classmethod
-    def load(cls, path: Path) -> 'ExperimentConfig':
-        with open(path / "config.yaml", 'r') as f:
-            config_dict = yaml.safe_load(f)
-        return cls(**config_dict)
-    
-    def set_seed(self):
-        random.seed(self.seed)
-        np.random.seed(self.seed)
-        torch.manual_seed(self.seed)
-        torch.cuda.manual_seed_all(self.seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-
-
-class Experiment:
-    def __init__(self, config: ExperimentConfig):
+class TrainingManager:
+    def __init__(self, config: TrainingConfig):
         self.config = config
         
         # Initialize tokenizer
@@ -967,253 +961,276 @@ class Experiment:
             results = prepare_training_data(sources, citation_data, self.tokenizer, cache_dir="cache")
         return results
 
-
-
-def train_citation_matcher(
-    experiment: Experiment,
-    results: List[dict],
-) -> CitationModel:
-    """
-    Memory-optimized training function with enhanced checkpoint management.
-    """
-    import wandb
-    import gc
     
-    config = experiment.config
-    model = experiment.model
-    tokenizer = experiment.tokenizer
+    def train_citation_matcher(
+        self, 
+        results: List[dict],
+    ) -> CitationModel:
+        """
+        Memory-optimized training function with enhanced checkpoint management.
+        """
+        import wandb
+        import gc
+        
+        config = self.config
+        model = self.model
+        tokenizer = self.tokenizer
+        
+        # Set random seeds
+        config.set_seed()
+        
+        # Initialize or resume wandb run
+        if config.resume_from:
+            checkpoint = self.load_checkpoint(config.resume_from)
+            wandb_run_id = checkpoint['wandb_run_id']
+            print(f"Resuming wandb run: {wandb_run_id}")
+            wandb.init(
+                project=config.project_name,
+                name=config.run_name,
+                id=wandb_run_id,
+                resume="must"
+            )
+        else:
+            wandb.init(
+                project=config.project_name,
+                name=config.run_name,
+                config=config,
+            )
+            
+            # Update run name in config if not set
+            if not config.run_name:
+                config.run_name = wandb.run.name
+        
+        # Initialize training state
+        global_step = 0
+        start_epoch = 0
+        batch_in_epoch = 0
+        best_val_metrics = {'loss': float('inf')}
+        scaler = GradScaler()
+        
+        # Move model to device and enable memory efficient training
+        model = model.to(config.device)
+        model.transformer.gradient_checkpointing_enable()
+        
+        # Initialize optimizer
+        optimizer = AdamW([
+            {
+                'params': [p for n, p in model.named_parameters() if n != 'logit_scale'],
+                'lr': config.learning_rate,
+                'weight_decay': config.weight_decay,
+                'eps': config.Adam_eps
+            },
+            {
+                'params': [model.logit_scale],
+                'lr': config.logits_learning_rate,
+                'weight_decay': 0
+            }
+        ])
+        
+        # Load checkpoint state if resuming
+        if config.resume_from:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            global_step = checkpoint['global_step']
+            start_epoch = checkpoint['epoch']
+            batch_in_epoch = checkpoint['batch_in_epoch']
+            best_val_metrics = checkpoint['best_val_metrics']
+            print(f"Resumed from checkpoint at epoch {start_epoch}, batch {batch_in_epoch}, step {global_step}")
+        
+        for epoch in range(start_epoch, config.num_epochs):
+            print(f"\nEpoch {epoch + 1}/{config.num_epochs}")
+            
+            # Log current scale
+            current_scale = model.logit_scale.exp().item()
+            print(f"Current logit scale: {current_scale:.4f}")
+            wandb.log({"logit_scale": current_scale}, step=global_step)
+            
+            # Training data preparation
+            print("Collating training data with new random masks...")
+            batches = create_training_batches(results, tokenizer, config)
+            dataset = CitationDataset(batches)
+            
+            # Create train/val split
+            indices = np.arange(len(dataset))
+            train_size = int(len(dataset) * config.train_ratio)
+            train_indices = indices[:train_size]
+            val_indices = indices[train_size:]
     
-    # Set random seeds
-    config.set_seed()
-    
-    # Initialize or resume wandb run
-    if config.resume_from:
-        checkpoint = experiment.load_checkpoint(config.resume_from)
-        wandb_run_id = checkpoint['wandb_run_id']
-        print(f"Resuming wandb run: {wandb_run_id}")
-        wandb.init(
-            project=config.project_name,
-            name=config.run_name,
-            id=wandb_run_id,
-            resume="must"
-        )
-    else:
-        wandb.init(
-            project=config.project_name,
-            name=config.run_name,
-            config=config,
-        )
-        
-        # Update run name in config if not set
-        if not config.run_name:
-            config.run_name = wandb.run.name
-    
-    # Initialize training state
-    global_step = 0
-    start_epoch = 0
-    batch_in_epoch = 0
-    best_val_metrics = {'loss': float('inf')}
-    scaler = GradScaler()
-    
-    # Move model to device and enable memory efficient training
-    model = model.to(config.device)
-    model.transformer.gradient_checkpointing_enable()
-    
-    # Initialize optimizer
-    optimizer = AdamW([
-        {
-            'params': [p for n, p in model.named_parameters() if n != 'logit_scale'],
-            'lr': config.learning_rate,
-            'weight_decay': config.weight_decay,
-            'eps': config.Adam_eps
-        },
-        {
-            'params': [model.logit_scale],
-            'lr': config.logits_learning_rate,
-            'weight_decay': 0
-        }
-    ])
-    
-    # Load checkpoint state if resuming
-    if config.resume_from:
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scaler.load_state_dict(checkpoint['scaler_state_dict'])
-        global_step = checkpoint['global_step']
-        start_epoch = checkpoint['epoch']
-        batch_in_epoch = checkpoint['batch_in_epoch']
-        best_val_metrics = checkpoint['best_val_metrics']
-        print(f"Resumed from checkpoint at epoch {start_epoch}, batch {batch_in_epoch}, step {global_step}")
-    
-    for epoch in range(start_epoch, config.num_epochs):
-        print(f"\nEpoch {epoch + 1}/{config.num_epochs}")
-        
-        # Log current scale
-        current_scale = model.logit_scale.exp().item()
-        print(f"Current logit scale: {current_scale:.4f}")
-        wandb.log({"logit_scale": current_scale}, step=global_step)
-        
-        # Training data preparation
-        print("Collating training data with new random masks...")
-        batches = create_training_batches(results, tokenizer, config)
-        dataset = CitationDataset(batches)
-        
-        # Create train/val split
-        indices = np.arange(len(dataset))
-        train_size = int(len(dataset) * config.train_ratio)
-        train_indices = indices[:train_size]
-        val_indices = indices[train_size:]
-
-        from torch.utils.data import Subset
-        train_dataset = Subset(dataset, train_indices)
-        val_dataset = Subset(dataset, val_indices)
-        
-        # Create dataloaders
-        generator = torch.Generator()
-        generator.manual_seed(config.seed + epoch)
-        
-        train_dataloader = DataLoader(
-            train_dataset,
-            batch_size=config.batch_size,
-            shuffle=True,
-            num_workers=4,
-            pin_memory=True,
-            drop_last=True,
-            collate_fn=citation_collate_fn,
-            generator=generator
-        )
-        
-        val_dataloader = DataLoader(
-            val_dataset,
-            batch_size=int(config.batch_size * 1.8),
-            shuffle=False,
-            num_workers=4,
-            pin_memory=True,
-            drop_last=True,
-            collate_fn=citation_collate_fn
-        )
-        
-        # Clear memory
-        del batches, dataset
-        gc.collect()
-        torch.cuda.empty_cache()
-        
-        # Training phase
-        model.train()
-        total_train_loss = 0
-        train_steps = 0
-        
-        progress_bar = tqdm.tqdm(train_dataloader, desc="Training")
-        
-        for batch_idx, batch in enumerate(progress_bar):     
-            if not validate_batch_structure(batch, config):
-                continue
-            # Skip previously processed batches if resuming
-            if epoch == start_epoch and batch_idx < batch_in_epoch:
-                continue
+            from torch.utils.data import Subset
+            train_dataset = Subset(dataset, train_indices)
+            val_dataset = Subset(dataset, val_indices)
             
-            batch = {k: v.to(config.device) for k, v in batch.items()}
+            # Create dataloaders
+            generator = torch.Generator()
+            generator.manual_seed(config.seed + epoch)
             
-            optimizer.zero_grad()
+            train_dataloader = DataLoader(
+                train_dataset,
+                batch_size=config.batch_size,
+                shuffle=True,
+                num_workers=4,
+                pin_memory=True,
+                drop_last=True,
+                collate_fn=citation_collate_fn,
+                generator=generator
+            )
             
-            # Forward pass with mixed precision
-            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-                outputs = model(**batch)
-                loss = outputs.loss
+            val_dataloader = DataLoader(
+                val_dataset,
+                batch_size=int(config.batch_size * 1.8),
+                shuffle=False,
+                num_workers=4,
+                pin_memory=True,
+                drop_last=True,
+                collate_fn=citation_collate_fn
+            )
             
-            # Backward pass with gradient scaling
-            scaler.scale(loss).backward()
+            # Clear memory
+            del batches, dataset
+            gc.collect()
+            torch.cuda.empty_cache()
             
-            if config.max_grad_norm:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+            # Training phase
+            model.train()
+            total_train_loss = 0
+            train_steps = 0
             
-            scaler.step(optimizer)
-            scaler.update()
+            progress_bar = tqdm.tqdm(train_dataloader, desc="Training")
             
-            # Update tracking
-            total_train_loss += loss.item()
-            train_steps += 1
+            for batch_idx, batch in enumerate(progress_bar):     
+                if not validate_batch_structure(batch, config):
+                    continue
+                # Skip previously processed batches if resuming
+                if epoch == start_epoch and batch_idx < batch_in_epoch:
+                    continue
+                
+                batch = {k: v.to(config.device) for k, v in batch.items()}
+                
+                optimizer.zero_grad()
+                
+                # Forward pass with mixed precision
+                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                    outputs = model(**batch)
+                    loss = outputs.loss
+                
+                # Backward pass with gradient scaling
+                scaler.scale(loss).backward()
+                
+                if config.max_grad_norm:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                
+                scaler.step(optimizer)
+                scaler.update()
+                
+                # Update tracking
+                total_train_loss += loss.item()
+                train_steps += 1
+                
+                # Log metrics
+                wandb.log({
+                    "train/batch_loss": loss.item(),
+                    'logit_scale': model.logit_scale.item(),
+                    "train/learning_rate": optimizer.param_groups[0]["lr"],
+                    "train/batch_in_epoch": batch_idx,
+                    "epoch": epoch
+                }, step=global_step)
+                
+                progress_bar.set_postfix({'loss': loss.item()})
+                
+                # Save checkpoint periodically
+                if global_step > 0 and global_step % config.checkpoint_every == 0:
+                    checkpoint_path = experiment.get_checkpoint_path(step=global_step)
+                    experiment.save_checkpoint(
+                        checkpoint_path,
+                        optimizer=optimizer,
+                        scaler=scaler,
+                        epoch=epoch,
+                        batch_in_epoch=batch_idx,
+                        global_step=global_step,
+                        wandb_run_id=wandb.run.id
+                    )
+                    print(f"\nSaved checkpoint at step {global_step} to {checkpoint_path}")
+                
+                global_step += 1
+                
+                # Clear memory
+                del outputs, loss, batch
+                torch.cuda.empty_cache()
             
-            # Log metrics
+            # Log epoch-level training metrics
+            avg_train_loss = total_train_loss / train_steps
+            print(f"\nAverage training loss: {avg_train_loss:.4f}")
             wandb.log({
-                "train/batch_loss": loss.item(),
-                'logit_scale': model.logit_scale.item(),
-                "train/learning_rate": optimizer.param_groups[0]["lr"],
-                "train/batch_in_epoch": batch_idx,
+                "train/epoch_loss": avg_train_loss,
                 "epoch": epoch
             }, step=global_step)
             
-            progress_bar.set_postfix({'loss': loss.item()})
+            # Validation phase
+            if len(val_dataloader)==0:
+                print("\nValidation set is emptpy, so continuing with training ... ")
+                continue
+            print("\nRunning validation...")
+            torch.cuda.empty_cache()
+            model.eval()
             
-            # Save checkpoint periodically
-            if global_step > 0 and global_step % config.checkpoint_every == 0:
-                checkpoint_path = experiment.get_checkpoint_path(step=global_step)
+            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                val_metrics = validate_citation_matcher(
+                    model=model,
+                    val_dataloader=val_dataloader,
+                    k_values=config.k_values,
+                    config=config,
+                )
+            
+            # Log validation metrics
+            wandb_val_metrics = {
+                "val/loss": val_metrics['loss'],
+                "val/accuracy": val_metrics['accuracy'],
+                "val/mrr": val_metrics['mrr']
+            }
+            
+            for k in config.k_values:
+                if f'top_{k}_accuracy' in val_metrics:
+                    wandb_val_metrics[f"val/top_{k}_accuracy"] = val_metrics[f'top_{k}_accuracy']
+            
+            wandb.log(wandb_val_metrics, step=global_step)
+            
+            # Print validation metrics
+            print(f"\nValidation metrics:")
+            for metric, value in val_metrics.items():
+                if isinstance(value, (int, float)):
+                    print(f"  {metric}: {value:.4f}")
+            
+            # Save best model if validation loss improved
+            if val_metrics['loss'] < best_val_metrics['loss']:
+                best_val_metrics = val_metrics
+                best_model_path = experiment.get_checkpoint_path(is_best=True)
                 experiment.save_checkpoint(
-                    checkpoint_path,
+                    best_model_path,
                     optimizer=optimizer,
                     scaler=scaler,
                     epoch=epoch,
                     batch_in_epoch=batch_idx,
                     global_step=global_step,
-                    wandb_run_id=wandb.run.id
+                    val_metrics=val_metrics,
+                    best_val_metrics=best_val_metrics,
+                    wandb_run_id=wandb.run.id,
+                    is_best=True
                 )
-                print(f"\nSaved checkpoint at step {global_step} to {checkpoint_path}")
+                
+                # Update wandb summary with best metrics
+                wandb.run.summary.update({
+                    "best_val_loss": val_metrics['loss'],
+                    "best_val_accuracy": val_metrics['accuracy'],
+                    "best_val_mrr": val_metrics['mrr'],
+                    "best_model_epoch": epoch,
+                    "best_model_step": global_step
+                })
             
-            global_step += 1
-            
-            # Clear memory
-            del outputs, loss, batch
-            torch.cuda.empty_cache()
-        
-        # Log epoch-level training metrics
-        avg_train_loss = total_train_loss / train_steps
-        print(f"\nAverage training loss: {avg_train_loss:.4f}")
-        wandb.log({
-            "train/epoch_loss": avg_train_loss,
-            "epoch": epoch
-        }, step=global_step)
-        
-        # Validation phase
-        if len(val_dataloader)==0:
-            print("\nValidation set is emptpy, so continuing with training ... ")
-            continue
-        print("\nRunning validation...")
-        torch.cuda.empty_cache()
-        model.eval()
-        
-        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-            val_metrics = validate_citation_matcher(
-                model=model,
-                val_dataloader=val_dataloader,
-                k_values=config.k_values,
-                config=config,
-            )
-        
-        # Log validation metrics
-        wandb_val_metrics = {
-            "val/loss": val_metrics['loss'],
-            "val/accuracy": val_metrics['accuracy'],
-            "val/mrr": val_metrics['mrr']
-        }
-        
-        for k in config.k_values:
-            if f'top_{k}_accuracy' in val_metrics:
-                wandb_val_metrics[f"val/top_{k}_accuracy"] = val_metrics[f'top_{k}_accuracy']
-        
-        wandb.log(wandb_val_metrics, step=global_step)
-        
-        # Print validation metrics
-        print(f"\nValidation metrics:")
-        for metric, value in val_metrics.items():
-            if isinstance(value, (int, float)):
-                print(f"  {metric}: {value:.4f}")
-        
-        # Save best model if validation loss improved
-        if val_metrics['loss'] < best_val_metrics['loss']:
-            best_val_metrics = val_metrics
-            best_model_path = experiment.get_checkpoint_path(is_best=True)
+            # Save epoch checkpoint
+            epoch_checkpoint_path = experiment.get_checkpoint_path(epoch=epoch)
             experiment.save_checkpoint(
-                best_model_path,
+                epoch_checkpoint_path,
                 optimizer=optimizer,
                 scaler=scaler,
                 epoch=epoch,
@@ -1221,47 +1238,21 @@ def train_citation_matcher(
                 global_step=global_step,
                 val_metrics=val_metrics,
                 best_val_metrics=best_val_metrics,
-                wandb_run_id=wandb.run.id,
-                is_best=True
+                wandb_run_id=wandb.run.id
             )
             
-            # Update wandb summary with best metrics
-            wandb.run.summary.update({
-                "best_val_loss": val_metrics['loss'],
-                "best_val_accuracy": val_metrics['accuracy'],
-                "best_val_mrr": val_metrics['mrr'],
-                "best_model_epoch": epoch,
-                "best_model_step": global_step
-            })
+            # Clear memory after each epoch
+            del val_metrics, train_dataloader, val_dataloader
+            gc.collect()
+            torch.cuda.empty_cache()
         
-        # Save epoch checkpoint
-        epoch_checkpoint_path = experiment.get_checkpoint_path(epoch=epoch)
-        experiment.save_checkpoint(
-            epoch_checkpoint_path,
-            optimizer=optimizer,
-            scaler=scaler,
-            epoch=epoch,
-            batch_in_epoch=batch_idx,
-            global_step=global_step,
-            val_metrics=val_metrics,
-            best_val_metrics=best_val_metrics,
-            wandb_run_id=wandb.run.id
-        )
-        
-        # Clear memory after each epoch
-        del val_metrics, train_dataloader, val_dataloader
-        gc.collect()
-        torch.cuda.empty_cache()
-    
-    wandb.finish()
-    return model
+        wandb.finish()
+        return model
 
 
-config = ExperimentConfig(
+config = TrainingConfig(
     project_name="citation-matching",
-    # model_name="google-bert/bert-large-uncased",
     model_name="FacebookAI/roberta-base",
-    # run_name=None,
     root_dir=Path("/mnt/HDD/amir/paperGPT"),
     checkpoint_every=1000,
     seed=42,
@@ -1278,14 +1269,14 @@ config = ExperimentConfig(
 
 
 if __name__ == "__main__":
-    experiment = Experiment(config)
+    experiment = TrainingManager(config)
     # results = experiment.get_results(cache_path='./cache/tokenized_1caf5def_eb27a5477eaa3d549aebc4886f3717d1.pt')
     results = experiment.get_results(cache_path=config.cache_dir / "tokenized.pt")
     
     # Train from scratch
-    trained_model = train_citation_matcher(experiment, results)
+    trained_model = experiment.train_citation_matcher(experiment, results)
     
     # # Or resume from checkpoint
     # config.resume_from = './checkpoints/citation-matching/icy-water-83/checkpoint-step-2000.pt'
-    # experiment = Experiment(config)
-    # trained_model = train_citation_matcher(experiment, results)
+    # experiment = TrainingManager(config)
+    # trained_model = experiment.train_citation_matcher(experiment, results)
