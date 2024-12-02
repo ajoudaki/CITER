@@ -474,7 +474,7 @@ class TrainingManager:
                 
                 # Training phase
                 model.train()
-                model.transformer.gradient_checkpointing_enable()
+                # model.transformer.gradient_checkpointing_enable()
                 total_train_loss = 0
                 train_steps = 0
                 
@@ -489,10 +489,9 @@ class TrainingManager:
                     
                     optimizer.zero_grad()
                     
-                    # Forward pass
-                    outputs = model(**batch)
+                    # Forward-Backward pass with micro-batches
+                    outputs = model.forward_backward(**batch)
                     loss = outputs.loss
-                    CE_loss = outputs.CE_loss
                     
                     # Backward pass
                     # loss.backward()
@@ -503,19 +502,19 @@ class TrainingManager:
                     optimizer.step()
                     
                     # Update tracking
-                    total_train_loss += CE_loss.item()
+                    total_train_loss += loss
                     train_steps += 1
                     
                     # Log metrics
                     wandb.log({
-                        "train/batch_loss": CE_loss.item(),
+                        "train/batch_loss": loss,
                         'logit_scale': model.logit_scale.item(),
                         "train/learning_rate": optimizer.param_groups[0]["lr"],
                         "train/batch_in_epoch": batch_idx,
                         "epoch": epoch
                     }, step=global_step)
                     
-                    progress_bar.set_postfix({'loss': CE_loss.item()})
+                    progress_bar.set_postfix({'loss': loss})
                     
                     # Save checkpoint periodically
                     if global_step > 0 and global_step % config.checkpoint_every == 0:
@@ -533,7 +532,7 @@ class TrainingManager:
                     global_step += 1
                     
                     # Clear memory
-                    del outputs, loss, CE_loss, batch
+                    del outputs, loss, batch
                     torch.cuda.empty_cache()
                 
                 # Log epoch-level training metrics
@@ -551,7 +550,7 @@ class TrainingManager:
                 print("\nRunning validation...")
                 torch.cuda.empty_cache()
                 model.eval()
-                model.transformer.gradient_checkpointing_disable()
+                # model.transformer.gradient_checkpointing_disable()
                 
                 val_metrics = validate_citation_matcher(
                     model=model,

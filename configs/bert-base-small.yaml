@@ -1,6 +1,6 @@
 Adam_eps: 1.0e-08
-batch_size: 1000
-micro_batch_size: 32
+batch_size: 1024
+micro_batch_size: 128
 checkpoint_every: 1000
 cite_token: '[[CITE]]'
 ref_token: '[[REF]]'
