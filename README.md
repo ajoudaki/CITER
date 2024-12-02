@@ -9,8 +9,8 @@ This project aims to use language models to predict and understand relationships
 ├── data_processing.py  # Data preparation and processing for tokenization
 ├── model.py           # Core model architecture definition
 ├── trainer.py        # Training orchestration and management
-└── train.py          # Training script entry point
-├── test.ipynb         # Testing and demonstration notebook using out of describution data 
+├── train.py          # Training script entry point
+└── test.ipynb         # Testing and demonstration notebook using out of describution data 
 ```
 
 ### Module Descriptions
