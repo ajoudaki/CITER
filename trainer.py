@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.cuda.amp import GradScaler
+from torch.utils.data import Subset
 from torch.optim import AdamW
 from torch.utils.data import DataLoader 
 from transformers import (
@@ -438,7 +439,7 @@ class TrainingManager:
                 train_indices = indices[:train_size]
                 val_indices = indices[train_size:]
         
-                from torch.utils.data import Subset
+                
                 train_dataset = Subset(dataset, train_indices)
                 val_dataset = Subset(dataset, val_indices)
                 
@@ -459,7 +460,7 @@ class TrainingManager:
                 
                 val_dataloader = DataLoader(
                     val_dataset,
-                    batch_size=int(config.batch_size * 1.8),
+                    batch_size=config.batch_size * 2, 
                     shuffle=False,
                     num_workers=4,
                     pin_memory=True,
@@ -511,6 +512,8 @@ class TrainingManager:
                         'logit_scale': model.logit_scale.item(),
                         "train/learning_rate": optimizer.param_groups[0]["lr"],
                         "train/batch_in_epoch": batch_idx,
+                        "train/num_cited_art_ids": batch['cited_art_ids'].shape[0],
+                        "train/num_target_art_ids": batch['target_art_ids'].shape[0],
                         "epoch": epoch
                     }, step=global_step)
                     
@@ -552,23 +555,23 @@ class TrainingManager:
                 model.eval()
                 # model.transformer.gradient_checkpointing_disable()
                 
-                val_metrics = validate_citation_matcher(
-                    model=model,
-                    val_dataloader=val_dataloader,
-                    k_values=config.k_values,
-                    config=config,
-                )
+                val_metrics = model.validate(val_dataloader)
                 
-                # Log validation metrics
                 wandb_val_metrics = {
-                    "val/loss": val_metrics['loss'],
-                    "val/accuracy": val_metrics['accuracy'],
-                    "val/mrr": val_metrics['mrr']
+                    f'val/{k}': v for k, v in val_metrics.items()
+                    for k, v in val_metrics.items()
                 }
                 
-                for k in config.k_values:
-                    if f'top_{k}_accuracy' in val_metrics:
-                        wandb_val_metrics[f"val/top_{k}_accuracy"] = val_metrics[f'top_{k}_accuracy']
+                # # Log validation metrics
+                # wandb_val_metrics = {
+                #     "val/loss": val_metrics['loss'],
+                #     "val/accuracy": val_metrics['accuracy'],
+                #     "val/mrr": val_metrics['mrr']
+                # }
+                
+                # for k in config.k_values:
+                #     if f'top_{k}_accuracy' in val_metrics:
+                #         wandb_val_metrics[f"val/top_{k}_accuracy"] = val_metrics[f'top_{k}_accuracy']
                 
                 wandb.log(wandb_val_metrics, step=global_step)
                 
