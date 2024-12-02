@@ -42,6 +42,7 @@ class TrainingConfig:
     weight_decay: float = 0.01
     warmup_steps: int = 0
     batch_size: int = 200
+    micro_batch_size: int = 32
     train_ratio: float = 0.5
     collate_sample_size: Optional[int] = None
     

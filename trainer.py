@@ -50,7 +50,7 @@ def validate_citation_matcher(
     val_dataloader,
     return_embeddings: bool = False,
     k_values: List[int] = [1, 5, 10, 50, 100, 1000],
-    similarity_batch_size: int = 512,
+    similarity_batch_size: int = 16,
     config: TrainingConfig = None
 ):
     device = config.device
@@ -238,18 +238,17 @@ class TrainingManager:
             return checkpoint_dir / f"checkpoint-epoch-{epoch}.pt"
         else:
             raise ValueError("Must specify either step, epoch, or is_best=True")
-    
+        
     def save_checkpoint(self, 
-                       path: Path, 
-                       optimizer: Optional[torch.optim.Optimizer] = None,
-                       scaler: Optional[GradScaler] = None,
-                       epoch: Optional[int] = None,
-                       batch_in_epoch: Optional[int] = None,
-                       global_step: Optional[int] = None,
-                       val_metrics: Optional[dict] = None,
-                       best_val_metrics: Optional[dict] = None,
-                       wandb_run_id: Optional[str] = None,
-                       is_best: bool = False):
+                    path: Path, 
+                    optimizer: Optional[torch.optim.Optimizer] = None,
+                    epoch: Optional[int] = None,
+                    batch_in_epoch: Optional[int] = None,
+                    global_step: Optional[int] = None,
+                    val_metrics: Optional[dict] = None,
+                    best_val_metrics: Optional[dict] = None,
+                    wandb_run_id: Optional[str] = None,
+                    is_best: bool = False):
         
         # Save RNG states as numpy arrays
         rng_state = {
@@ -269,8 +268,6 @@ class TrainingManager:
         # Add optional states
         if optimizer is not None:
             save_dict['optimizer_state_dict'] = optimizer.state_dict()
-        if scaler is not None:
-            save_dict['scaler_state_dict'] = scaler.state_dict()
         if epoch is not None:
             save_dict['epoch'] = epoch
         if batch_in_epoch is not None:
@@ -350,293 +347,280 @@ class TrainingManager:
             tokenized_data = prepare_training_data(sources, citation_data, self.tokenizer, cache_dir="cache")
         return tokenized_data
 
-    
     def train_citation_matcher(
-        self, 
-        results: List[dict],
-    ) -> CitationModel:
-        """
-        Memory-optimized training function with enhanced checkpoint management.
-        """
-        import wandb
-        import gc
-        
-        config = self.config
-        model = self.model
-        tokenizer = self.tokenizer
-        
-        # Set random seeds
-        config.set_seed()
-        
-        # Initialize or resume wandb run
-        if config.resume_from:
-            checkpoint = self.checkpoint
-            wandb_run_id = checkpoint['wandb_run_id']
-            print(f"Resuming wandb run: {wandb_run_id}")
-            wandb.init(
-                project=config.project_name,
-                name=config.run_name,
-                id=wandb_run_id,
-                resume="must"
-            )
-        else:
-            wandb.init(
-                project=config.project_name,
-                name=config.run_name,
-                config=config,
-            )
+            self, 
+            results: List[dict],
+        ) -> CitationModel:
+            """
+            Training function without grad scaler.
+            """
+            import wandb
+            import gc
             
-            # Update run name in config if not set
-            if not config.run_name:
-                config.run_name = wandb.run.name
-        
-        # Initialize training state
-        global_step = 0
-        start_epoch = 0
-        batch_in_epoch = 0
-        best_val_metrics = {'loss': float('inf')}
-        scaler = GradScaler()
-        
-        # Move model to device and enable memory efficient training
-        model = model.to(config.device)
-        
-        
-        # Initialize optimizer
-        optimizer = AdamW([
-            {
-                'params': [p for n, p in model.named_parameters() if n != 'logit_scale'],
-                'lr': config.learning_rate,
-                'weight_decay': config.weight_decay,
-                'eps': config.Adam_eps
-            },
-            {
-                'params': [model.logit_scale],
-                'lr': config.logits_learning_rate,
-                'weight_decay': 0
-            }
-        ])
-        
-        # Load checkpoint state if resuming
-        if config.resume_from:
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            scaler.load_state_dict(checkpoint['scaler_state_dict'])
-            global_step = checkpoint['global_step']
-            start_epoch = checkpoint['epoch']
-            batch_in_epoch = checkpoint['batch_in_epoch']
-            best_val_metrics = checkpoint['best_val_metrics']
-            print(f"Resumed from checkpoint at epoch {start_epoch}, batch {batch_in_epoch}, step {global_step}")
-        
-        for epoch in range(start_epoch, config.num_epochs):
-            print(f"\nEpoch {epoch + 1}/{config.num_epochs}")
+            config = self.config
+            model = self.model
+            tokenizer = self.tokenizer
             
-            # Log current scale
-            current_scale = model.logit_scale.exp().item()
-            print(f"Current logit scale: {current_scale:.4f}")
-            wandb.log({"logit_scale": current_scale}, step=global_step)
+            # Set random seeds
+            config.set_seed()
             
-            # Training data preparation
-            print("Collating training data with new random masks...")
-            batches = create_training_batches(results, tokenizer, config)
-            dataset = CitationDataset(batches)
-            
-            # Create train/val split
-            indices = np.arange(len(dataset))
-            train_size = int(len(dataset) * config.train_ratio)
-            train_indices = indices[:train_size]
-            val_indices = indices[train_size:]
-    
-            from torch.utils.data import Subset
-            train_dataset = Subset(dataset, train_indices)
-            val_dataset = Subset(dataset, val_indices)
-            
-            # Create dataloaders
-            generator = torch.Generator()
-            generator.manual_seed(config.seed + epoch)
-            
-            train_dataloader = DataLoader(
-                train_dataset,
-                batch_size=config.batch_size,
-                shuffle=True,
-                num_workers=4,
-                pin_memory=True,
-                drop_last=True,
-                collate_fn=citation_collate_fn,
-                generator=generator
-            )
-            
-            val_dataloader = DataLoader(
-                val_dataset,
-                batch_size=int(config.batch_size * 1.8),
-                shuffle=False,
-                num_workers=4,
-                pin_memory=True,
-                drop_last=True,
-                collate_fn=citation_collate_fn
-            )
-            
-            # Clear memory
-            del batches, dataset
-            gc.collect()
-            torch.cuda.empty_cache()
-            
-            # Training phase
-            model.train()
-            model.transformer.gradient_checkpointing_enable()
-            total_train_loss = 0
-            train_steps = 0
-            
-            progress_bar = tqdm.tqdm(train_dataloader, desc="Training")
-            
-            for batch_idx, batch in enumerate(progress_bar):     
-                if not validate_batch_structure(batch, config):
-                    continue
-                # Skip previously processed batches if resuming
-                if epoch == start_epoch and batch_idx < batch_in_epoch:
-                    continue
+            # Initialize or resume wandb run
+            if config.resume_from:
+                checkpoint = self.checkpoint
+                wandb_run_id = checkpoint['wandb_run_id']
+                print(f"Resuming wandb run: {wandb_run_id}")
+                wandb.init(
+                    project=config.project_name,
+                    name=config.run_name,
+                    id=wandb_run_id,
+                    resume="must"
+                )
+            else:
+                wandb.init(
+                    project=config.project_name,
+                    name=config.run_name,
+                    config=config,
+                )
                 
-                batch = {k: v.to(config.device) for k, v in batch.items()}
+                # Update run name in config if not set
+                if not config.run_name:
+                    config.run_name = wandb.run.name
+            
+            # Initialize training state
+            global_step = 0
+            start_epoch = 0
+            batch_in_epoch = 0
+            best_val_metrics = {'loss': float('inf')}
+            
+            # Move model to device
+            model = model.to(config.device)
+            
+            # Initialize optimizer
+            optimizer = AdamW([
+                {
+                    'params': [p for n, p in model.named_parameters() if n != 'logit_scale'],
+                    'lr': config.learning_rate,
+                    'weight_decay': config.weight_decay,
+                    'eps': config.Adam_eps
+                },
+                {
+                    'params': [model.logit_scale],
+                    'lr': config.logits_learning_rate,
+                    'weight_decay': 0
+                }
+            ])
+            
+            # Load checkpoint state if resuming
+            if config.resume_from:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                global_step = checkpoint['global_step']
+                start_epoch = checkpoint['epoch']
+                batch_in_epoch = checkpoint['batch_in_epoch']
+                best_val_metrics = checkpoint['best_val_metrics']
+                print(f"Resumed from checkpoint at epoch {start_epoch}, batch {batch_in_epoch}, step {global_step}")
+            
+            for epoch in range(start_epoch, config.num_epochs):
+                print(f"\nEpoch {epoch + 1}/{config.num_epochs}")
                 
-                optimizer.zero_grad()
+                # Log current scale
+                current_scale = model.logit_scale.exp().item()
+                print(f"Current logit scale: {current_scale:.4f}")
+                wandb.log({"logit_scale": current_scale}, step=global_step)
                 
-                # Forward pass with mixed precision
-                with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                # Training data preparation
+                print("Collating training data with new random masks...")
+                batches = create_training_batches(results, tokenizer, config)
+                dataset = CitationDataset(batches)
+                
+                # Create train/val split
+                indices = np.arange(len(dataset))
+                train_size = int(len(dataset) * config.train_ratio)
+                train_indices = indices[:train_size]
+                val_indices = indices[train_size:]
+        
+                from torch.utils.data import Subset
+                train_dataset = Subset(dataset, train_indices)
+                val_dataset = Subset(dataset, val_indices)
+                
+                # Create dataloaders
+                generator = torch.Generator()
+                generator.manual_seed(config.seed + epoch)
+                
+                train_dataloader = DataLoader(
+                    train_dataset,
+                    batch_size=config.batch_size,
+                    shuffle=True,
+                    num_workers=4,
+                    pin_memory=True,
+                    drop_last=True,
+                    collate_fn=citation_collate_fn,
+                    generator=generator
+                )
+                
+                val_dataloader = DataLoader(
+                    val_dataset,
+                    batch_size=int(config.batch_size * 1.8),
+                    shuffle=False,
+                    num_workers=4,
+                    pin_memory=True,
+                    drop_last=True,
+                    collate_fn=citation_collate_fn
+                )
+                
+                # Clear memory
+                del batches, dataset
+                gc.collect()
+                torch.cuda.empty_cache()
+                
+                # Training phase
+                model.train()
+                model.transformer.gradient_checkpointing_enable()
+                total_train_loss = 0
+                train_steps = 0
+                
+                progress_bar = tqdm.tqdm(train_dataloader, desc="Training")
+                
+                for batch_idx, batch in enumerate(progress_bar):     
+                    if not validate_batch_structure(batch, config):
+                        continue
+                    # Skip previously processed batches if resuming
+                    if epoch == start_epoch and batch_idx < batch_in_epoch:
+                        continue
+                    
+                    optimizer.zero_grad()
+                    
+                    # Forward pass
                     outputs = model(**batch)
                     loss = outputs.loss
+                    CE_loss = outputs.CE_loss
+                    
+                    # Backward pass
+                    # loss.backward()
+                    
+                    if config.max_grad_norm:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+                    
+                    optimizer.step()
+                    
+                    # Update tracking
+                    total_train_loss += CE_loss.item()
+                    train_steps += 1
+                    
+                    # Log metrics
+                    wandb.log({
+                        "train/batch_loss": CE_loss.item(),
+                        'logit_scale': model.logit_scale.item(),
+                        "train/learning_rate": optimizer.param_groups[0]["lr"],
+                        "train/batch_in_epoch": batch_idx,
+                        "epoch": epoch
+                    }, step=global_step)
+                    
+                    progress_bar.set_postfix({'loss': CE_loss.item()})
+                    
+                    # Save checkpoint periodically
+                    if global_step > 0 and global_step % config.checkpoint_every == 0:
+                        checkpoint_path = self.get_checkpoint_path(step=global_step)
+                        self.save_checkpoint(
+                            checkpoint_path,
+                            optimizer=optimizer,
+                            epoch=epoch,
+                            batch_in_epoch=batch_idx,
+                            global_step=global_step,
+                            wandb_run_id=wandb.run.id
+                        )
+                        print(f"\nSaved checkpoint at step {global_step} to {checkpoint_path}")
+                    
+                    global_step += 1
+                    
+                    # Clear memory
+                    del outputs, loss, CE_loss, batch
+                    torch.cuda.empty_cache()
                 
-                # Backward pass with gradient scaling
-                scaler.scale(loss).backward()
-                
-                if config.max_grad_norm:
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
-                
-                scaler.step(optimizer)
-                scaler.update()
-                
-                # Update tracking
-                total_train_loss += loss.item()
-                train_steps += 1
-                
-                # Log metrics
+                # Log epoch-level training metrics
+                avg_train_loss = total_train_loss / train_steps
+                print(f"\nAverage training loss: {avg_train_loss:.4f}")
                 wandb.log({
-                    "train/batch_loss": loss.item(),
-                    'logit_scale': model.logit_scale.item(),
-                    "train/learning_rate": optimizer.param_groups[0]["lr"],
-                    "train/batch_in_epoch": batch_idx,
+                    "train/epoch_loss": avg_train_loss,
                     "epoch": epoch
                 }, step=global_step)
                 
-                progress_bar.set_postfix({'loss': loss.item()})
-                
-                # Save checkpoint periodically
-                if global_step > 0 and global_step % config.checkpoint_every == 0:
-                    checkpoint_path = self.get_checkpoint_path(step=global_step)
-                    self.save_checkpoint(
-                        checkpoint_path,
-                        optimizer=optimizer,
-                        scaler=scaler,
-                        epoch=epoch,
-                        batch_in_epoch=batch_idx,
-                        global_step=global_step,
-                        wandb_run_id=wandb.run.id
-                    )
-                    print(f"\nSaved checkpoint at step {global_step} to {checkpoint_path}")
-                
-                global_step += 1
-                
-                # Clear memory
-                del outputs, loss, batch
+                # Validation phase
+                if len(val_dataloader)==0:
+                    print("\nValidation set is empty, so continuing with training ... ")
+                    continue
+                print("\nRunning validation...")
                 torch.cuda.empty_cache()
-            
-            # Log epoch-level training metrics
-            avg_train_loss = total_train_loss / train_steps
-            print(f"\nAverage training loss: {avg_train_loss:.4f}")
-            wandb.log({
-                "train/epoch_loss": avg_train_loss,
-                "epoch": epoch
-            }, step=global_step)
-            
-            # Validation phase
-            if len(val_dataloader)==0:
-                print("\nValidation set is emptpy, so continuing with training ... ")
-                continue
-            print("\nRunning validation...")
-            torch.cuda.empty_cache()
-            model.eval()
-            model.transformer.gradient_checkpointing_disable()
-            
-            with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
+                model.eval()
+                model.transformer.gradient_checkpointing_disable()
+                
                 val_metrics = validate_citation_matcher(
                     model=model,
                     val_dataloader=val_dataloader,
                     k_values=config.k_values,
                     config=config,
                 )
-            
-            # Log validation metrics
-            wandb_val_metrics = {
-                "val/loss": val_metrics['loss'],
-                "val/accuracy": val_metrics['accuracy'],
-                "val/mrr": val_metrics['mrr']
-            }
-            
-            for k in config.k_values:
-                if f'top_{k}_accuracy' in val_metrics:
-                    wandb_val_metrics[f"val/top_{k}_accuracy"] = val_metrics[f'top_{k}_accuracy']
-            
-            wandb.log(wandb_val_metrics, step=global_step)
-            
-            # Print validation metrics
-            print(f"\nValidation metrics:")
-            for metric, value in val_metrics.items():
-                if isinstance(value, (int, float)):
-                    print(f"  {metric}: {value:.4f}")
-            
-            # Save best model if validation loss improved
-            if val_metrics['loss'] < best_val_metrics['loss']:
-                best_val_metrics = val_metrics
-                best_model_path = self.get_checkpoint_path(is_best=True)
+                
+                # Log validation metrics
+                wandb_val_metrics = {
+                    "val/loss": val_metrics['loss'],
+                    "val/accuracy": val_metrics['accuracy'],
+                    "val/mrr": val_metrics['mrr']
+                }
+                
+                for k in config.k_values:
+                    if f'top_{k}_accuracy' in val_metrics:
+                        wandb_val_metrics[f"val/top_{k}_accuracy"] = val_metrics[f'top_{k}_accuracy']
+                
+                wandb.log(wandb_val_metrics, step=global_step)
+                
+                # Print validation metrics
+                print(f"\nValidation metrics:")
+                for metric, value in val_metrics.items():
+                    if isinstance(value, (int, float)):
+                        print(f"  {metric}: {value:.4f}")
+                
+                # Save best model if validation loss improved
+                if val_metrics['loss'] < best_val_metrics['loss']:
+                    best_val_metrics = val_metrics
+                    best_model_path = self.get_checkpoint_path(is_best=True)
+                    self.save_checkpoint(
+                        best_model_path,
+                        optimizer=optimizer,
+                        epoch=epoch,
+                        batch_in_epoch=batch_idx,
+                        global_step=global_step,
+                        val_metrics=val_metrics,
+                        best_val_metrics=best_val_metrics,
+                        wandb_run_id=wandb.run.id,
+                        is_best=True
+                    )
+                    
+                    # Update wandb summary with best metrics
+                    wandb.run.summary.update({
+                        "best_val_loss": val_metrics['loss'],
+                        "best_val_accuracy": val_metrics['accuracy'],
+                        "best_val_mrr": val_metrics['mrr'],
+                        "best_model_epoch": epoch,
+                        "best_model_step": global_step
+                    })
+                
+                # Save epoch checkpoint
+                epoch_checkpoint_path = self.get_checkpoint_path(epoch=epoch)
                 self.save_checkpoint(
-                    best_model_path,
+                    epoch_checkpoint_path,
                     optimizer=optimizer,
-                    scaler=scaler,
                     epoch=epoch,
                     batch_in_epoch=batch_idx,
                     global_step=global_step,
                     val_metrics=val_metrics,
                     best_val_metrics=best_val_metrics,
-                    wandb_run_id=wandb.run.id,
-                    is_best=True
+                    wandb_run_id=wandb.run.id
                 )
                 
-                # Update wandb summary with best metrics
-                wandb.run.summary.update({
-                    "best_val_loss": val_metrics['loss'],
-                    "best_val_accuracy": val_metrics['accuracy'],
-                    "best_val_mrr": val_metrics['mrr'],
-                    "best_model_epoch": epoch,
-                    "best_model_step": global_step
-                })
+                # Clear memory after each epoch
+                del val_metrics, train_dataloader, val_dataloader
+                gc.collect()
+                torch.cuda.empty_cache()
             
-            # Save epoch checkpoint
-            epoch_checkpoint_path = self.get_checkpoint_path(epoch=epoch)
-            self.save_checkpoint(
-                epoch_checkpoint_path,
-                optimizer=optimizer,
-                scaler=scaler,
-                epoch=epoch,
-                batch_in_epoch=batch_idx,
-                global_step=global_step,
-                val_metrics=val_metrics,
-                best_val_metrics=best_val_metrics,
-                wandb_run_id=wandb.run.id
-            )
-            
-            # Clear memory after each epoch
-            del val_metrics, train_dataloader, val_dataloader
-            gc.collect()
-            torch.cuda.empty_cache()
-        
-        wandb.finish()
-        return model
-
+            wandb.finish()
+            return model

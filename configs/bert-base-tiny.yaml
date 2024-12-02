@@ -1,5 +1,5 @@
 Adam_eps: 1.0e-08
-batch_size: 290
+batch_size: 400
 checkpoint_every: 1000
 cite_token: '[[CITE]]'
 ref_token: '[[REF]]'
