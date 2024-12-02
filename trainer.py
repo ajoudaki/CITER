@@ -15,9 +15,9 @@ from transformers import (
 )
 import tqdm 
 
-from data_processing import CitationExtractor
+from wiki_processor import CitationExtractor
 from config import TrainingConfig
-from architecture import CitationModel
+from model import CitationModel
 from data_processing import prepare_training_data, create_training_batches, citation_collate_fn, CitationDataset
 
 
