@@ -225,7 +225,7 @@ class TrainingManager:
         
         # Load checkpoint if specified
         if config.resume_from:
-            self.load_checkpoint(config.resume_from)
+            self.checkpoint = self.load_checkpoint(config.resume_from)
     
     def get_checkpoint_path(self, step: Optional[int] = None, epoch: Optional[int] = None, is_best: bool = False) -> Path:
         checkpoint_dir = self.config.get_checkpoint_dir()
@@ -286,7 +286,7 @@ class TrainingManager:
         
         # Save checkpoint and config
         torch.save(save_dict, path)
-        self.config.save(path.parent)
+        self.config.save(path.parent / 'config.yaml')
         
         if is_best:
             print(f"\nSaved new best model to {path}")
@@ -370,7 +370,7 @@ class TrainingManager:
         
         # Initialize or resume wandb run
         if config.resume_from:
-            checkpoint = self.load_checkpoint(config.resume_from)
+            checkpoint = self.checkpoint
             wandb_run_id = checkpoint['wandb_run_id']
             print(f"Resuming wandb run: {wandb_run_id}")
             wandb.init(

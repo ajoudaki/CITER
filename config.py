@@ -15,7 +15,7 @@ class TrainingConfig:
     # Model configuration
     model_name: str = "bert-base-uncased"
     vocab_size: Optional[int] = None
-    initial_logit_scale: float = np.log(1/0.07)
+    initial_logit_scale: float = 1.15
     
     # Random seed configuration
     seed: int = 42
@@ -49,16 +49,16 @@ class TrainingConfig:
     k_values: List[int] = field(default_factory=lambda: [1, 5, 10, 50, 100, 1000])
     
     # Checkpoint configuration
-    root_dir: Path = Path(".")  # Default to current directory
+    root_dir: Path = "."  # Default to current directory
     project_name: str = "citation-matching"
     
     @property
     def data_dir(self) -> Path:
-        return self.root_dir / "data"
+        return Path(self.root_dir) / "data"
     
     @property
     def output_dir(self) -> Path:
-        return self.root_dir / "outputs"
+        return Path(self.root_dir) / "outputs"
     
     @property
     def checkpoint_dir(self) -> Path:
@@ -90,21 +90,21 @@ class TrainingConfig:
     
     def get_checkpoint_dir(self) -> Path:
         if self.project_name and self.run_name:
-            checkpoint_path = Path(self.checkpoint_dir) / self.project_name / self.run_name
+            checkpoint_path = Path(self.checkpoint_dir) / self.run_name
         elif self.project_name:
-            checkpoint_path = Path(self.checkpoint_dir) / self.project_name
+            checkpoint_path = Path(self.checkpoint_dir)
         else:
             checkpoint_path = Path(self.checkpoint_dir)
         checkpoint_path.mkdir(parents=True, exist_ok=True)
         return checkpoint_path
     
-    def save(self, path: Path):
-        with open(path / "config.yaml", 'w') as f:
+    def save(self, path: str):
+        with open(path, 'w') as f:
             yaml.dump(asdict(self), f)
     
     @classmethod
-    def load(cls, path: Path) -> 'TrainingConfig':
-        with open(path / "config.yaml", 'r') as f:
+    def load(cls, path: str) -> 'TrainingConfig':
+        with open(path, 'r') as f:
             config_dict = yaml.safe_load(f)
         return cls(**config_dict)
     
