@@ -341,14 +341,14 @@ class TrainingManager:
     def get_tokenizer(self) -> AutoTokenizer:
         return self.tokenizer
     
-    def get_results(self, cache_path=None):
+    def get_tokenized_data(self, cache_path=None):
         if cache_path:
-            results = prepare_training_data(cache_path=cache_path)
+            tokenized_data = prepare_training_data(cache_path=cache_path)
         else:
             preprocessor = CitationExtractor()
             sources, citation_data = preprocessor.find_source_citations()
-            results = prepare_training_data(sources, citation_data, self.tokenizer, cache_dir="cache")
-        return results
+            tokenized_data = prepare_training_data(sources, citation_data, self.tokenizer, cache_dir="cache")
+        return tokenized_data
 
     
     def train_citation_matcher(
@@ -399,7 +399,7 @@ class TrainingManager:
         
         # Move model to device and enable memory efficient training
         model = model.to(config.device)
-        model.transformer.gradient_checkpointing_enable()
+        
         
         # Initialize optimizer
         optimizer = AdamW([
@@ -481,6 +481,7 @@ class TrainingManager:
             
             # Training phase
             model.train()
+            model.transformer.gradient_checkpointing_enable()
             total_train_loss = 0
             train_steps = 0
             
@@ -562,6 +563,7 @@ class TrainingManager:
             print("\nRunning validation...")
             torch.cuda.empty_cache()
             model.eval()
+            model.transformer.gradient_checkpointing_disable()
             
             with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
                 val_metrics = validate_citation_matcher(

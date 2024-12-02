@@ -5,7 +5,7 @@ cite_token: '[[CITE]]'
 cite_token_id: null
 collate_sample_size: null
 device: cuda
-initial_logit_scale: 2.995732273553991
+initial_logit_scale: 3
 k_values:
 - 1
 - 5

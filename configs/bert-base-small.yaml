@@ -4,7 +4,7 @@ checkpoint_every: 1000
 cite_token: '[[CITE]]'
 ref_token: '[[REF]]'
 cite_token_id: null
-collate_sample_size: 2000
+collate_sample_size: 20000
 device: cuda
 initial_logit_scale: 3
 k_values:
