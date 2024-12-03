@@ -46,165 +46,117 @@ def compute_retrieval_metrics(logits, labels, ks=[1, 5, 10, 50, 100, 1000]):
     
     return metrics
     
-def validate_citation_matcher(
+
+
+def validate_epoch(
     model,
     val_dataloader,
-    return_embeddings: bool = False,
-    k_values: List[int] = [1, 5, 10, 50, 100, 1000],
-    similarity_batch_size: int = 16,
-    config: TrainingConfig = None
-):
-    device = config.device
+    global_step: int,
+    epoch: int,
+    wandb,
+    config: TrainingConfig
+) -> dict:
+    import torch
+    import tqdm
+    from torch.cuda import empty_cache
     
+    print("\nStarting validation...")
     model.eval()
+    empty_cache()
     
-    # Lists to store accumulated embeddings and IDs
-    all_cite_embeds = []
-    all_ref_embeds = []
-    all_cited_art_ids = []
-    all_target_art_ids = []
+    # Initialize tracking variables
+    total_val_loss = 0
+    total_correct = 0
+    total_samples = 0
+    all_logits = []
+    all_labels = []
     
-    # Accumulate embeddings and IDs
+    # Validation loop
     with torch.no_grad():
-        for batch in tqdm.tqdm(val_dataloader, desc="Computing embeddings"):
+        progress_bar = tqdm.tqdm(val_dataloader, desc="Validating")
+        
+        for batch_idx, batch in enumerate(progress_bar):
+            # Validate batch structure
             if not validate_batch_structure(batch, config):
                 continue
-            # Move batch to device and convert to FP16
-            batch = {k: (v.to(device, dtype=torch.float16) if isinstance(v, torch.FloatTensor) 
-                        else v.to(device)) for k, v in batch.items()}
+                
             
-            # Process source text
-            source_outputs = model.transformer(
-                input_ids=batch['source_ids'],
-                attention_mask=batch['attention_mask'],
-                return_dict=True
-            )
+            # Forward pass
+            outputs = model.forward_backward(**batch, compute_backward=False)
+            loss = outputs.loss
+            logits = outputs.logits
             
-            # Process target text
-            target_outputs = model.transformer(
-                input_ids=batch['target_ids'],
-                attention_mask=batch['target_attention_mask'],
-                return_dict=True
-            )
+            # Update metrics
+            total_val_loss += loss.item()
+            predictions = torch.argmax(logits, dim=-1)
+            total_correct += (predictions == batch['labels']).sum().item()
+            total_samples += len(batch['labels'])
             
-            # Extract embeddings with masks
-            cite_mask = model.get_citation_masks(batch['source_ids'])
-            cite_embeds = source_outputs.last_hidden_state[cite_mask]
-            ref_mask = model.get_reference_masks(batch['target_ids'])
-            ref_embeds = target_outputs.last_hidden_state[ref_mask]
+            # Store logits and labels for computing retrieval metrics
+            all_logits.append(logits.cpu())
+            all_labels.append(batch['labels'].cpu())
             
-            # Normalize and move to CPU immediately
-            cite_embeds = F.normalize(cite_embeds, p=2, dim=-1).cpu()
-            ref_embeds = F.normalize(ref_embeds, p=2, dim=-1).cpu()
+            # Update progress bar
+            progress_bar.set_postfix({'loss': loss.item()})
             
-            # Store embeddings and IDs on CPU
-            all_cite_embeds.append(cite_embeds)
-            all_ref_embeds.append(ref_embeds)
-            all_cited_art_ids.append(batch['cited_art_ids'].cpu())
-            all_target_art_ids.append(batch['target_art_ids'].cpu())
+            # Log batch-level metrics
+            wandb.log({
+                "val/batch_loss": loss.item(),
+                "val/batch_accuracy": (predictions == batch['labels']).float().mean().item(),
+                "val/batch_size": len(batch['labels']),
+                "epoch": epoch
+            }, step=global_step + batch_idx)
             
-            # Clear GPU cache after each batch
-            del source_outputs, target_outputs, cite_embeds, ref_embeds
-            torch.cuda.empty_cache()
+            # Clear memory
+            del outputs, loss, logits, predictions, batch
+            empty_cache()
     
-    # Concatenate all accumulated tensors
-    cite_embeds = torch.cat(all_cite_embeds)
-    ref_embeds = torch.cat(all_ref_embeds)
-    cited_art_ids = torch.cat(all_cited_art_ids)
-    target_art_ids = torch.cat(all_target_art_ids)
+    # Compute epoch-level metrics
+    all_logits = torch.cat(all_logits)
+    all_labels = torch.cat(all_labels)
     
-    # Get unique target art IDs and create mapping
-    target_art_ids_unique, unique_indices = np.unique(target_art_ids.numpy(), return_index=True)
-    target_art_ids_unique = torch.tensor(target_art_ids_unique)
-    ref_embeds_unique = ref_embeds[torch.tensor(unique_indices)]
-    
-    # Create ID to index mapping
-    id2i = {id.item(): i for i, id in enumerate(target_art_ids_unique)}
-    labels = torch.tensor([id2i[id.item()] for id in cited_art_ids], dtype=torch.long)
-    
-    # Process in smaller batches for similarity computation
-    total_loss = 0
-    total_correct = 0
-    all_predictions = []
-    logits_list = []  # Store logits temporarily for metrics computation
-    labels_list = []  # Store labels temporarily for metrics computation
-    
-    num_batches = (len(cite_embeds) + similarity_batch_size - 1) // similarity_batch_size
-    logit_scale = torch.clamp(model.logit_scale, 0, torch.log(torch.tensor(20.0)))
-    
-    # Move ref_embeds to GPU once
-    ref_embeds_unique = ref_embeds_unique.to(device)
-    
-    for i in tqdm.tqdm(range(num_batches), desc="Computing similarities"):
-        start_idx = i * similarity_batch_size
-        end_idx = min((i + 1) * similarity_batch_size, len(cite_embeds))
-        
-        # Process batch
-        cite_embeds_batch = cite_embeds[start_idx:end_idx].to(device)
-        labels_batch = labels[start_idx:end_idx].to(device)
-        
-        # Compute similarities and loss
-        with torch.amp.autocast(device_type='cuda', dtype=torch.float16):
-            logits_batch = torch.matmul(cite_embeds_batch, ref_embeds_unique.t()) * logit_scale.exp()
-            loss_batch = F.cross_entropy(logits_batch, labels_batch)
-        
-        total_loss += loss_batch.item() * len(labels_batch)
-        predictions_batch = torch.argmax(logits_batch, dim=-1)
-        total_correct += (predictions_batch == labels_batch).sum().item()
-        
-        # Store predictions and move to CPU
-        all_predictions.append(predictions_batch.cpu())
-        logits_list.append(logits_batch.cpu())
-        labels_list.append(labels_batch.cpu())
-        
-        # Clear GPU memory
-        del logits_batch, cite_embeds_batch, labels_batch, predictions_batch
-        torch.cuda.empty_cache()
-    
-    # Compute final metrics
-    num_citations = len(cite_embeds)
-    accuracy = total_correct / num_citations
-    avg_loss = total_loss / num_citations
+    # Calculate average metrics
+    avg_val_loss = total_val_loss / len(val_dataloader)
+    accuracy = total_correct / total_samples
     
     # Compute retrieval metrics
-    all_logits = torch.cat(logits_list)
-    all_labels = torch.cat(labels_list)
-    retrieval_metrics = compute_retrieval_metrics(all_logits, all_labels, ks=k_values)
+    retrieval_metrics = compute_retrieval_metrics(
+        all_logits, 
+        all_labels,
+        ks=config.k_values,
+    )
     
-    # Clear temporary lists
-    del logits_list, labels_list
-    torch.cuda.empty_cache()
-    
-    results = {
-        'loss': avg_loss,
+    # Combine all metrics
+    val_metrics = {
+        'loss': avg_val_loss,
         'accuracy': accuracy,
-        'num_citations': num_citations,
-        'num_unique_targets': len(target_art_ids_unique),
+        'num_samples': total_samples,
         'mrr': retrieval_metrics['mrr']
     }
     
     # Add top-k accuracies
-    for k in k_values:
-        if f'top_{k}_accuracy' in retrieval_metrics:
-            results[f'top_{k}_accuracy'] = retrieval_metrics[f'top_{k}_accuracy']
+    for k, value in retrieval_metrics.items():
+        if k.startswith('top_'):
+            val_metrics[k] = value
     
-    if return_embeddings:
-        results.update({
-            'cite_embeds': cite_embeds,
-            'ref_embeds': ref_embeds_unique.cpu(),
-            'cited_art_ids': cited_art_ids,
-            'target_art_ids': target_art_ids_unique,
-            'logits': all_logits,
-            'labels': labels
-        })
+    # Log epoch-level validation metrics
+    wandb_val_metrics = {f'val/{k}': v for k, v in val_metrics.items()}
+    wandb.log({
+        **wandb_val_metrics,
+        "epoch": epoch
+    }, step=global_step)
     
-    # Final cleanup
-    del cite_embeds, ref_embeds, ref_embeds_unique
-    torch.cuda.empty_cache()
+    # Print validation metrics
+    print("\nValidation metrics:")
+    for metric, value in val_metrics.items():
+        if isinstance(value, (int, float)):
+            print(f"  {metric}: {value:.4f}")
     
-    return results
-
-
+    # Clear memory
+    del all_logits, all_labels
+    empty_cache()
+    
+    return val_metrics
 
 class TrainingManager:
     def __init__(self, config: TrainingConfig):
@@ -460,7 +412,7 @@ class TrainingManager:
                 
                 val_dataloader = DataLoader(
                     val_dataset,
-                    batch_size=config.batch_size * 2, 
+                    batch_size=config.val_batch_size, 
                     shuffle=False,
                     num_workers=4,
                     pin_memory=True,
@@ -491,7 +443,7 @@ class TrainingManager:
                     optimizer.zero_grad()
                     
                     # Forward-Backward pass with micro-batches
-                    outputs = model.forward_backward(**batch)
+                    outputs = model.forward_backward(**batch, compute_backward=True)
                     loss = outputs.loss
                     
                     # Backward pass
@@ -503,7 +455,7 @@ class TrainingManager:
                     optimizer.step()
                     
                     # Update tracking
-                    total_train_loss += loss
+                    total_train_loss += loss.item()
                     train_steps += 1
                     
                     # Log metrics
@@ -552,34 +504,14 @@ class TrainingManager:
                     continue
                 print("\nRunning validation...")
                 torch.cuda.empty_cache()
-                model.eval()
-                # model.transformer.gradient_checkpointing_disable()
-                
-                val_metrics = model.validate(val_dataloader)
-                
-                wandb_val_metrics = {
-                    f'val/{k}': v for k, v in val_metrics.items()
-                    for k, v in val_metrics.items()
-                }
-                
-                # # Log validation metrics
-                # wandb_val_metrics = {
-                #     "val/loss": val_metrics['loss'],
-                #     "val/accuracy": val_metrics['accuracy'],
-                #     "val/mrr": val_metrics['mrr']
-                # }
-                
-                # for k in config.k_values:
-                #     if f'top_{k}_accuracy' in val_metrics:
-                #         wandb_val_metrics[f"val/top_{k}_accuracy"] = val_metrics[f'top_{k}_accuracy']
-                
-                wandb.log(wandb_val_metrics, step=global_step)
-                
-                # Print validation metrics
-                print(f"\nValidation metrics:")
-                for metric, value in val_metrics.items():
-                    if isinstance(value, (int, float)):
-                        print(f"  {metric}: {value:.4f}")
+                val_metrics = validate_epoch(
+                    model=model,
+                    val_dataloader=val_dataloader,
+                    global_step=global_step,
+                    epoch=epoch,
+                    wandb=wandb,
+                    config=config
+                )
                 
                 # Save best model if validation loss improved
                 if val_metrics['loss'] < best_val_metrics['loss']:

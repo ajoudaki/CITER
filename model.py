@@ -143,7 +143,7 @@ class CitationModel(nn.Module):
         cited_art_ids: Optional[torch.Tensor] = None,
         target_art_ids: Optional[torch.Tensor] = None,
         return_dict: bool = True,
-        compute_backward: bool = True,
+        compute_backward: bool = False,
     ) -> Union[Tuple, CitationModelOutput]:
         """Forward pass with gradient accumulation using micro-batches."""
         
@@ -202,82 +202,11 @@ class CitationModel(nn.Module):
         all_cite_embeds.requires_grad_(False)
         if return_dict:
             return CitationModelOutput(
-                loss=loss.item(),
+                loss=loss.detach().cpu(),
                 logits=logits.detach().cpu(),
                 cite_embeds=all_cite_embeds.cpu(),
                 ref_embeds=all_ref_embeds.cpu()
             )
         
         return (loss, logits, all_cite_embeds, all_ref_embeds)
-    
-    def validate(
-        self,
-        val_dataloader,
-        return_embeddings: bool = False,
-    ) -> Dict[str, Union[float, int, torch.Tensor]]:
-        """
-        Validation method using forward_backward implementation.
-        """
-        self.eval()
-        device = self.config.device
-        k_values = self.config.k_values
-        
-        all_logits = []
-        all_labels = []
-        total_loss = 0
-        total_citations = 0
-        
-        with torch.no_grad():
-            for batch in tqdm.tqdm(val_dataloader, desc="Validating"):
-                # Process batch
-                outputs = self.forward_backward(
-                    source_ids=batch['source_ids'].to(device),
-                    target_ids=batch['target_ids'].to(device),
-                    labels=batch['labels'].to(device),
-                    attention_mask=batch['attention_mask'].to(device),
-                    target_attention_mask=batch['target_attention_mask'].to(device),
-                    cited_art_ids=batch['cited_art_ids'].to(device),
-                    target_art_ids=batch['target_art_ids'].to(device),
-                    compute_backward=False
-                )
-                
-                # Accumulate results
-                total_loss += outputs.loss.item() * len(batch['labels'])
-                total_citations += len(batch['labels'])
-                all_logits.append(outputs.logits.cpu())
-                all_labels.append(batch['labels'].cpu())
-                
-                # Clear GPU memory
-                torch.cuda.empty_cache()
-        
-        # Concatenate results
-        all_logits = torch.cat(all_logits)
-        all_labels = torch.cat(all_labels)
-        
-        # Calculate metrics
-        avg_loss = total_loss / total_citations
-        accuracy = (all_logits.argmax(dim=-1) == all_labels).float().mean().item()
-        
-        # Compute retrieval metrics
-        retrieval_metrics = compute_retrieval_metrics(all_logits, all_labels, ks=k_values)
-        
-        results = {
-            'loss': avg_loss,
-            'accuracy': accuracy,
-            'num_citations': total_citations,
-            'mrr': retrieval_metrics['mrr']
-        }
-        
-        # Add top-k accuracies
-        for k in k_values:
-            if f'top_{k}_accuracy' in retrieval_metrics:
-                results[f'top_{k}_accuracy'] = retrieval_metrics[f'top_{k}_accuracy']
-        
-        if return_embeddings:
-            results.update({
-                'logits': all_logits,
-                'labels': all_labels
-            })
-        
-        return results
     
