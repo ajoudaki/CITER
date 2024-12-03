@@ -1,13 +1,13 @@
 Adam_eps: 1.0e-08
-batch_size: 4024
+batch_size: 2048
 val_batch_size: 8000
-micro_batch_size: 32
+micro_batch_size: 16
 train_ratio: 0.9
 checkpoint_every: 50
 cite_token: '[[CITE]]'
 ref_token: '[[REF]]'
 cite_token_id: null
-device: cuda
+device: 'cuda:1'
 initial_logit_scale: 3
 k_values:
 - 1
@@ -18,17 +18,14 @@ k_values:
 - 1000
 learning_rate: 0.00015
 logits_learning_rate: 0
-max_grad_norm: 1.0
+max_grad_norm: 0.5
 max_length: 512
 max_targets: 5
 model_name: bert-base-uncased
 num_epochs: 100
 overlap: 0.5
 project_name: citation-matching
-ref_token_id: null
-resume_from: null
 root_dir: /mnt/HDD/amir/paperGPT
-run_name: null
 seed: 42
 source_len: 512
 target_len: 512
