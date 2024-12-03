@@ -205,6 +205,10 @@ class CitationDataset(Dataset):
     def __getitem__(self, idx):
         return self.data[idx]
 
+    def __del__(self):
+        torch.cuda.empty_cache()
+
+
 def citation_collate_fn(batch):
     # Stack sources normally
     source_ids = torch.stack([item['source_ids'] for item in batch])

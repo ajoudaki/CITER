@@ -53,7 +53,8 @@ class CitationModel(nn.Module):
         
         # Load base transformer model
         self.transformer = AutoModel.from_pretrained(config.model_name)
-        self.transformer.to(config.device)
+        # self.transformer = torch.compile(self.transformer)
+        # self.transformer.to(config.device)
         
         # Resize token embeddings if needed
         if config.vocab_size != self.transformer.config.vocab_size:
@@ -113,17 +114,24 @@ class CitationModel(nn.Module):
                 curr_mask = (curr_input_ids == mask_token_id)
                 curr_embeds = F.normalize(outputs.last_hidden_state[curr_mask], p=2, dim=-1)
                 
-                if embedding_gradients is not None:
+                if embedding_gradients is None:
+                    all_embeddings.append(curr_embeds)
+                else:
                     num_curr_embeds = curr_embeds.size(0)
                     curr_grads = embedding_gradients[grad_idx:grad_idx + num_curr_embeds]
                     loss = torch.sum(curr_embeds * curr_grads)
                     loss.backward()
                     accumulated_loss += loss.item()
                     grad_idx += num_curr_embeds
-                else:
-                    all_embeddings.append(curr_embeds.detach().cpu())
+
+
+        torch.cuda.empty_cache()
+        
+        if embedding_gradients is None:
+            return torch.cat(all_embeddings, dim=0)
+        else:
+            return accumulated_loss
                     
-        return accumulated_loss if embedding_gradients is not None else torch.cat(all_embeddings, dim=0).to(self.config.device)
 
     def forward_backward(
         self,
@@ -141,62 +149,63 @@ class CitationModel(nn.Module):
         
         # Move labels to device
         labels = labels.to(self.config.device)
-        
-        # First pass: get embeddings and compute initial loss
-        all_cite_embeds = self.forward_backward_microbatches(
-            input_ids=source_ids,
-            mask_token_id=self.config.cite_token_id,
-            attention_mask=attention_mask,
-        )
-        
-        all_ref_embeds = self.forward_backward_microbatches(
-            input_ids=target_ids,
-            mask_token_id=self.config.ref_token_id,
-            attention_mask=target_attention_mask,
-        )
-        
-        # Create copies that require gradients
-        cite_embeds_grad = all_cite_embeds.detach().requires_grad_(True)
-        ref_embeds_grad = all_ref_embeds.detach().requires_grad_(True)
-        
-        # Compute similarity and loss
-        logit_scale = torch.clamp(self.logit_scale, 0, torch.log(torch.tensor(20.0, device=self.config.device)))
-        logits = torch.matmul(cite_embeds_grad, ref_embeds_grad.t()) * logit_scale.exp()
-        loss = F.cross_entropy(logits, labels)
-        
-        # Compute gradients
-        loss.backward()
-        
-        if compute_backward:        
-            # Get gradient
-            cite_grads = cite_embeds_grad.grad.clone()
-            ref_grads = ref_embeds_grad.grad.clone()
-            
-            # Second pass: compute loss using gradients
-            self.forward_backward_microbatches(
+    
+        with torch.no_grad():
+            # First pass: get embeddings and compute initial loss
+            all_cite_embeds = self.forward_backward_microbatches(
                 input_ids=source_ids,
                 mask_token_id=self.config.cite_token_id,
                 attention_mask=attention_mask,
-                embedding_gradients=cite_grads,
             )
             
-            self.forward_backward_microbatches(
+            all_ref_embeds = self.forward_backward_microbatches(
                 input_ids=target_ids,
                 mask_token_id=self.config.ref_token_id,
                 attention_mask=target_attention_mask,
-                embedding_gradients=ref_grads,
             )
-            
-            # Clean up intermediate tensors
-            del cite_embeds_grad, ref_embeds_grad, cite_grads, ref_grads
-            torch.cuda.empty_cache()
-            
+
+        with torch.amp.autocast('cuda', dtype=torch.float16):
+            with torch.enable_grad():
+                # Create copies that require gradients
+                all_cite_embeds.requires_grad_(True)
+                all_ref_embeds.requires_grad_(True)
+                
+                # Compute similarity and loss
+                logit_scale = torch.clamp(self.logit_scale, 0, torch.log(torch.tensor(20.0, device=self.config.device)))
+                logits = torch.matmul(all_cite_embeds, all_ref_embeds.t()) * logit_scale.exp()
+                loss = F.cross_entropy(logits, labels)
+                
+                # Compute gradients
+                loss.backward()
+        
+                if compute_backward:        
+                    
+                    # Second pass: compute loss using gradients
+                    self.forward_backward_microbatches(
+                        input_ids=source_ids,
+                        mask_token_id=self.config.cite_token_id,
+                        attention_mask=attention_mask,
+                        embedding_gradients=all_cite_embeds.grad,
+                    )
+                    
+                    self.forward_backward_microbatches(
+                        input_ids=target_ids,
+                        mask_token_id=self.config.ref_token_id,
+                        attention_mask=target_attention_mask,
+                        embedding_gradients=all_ref_embeds.grad,
+                    )
+                    
+                    # Clean up intermediate tensors
+                    # del all_cite_embeds, all_ref_embeds, cite_grads, ref_grads
+
+        all_ref_embeds.requires_grad_(False)
+        all_cite_embeds.requires_grad_(False)
         if return_dict:
             return CitationModelOutput(
-                loss=loss,
-                logits=logits,
-                cite_embeds=all_cite_embeds,
-                ref_embeds=all_ref_embeds
+                loss=loss.item(),
+                logits=logits.detach().cpu(),
+                cite_embeds=all_cite_embeds.cpu(),
+                ref_embeds=all_ref_embeds.cpu()
             )
         
         return (loss, logits, all_cite_embeds, all_ref_embeds)
