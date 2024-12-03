@@ -1,11 +1,11 @@
 Adam_eps: 1.0e-08
 batch_size: 2048
 micro_batch_size: 32
-checkpoint_every: 1000
+checkpoint_every: 20
 cite_token: '[[CITE]]'
 ref_token: '[[REF]]'
 cite_token_id: null
-device: cuda
+device: 'cuda:1'
 initial_logit_scale: 3
 k_values:
 - 1
@@ -29,8 +29,8 @@ root_dir: /mnt/HDD/amir/paperGPT
 run_name: null
 seed: 42
 source_len: 512
-target_len: 128
-train_ratio: 0.99
+target_len: 512
+train_ratio: 1.0
 vocab_size: null
 warmup_steps: 0
 weight_decay: 0.01
