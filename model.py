@@ -14,22 +14,6 @@ from transformers import (
 
 from config import TrainingConfig
 
-def compute_retrieval_metrics(logits, labels, ks=[1, 5, 10, 50, 100, 1000]):
-    # Get rankings of correct targets
-    correct_scores = logits[torch.arange(logits.size(0)), labels]
-    rankings = (logits >= correct_scores.unsqueeze(1)).sum(1)
-    
-    # Compute MRR
-    mrr = (1.0 / rankings).mean().item()
-    
-    # Compute top-k accuracy for different k values
-    metrics = {'mrr': mrr}
-    for k in ks:
-        if k <= logits.size(1):  # Only compute if k is not larger than number of targets
-            top_k_acc = (rankings <= k).float().mean().item()
-            metrics[f'top_{k}_accuracy'] = top_k_acc
-    
-    return metrics
 
 @dataclass
 class CitationModelOutput:
