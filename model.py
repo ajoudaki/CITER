@@ -30,7 +30,10 @@ class CitationModel(nn.Module):
         super().__init__()
         
         # Load base model configuration
-        base_config = AutoConfig.from_pretrained(config.model_name)
+        base_config = AutoConfig.from_pretrained(
+            config.model_name,
+            attn_implementation="flash_attention_2",
+        )
         
         # Store configuration
         self.config = config
