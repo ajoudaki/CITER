@@ -68,8 +68,6 @@ def validate_epoch(
     total_val_loss = 0
     total_correct = 0
     total_samples = 0
-    all_logits = []
-    all_labels = []
     
     # Validation loop
     with torch.no_grad():
@@ -92,9 +90,6 @@ def validate_epoch(
             total_correct += (predictions == batch['labels']).sum().item()
             total_samples += len(batch['labels'])
             
-            # Store logits and labels for computing retrieval metrics
-            all_logits.append(logits.cpu())
-            all_labels.append(batch['labels'].cpu())
             
             # Update progress bar
             progress_bar.set_postfix({'loss': loss.item()})
@@ -105,40 +100,26 @@ def validate_epoch(
                 "val/batch_accuracy": (predictions == batch['labels']).float().mean().item(),
                 "val/batch_size": len(batch['labels']),
                 "epoch": epoch
-            }, step=global_step + batch_idx)
+            }, step=global_step )
             
             # Clear memory
             del outputs, loss, logits, predictions, batch
             empty_cache()
     
-    # Compute epoch-level metrics
-    all_logits = torch.cat(all_logits)
-    all_labels = torch.cat(all_labels)
     
     # Calculate average metrics
     avg_val_loss = total_val_loss / len(val_dataloader)
     accuracy = total_correct / total_samples
     
-    # Compute retrieval metrics
-    retrieval_metrics = compute_retrieval_metrics(
-        all_logits, 
-        all_labels,
-        ks=config.k_values,
-    )
     
     # Combine all metrics
     val_metrics = {
         'loss': avg_val_loss,
         'accuracy': accuracy,
-        'num_samples': total_samples,
-        'mrr': retrieval_metrics['mrr']
+        'num_samples': total_samples / len(val_dataloader),
+        'mrr': 0
     }
-    
-    # Add top-k accuracies
-    for k, value in retrieval_metrics.items():
-        if k.startswith('top_'):
-            val_metrics[k] = value
-    
+
     # Log epoch-level validation metrics
     wandb_val_metrics = {f'val/{k}': v for k, v in val_metrics.items()}
     wandb.log({
@@ -153,7 +134,6 @@ def validate_epoch(
             print(f"  {metric}: {value:.4f}")
     
     # Clear memory
-    del all_logits, all_labels
     empty_cache()
     
     return val_metrics
