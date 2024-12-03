@@ -8,8 +8,8 @@ from trainer import TrainingManager
 
 
 # config = TrainingConfig.load('configs/bert-base-small.yaml')
-# config = TrainingConfig.load('configs/bert-base-tiny.yaml')
-config = TrainingConfig.load('configs/bert-base.yaml')
+config = TrainingConfig.load('configs/bert-base-tiny.yaml')
+# config = TrainingConfig.load('configs/bert-base.yaml')
 
 
 if __name__ == "__main__":
