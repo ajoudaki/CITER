@@ -137,22 +137,22 @@ class CitationModel(nn.Module):
         # Move labels to device
         labels = labels.to(self.config.device)
 
-        with torch.amp.autocast('cuda' if 'cuda' in self.config.device else 'cpu', dtype=torch.float16):
-            with torch.no_grad():
-                # First pass: get embeddings and compute initial loss
-                all_cite_embeds = self.forward_backward_microbatches(
-                    input_ids=source_ids,
-                    mask_token_id=self.config.cite_token_id,
-                    attention_mask=attention_mask,
-                )
-                
-                all_ref_embeds = self.forward_backward_microbatches(
-                    input_ids=target_ids,
-                    mask_token_id=self.config.ref_token_id,
-                    attention_mask=target_attention_mask,
-                )
+        # with torch.amp.autocast('cuda' if 'cuda' in self.config.device else 'cpu'):
+        with torch.no_grad():
+            # First pass: get embeddings and compute initial loss
+            all_cite_embeds = self.forward_backward_microbatches(
+                input_ids=source_ids,
+                mask_token_id=self.config.cite_token_id,
+                attention_mask=attention_mask,
+            )
+            
+            all_ref_embeds = self.forward_backward_microbatches(
+                input_ids=target_ids,
+                mask_token_id=self.config.ref_token_id,
+                attention_mask=target_attention_mask,
+            )
 
-        
+        with torch.amp.autocast('cuda' if 'cuda' in self.config.device else 'cpu', dtype = torch.float16):
             with torch.enable_grad():
                 # Create copies that require gradients
                 all_cite_embeds.requires_grad_(True)
