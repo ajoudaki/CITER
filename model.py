@@ -139,6 +139,7 @@ class CitationModel(nn.Module):
 
         # with torch.amp.autocast('cuda' if 'cuda' in self.config.device else 'cpu'):
         with torch.no_grad():
+            self.transformer.eval()
             # First pass: get embeddings and compute initial loss
             all_cite_embeds = self.forward_backward_microbatches(
                 input_ids=source_ids,
@@ -154,6 +155,7 @@ class CitationModel(nn.Module):
 
         # with torch.amp.autocast('cuda' if 'cuda' in self.config.device else 'cpu'):
         with torch.enable_grad():
+            
             # Create copies that require gradients
             all_cite_embeds.requires_grad_(True)
             all_ref_embeds.requires_grad_(True)
@@ -167,7 +169,7 @@ class CitationModel(nn.Module):
             loss.backward()
     
             if compute_backward:        
-                
+                self.transformer.train()
                 # Second pass: compute loss using gradients
                 self.forward_backward_microbatches(
                     input_ids=source_ids,

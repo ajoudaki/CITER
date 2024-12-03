@@ -1,13 +1,13 @@
 Adam_eps: 1.0e-08
 batch_size: 2048
 val_batch_size: 8000
-micro_batch_size: 16
+micro_batch_size: 32
 train_ratio: 0.9
 checkpoint_every: 50
 cite_token: '[[CITE]]'
 ref_token: '[[REF]]'
 cite_token_id: null
-device: 'cuda:1'
+device: 'cuda:0'
 initial_logit_scale: 3
 k_values:
 - 1
@@ -18,7 +18,7 @@ k_values:
 - 1000
 learning_rate: 0.00015
 logits_learning_rate: 0
-max_grad_norm: 0.5
+max_grad_norm: 1.0
 max_length: 512
 max_targets: 5
 model_name: bert-base-uncased
@@ -29,6 +29,6 @@ root_dir: /mnt/HDD/amir/paperGPT
 seed: 42
 source_len: 512
 target_len: 512
-vocab_size: null
 warmup_steps: 0
 weight_decay: 0.01
+

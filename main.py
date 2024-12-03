@@ -1,16 +1,13 @@
 # Standard library imports
 
 # Third-party imports
-import numpy as np
-
 from config import TrainingConfig
 from trainer import TrainingManager
 
 
 # config = TrainingConfig.load('configs/bert-base-small.yaml')
-config = TrainingConfig.load('configs/bert-base-tiny.yaml')
-# config = TrainingConfig.load('configs/bert-base.yaml')
-
+# config = TrainingConfig.load('configs/bert-base-tiny.yaml')
+config = TrainingConfig.load('configs/bert-base.yaml')
 
 if __name__ == "__main__":
     trainer = TrainingManager(config)
@@ -19,7 +16,7 @@ if __name__ == "__main__":
     # Train from scratch
     trained_model = trainer.train_citation_matcher(tokenized_data)
     
-    # # Or resume from checkpoint`
+    # # Or resume from checkpoint
     # config.resume_from = config.checkpoint_dir / 'proud-lion-111/checkpoint-step-1000.pt'
     # trainer = TrainingManager(config)
     # trained_model = trainer.train_citation_matcher(tokenized_data)
