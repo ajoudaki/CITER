@@ -152,39 +152,39 @@ class CitationModel(nn.Module):
                 attention_mask=target_attention_mask,
             )
 
-        with torch.amp.autocast('cuda' if 'cuda' in self.config.device else 'cpu', dtype = torch.float16):
-            with torch.enable_grad():
-                # Create copies that require gradients
-                all_cite_embeds.requires_grad_(True)
-                all_ref_embeds.requires_grad_(True)
+        # with torch.amp.autocast('cuda' if 'cuda' in self.config.device else 'cpu'):
+        with torch.enable_grad():
+            # Create copies that require gradients
+            all_cite_embeds.requires_grad_(True)
+            all_ref_embeds.requires_grad_(True)
+            
+            # Compute similarity and loss
+            logit_scale = torch.clamp(self.logit_scale, 0, torch.log(torch.tensor(20.0, device=self.config.device)))
+            logits = torch.matmul(all_cite_embeds, all_ref_embeds.t()) * logit_scale.exp()
+            loss = F.cross_entropy(logits, labels)
+            
+            # Compute gradients
+            loss.backward()
+    
+            if compute_backward:        
                 
-                # Compute similarity and loss
-                logit_scale = torch.clamp(self.logit_scale, 0, torch.log(torch.tensor(20.0, device=self.config.device)))
-                logits = torch.matmul(all_cite_embeds, all_ref_embeds.t()) * logit_scale.exp()
-                loss = F.cross_entropy(logits, labels)
+                # Second pass: compute loss using gradients
+                self.forward_backward_microbatches(
+                    input_ids=source_ids,
+                    mask_token_id=self.config.cite_token_id,
+                    attention_mask=attention_mask,
+                    embedding_gradients=all_cite_embeds.grad,
+                )
                 
-                # Compute gradients
-                loss.backward()
-        
-                if compute_backward:        
-                    
-                    # Second pass: compute loss using gradients
-                    self.forward_backward_microbatches(
-                        input_ids=source_ids,
-                        mask_token_id=self.config.cite_token_id,
-                        attention_mask=attention_mask,
-                        embedding_gradients=all_cite_embeds.grad,
-                    )
-                    
-                    self.forward_backward_microbatches(
-                        input_ids=target_ids,
-                        mask_token_id=self.config.ref_token_id,
-                        attention_mask=target_attention_mask,
-                        embedding_gradients=all_ref_embeds.grad,
-                    )
-                    
-                    # Clean up intermediate tensors
-                    # del all_cite_embeds, all_ref_embeds, cite_grads, ref_grads
+                self.forward_backward_microbatches(
+                    input_ids=target_ids,
+                    mask_token_id=self.config.ref_token_id,
+                    attention_mask=target_attention_mask,
+                    embedding_gradients=all_ref_embeds.grad,
+                )
+                
+                # Clean up intermediate tensors
+                # del all_cite_embeds, all_ref_embeds, cite_grads, ref_grads
 
         all_ref_embeds.requires_grad_(False)
         all_cite_embeds.requires_grad_(False)
