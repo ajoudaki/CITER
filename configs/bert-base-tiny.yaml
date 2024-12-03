@@ -1,11 +1,13 @@
 Adam_eps: 1.0e-08
-batch_size: 512
+batch_size: 1024
+val_batch_size: 8000
 micro_batch_size: 32
+train_ratio: 0.5
 checkpoint_every: 1000
 cite_token: '[[CITE]]'
 ref_token: '[[REF]]'
 cite_token_id: null
-collate_sample_size: 4000
+collate_sample_size: 20000
 device: cuda
 initial_logit_scale: 3
 k_values:
@@ -31,7 +33,6 @@ run_name: null
 seed: 42
 source_len: 512
 target_len: 128
-train_ratio: 1.0
 vocab_size: null
 warmup_steps: 0
 weight_decay: 0.01
