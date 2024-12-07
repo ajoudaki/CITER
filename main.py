@@ -7,11 +7,7 @@ from trainer import TrainingManager
 
 # config = TrainingConfig.load('configs/bert-base-small.yaml')
 # config = TrainingConfig.load('configs/bert-base-tiny.yaml')
-<<<<<<< HEAD
 config = TrainingConfig.load('configs/bert-base-tiny-stella.yaml')
-=======
-config = TrainingConfig.load('configs/stella-500m-tiny.yaml')
->>>>>>> 9746ccd ( changes to stella model)
 
 if __name__ == "__main__":
     trainer = TrainingManager(config)
