@@ -1,15 +1,15 @@
 Adam_eps: 1.0e-08
-batch_size: 128
+batch_size: 2048
 val_batch_size: 8000
-collate_sample_size: 40000
+collate_sample_size: 400000
 micro_batch_size: 8
-train_ratio: 0.5
+train_ratio: 0.9
 checkpoint_every: 50
 cite_token: '[[CITE]]'
 ref_token: '[[REF]]'
 cite_token_id: null
 device: 'cuda:1'
-initial_logit_scale: 2.5
+initial_logit_scale: 2.0
 k_values:
 - 1
 - 5
@@ -17,7 +17,7 @@ k_values:
 - 50
 - 100
 - 1000
-learning_rate: 0.00001
+learning_rate: 0.00002
 logits_learning_rate: 0.0
 max_grad_norm: 1.0
 max_targets: 5
