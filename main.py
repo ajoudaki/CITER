@@ -7,7 +7,7 @@ from trainer import TrainingManager
 
 # config = TrainingConfig.load('configs/bert-base-small.yaml')
 # config = TrainingConfig.load('configs/bert-base-tiny.yaml')
-config = TrainingConfig.load('configs/bert-base.yaml')
+config = TrainingConfig.load('configs/bert-base-tiny-stella.yaml')
 
 if __name__ == "__main__":
     trainer = TrainingManager(config)
@@ -17,6 +17,6 @@ if __name__ == "__main__":
     trained_model = trainer.train_citation_matcher(tokenized_data)
     
     # # Or resume from checkpoint
-    # config.resume_from = config.checkpoint_dir / 'proud-lion-111/checkpoint-step-1000.pt'
+    # config.resume_from = config.checkpoint_dir / 'daily-pine-230/checkpoint-step-100.pt'
     # trainer = TrainingManager(config)
     # trained_model = trainer.train_citation_matcher(tokenized_data)

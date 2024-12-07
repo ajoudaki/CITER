@@ -1,14 +1,15 @@
 Adam_eps: 1.0e-08
-batch_size: 2048 # to fit into GPU 
+batch_size: 128
 val_batch_size: 8000
-micro_batch_size: 32
-train_ratio: 0.9
+collate_sample_size: 40000
+micro_batch_size: 8
+train_ratio: 0.5
 checkpoint_every: 50
 cite_token: '[[CITE]]'
 ref_token: '[[REF]]'
 cite_token_id: null
-device: 'cuda:1'
-initial_logit_scale: 3
+device: 'cuda:0'
+initial_logit_scale: 2.
 k_values:
 - 1
 - 5
@@ -16,17 +17,17 @@ k_values:
 - 50
 - 100
 - 1000
-learning_rate: 0.00015
-logits_learning_rate: 0
+learning_rate: 0.0001
+logits_learning_rate: 0.0
 max_grad_norm: 1.0
-max_length: 512
 max_targets: 5
-model_name: bert-base-uncased
+model_name: 'dunzhang/stella_en_400M_v5'
 num_epochs: 100
 overlap: 0.5
 project_name: citation-matching
 root_dir: /mnt/HDD/amir/paperGPT
 seed: 42
+max_length: 512
 source_len: 512
 target_len: 512
 warmup_steps: 0
