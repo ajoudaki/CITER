@@ -25,7 +25,6 @@ model_name: bert-base-uncased
 num_epochs: 100
 overlap: 0.5
 project_name: citation-matching
-root_dir: /mnt/HDD/amir/paperGPT
 seed: 42
 source_len: 512
 target_len: 512
