@@ -16,7 +16,6 @@ import yaml
 class TrainingConfig:
     # Model configuration
     model_name: str = "bert-base-uncased"
-    vocab_size: Optional[int] = None
     initial_logit_scale: float = 3
     
     # Random seed configuration
@@ -27,6 +26,8 @@ class TrainingConfig:
     ref_token: str = "[[REF]]"
     cite_token_id: Optional[int] = None
     ref_token_id: Optional[int] = None
+    vocab_size: Optional[int] = None
+
     
     # Text processing configuration
     max_length: int = 512
@@ -49,7 +50,7 @@ class TrainingConfig:
     weight_decay: float = 0.01
     warmup_steps: int = 0
     train_ratio: float = 0.5
-    collate_sample_size: Optional[int] = None
+    collate_sample_size: int = None
     
     # Evaluation configuration
     k_values: List[int] = field(default_factory=lambda: [1, 5, 10, 50, 100, 1000])

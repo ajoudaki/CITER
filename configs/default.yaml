@@ -1,6 +1,5 @@
 # Model settings
 model_name: "bert-base-uncased"
-vocab_size: null
 initial_logit_scale: 3.0
 
 # Random seed
