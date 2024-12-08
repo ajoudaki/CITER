@@ -33,15 +33,14 @@ class CitationModel(nn.Module):
         base_config = AutoConfig.from_pretrained(
             config.model_name,
             attn_implementation="flash_attention_2",
+            trust_remote_code=True,
         )
         
         # Store configuration
         self.config = config
         
         # Load base transformer model
-        self.transformer = AutoModel.from_pretrained(config.model_name)
-        # self.transformer = torch.compile(self.transformer)
-        # self.transformer.to(config.device)
+        self.transformer = AutoModel.from_pretrained(config.model_name, trust_remote_code=True)
         
         # Resize token embeddings if needed
         if config.vocab_size != self.transformer.config.vocab_size:

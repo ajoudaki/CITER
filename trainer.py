@@ -232,6 +232,7 @@ class TrainingManager:
         
         # Initialize tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+
         self.tokenizer.add_special_tokens({
             'additional_special_tokens': [config.cite_token, config.ref_token]
         })

@@ -59,7 +59,6 @@ class TrainingConfig:
     project_name: str = "citation-matching"
 
     checkpoint_every: int = None
-    project_name: str = "citation-matching"
     run_name: Optional[str] = None
     resume_from: Optional[str] = None
     
