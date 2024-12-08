@@ -47,6 +47,79 @@ def compute_retrieval_metrics(logits, labels, ks=[1, 5, 10, 50, 100, 1000]):
     return metrics
     
 
+def compute_batched_retrieval_metrics(
+    all_cite_embeds,
+    all_ref_embeds,
+    cited_art_ids,
+    target_art_ids,
+    model,  # Add model as an argument
+    ks,
+    batch_size,
+):
+    num_sources = len(cited_art_ids)
+    target_art_ids = target_art_ids.numpy()
+    cited_art_ids = cited_art_ids.numpy()
+    num_correct = 0  # Initialize count of correct predictions
+
+    # get unique reference embeddings 
+    target_art_ids, unique_indices = np.unique(target_art_ids, return_index=True)
+    # target_art_ids = torch.tensor(target_art_ids)
+    unique_indices = torch.tensor(unique_indices)
+    all_ref_embeds = all_ref_embeds[unique_indices,:]
+    
+    id2i = {id:i for i,id in enumerate(target_art_ids)}
+    labels = np.array([id2i[id] for id in cited_art_ids])
+    
+    
+    
+    # Create a tensor to store retrieval metrics for each batch
+    batch_metrics = {k: [] for k in ['mrr'] + [f'top_{k}_accuracy' for k in ks] + ['loss']} # Added loss
+    
+    # Process source embeddings in batches
+    for i in tqdm.tqdm(range(0, num_sources, batch_size), desc="Computing retrieval metrics in batches"):
+        batch_cite_embeds = all_cite_embeds[i:i + batch_size]
+        batch_labels = labels[i:i + batch_size]
+        
+        # Compute cosine similarity between batch source embeddings and all target embeddings
+        similarities = torch.matmul(batch_cite_embeds, all_ref_embeds.t()).cpu()
+        # similarities = torch.cosine_similarity(batch_cite_embeds.unsqueeze(1), all_ref_embeds.unsqueeze(0), dim=-1).cpu()
+        predictions = torch.argmax(similarities, dim=-1)
+        num_correct += (predictions == torch.tensor(batch_labels)).sum().item()
+        # Compute retrieval metrics for the current batch
+        metrics = compute_retrieval_metrics(similarities, torch.tensor(batch_labels), ks=ks)
+        
+        # Compute loss for the current batch
+        logit_scale = torch.clamp(model.logit_scale, 0, torch.log(torch.tensor(20.0))).exp()
+        logits = similarities * logit_scale.to(similarities.device)
+        loss = F.cross_entropy(logits, torch.tensor(batch_labels))
+        metrics['loss'] = loss.item()
+        
+        
+        # Store batch metrics
+        for k, v in metrics.items():
+            batch_metrics[k].append(v)
+    
+    # Aggregate metrics across batches
+    avg_metrics = {k: np.mean(v) for k, v in batch_metrics.items()}
+
+    # Calculate additional metrics
+    accuracy = num_correct / len(cited_art_ids)  # Calculate overall accuracy
+    avg_loss = avg_metrics['loss']
+    normalized_loss = avg_loss / np.log(len(target_art_ids))
+    perplexity = np.exp(avg_loss)
+    normalized_perplexity = perplexity / len(target_art_ids)
+    
+    # Update avg_metrics with the new metrics
+    avg_metrics.update({
+        'accuracy': accuracy,
+        'num_cited_art_ids': len(cited_art_ids),
+        'num_target_art_ids': len(target_art_ids),
+        'normalized_loss': normalized_loss,
+        'perplexity': perplexity,
+        'normalized_perplexity': normalized_perplexity,
+    })
+    
+    return avg_metrics
 
 def validate_epoch(
     model,
@@ -69,6 +142,12 @@ def validate_epoch(
     total_correct = 0
     total_samples = 0
     
+    all_cite_embeds = []
+    all_ref_embeds = []
+    all_cited_art_ids = []
+    all_target_art_ids = []
+    
+    
     # Validation loop
     with torch.no_grad():
         progress_bar = tqdm.tqdm(val_dataloader, desc="Validating")
@@ -83,6 +162,12 @@ def validate_epoch(
             outputs = model.forward_backward(**batch, compute_backward=False)
             loss = outputs.loss
             logits = outputs.logits
+            
+            # Collect embeddings and article IDs
+            all_cite_embeds.append(outputs.cite_embeds)
+            all_ref_embeds.append(outputs.ref_embeds)
+            all_cited_art_ids.append(batch['cited_art_ids'])
+            all_target_art_ids.append(batch['target_art_ids'])
             
             # Update metrics
             total_val_loss += loss.item()
@@ -105,20 +190,23 @@ def validate_epoch(
             # Clear memory
             del outputs, loss, logits, predictions, batch
             empty_cache()
+            
+    # Concatenate all embeddings and article IDs
+    all_cite_embeds = torch.cat(all_cite_embeds, dim=0)
+    all_ref_embeds = torch.cat(all_ref_embeds, dim=0)
+    all_cited_art_ids = torch.cat(all_cited_art_ids, dim=0)
+    all_target_art_ids = torch.cat(all_target_art_ids, dim=0)
     
-    
-    # Calculate average metrics
-    avg_val_loss = total_val_loss / len(val_dataloader)
-    accuracy = total_correct / total_samples
-    
-    
-    # Combine all metrics
-    val_metrics = {
-        'loss': avg_val_loss,
-        'accuracy': accuracy,
-        'num_samples': total_samples / len(val_dataloader),
-        'mrr': 0
-    }
+    # Compute retrieval metrics in batches
+    val_metrics = compute_batched_retrieval_metrics(
+        all_cite_embeds,
+        all_ref_embeds,
+        all_cited_art_ids,
+        all_target_art_ids,
+        model, # Pass the model to the function
+        batch_size=config.retrieval_batch_size,
+        ks=config.k_values,
+    )
 
     # Log epoch-level validation metrics
     wandb_val_metrics = {f'val/{k}': v for k, v in val_metrics.items()}

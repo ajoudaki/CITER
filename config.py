@@ -15,7 +15,7 @@ class TrainingConfig:
     # Model configuration
     model_name: str = "bert-base-uncased"
     vocab_size: Optional[int] = None
-    initial_logit_scale: float = 1.15
+    initial_logit_scale: float = 3
     
     # Random seed configuration
     seed: int = 42
@@ -41,8 +41,9 @@ class TrainingConfig:
     Adam_eps: float = 1e-8
     weight_decay: float = 0.01
     warmup_steps: int = 0
-    batch_size: int = 200
-    val_batch_size: int = 1000
+    batch_size: int = 512
+    val_batch_size: int = 1024
+    retrieval_batch_size: int = 128
     micro_batch_size: int = 32
     train_ratio: float = 0.5
     collate_sample_size: Optional[int] = None
@@ -78,7 +79,7 @@ class TrainingConfig:
     def processed_data_dir(self) -> Path:
         return self.data_dir / "processed"
 
-    checkpoint_every: int = 1000
+    checkpoint_every: int = 50
     project_name: str = "citation-matching"
     run_name: Optional[str] = None
     resume_from: Optional[str] = None
@@ -88,7 +89,10 @@ class TrainingConfig:
     
     def __post_init__(self):
         if self.device is None:
-            self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # checkpoint after every 50,000 samples have been trained on
+        if self.checkpoint_every is None:
+            self.checkpoint_every = 50000 // self.batch_size
     
     def get_checkpoint_dir(self) -> Path:
         if self.project_name and self.run_name:

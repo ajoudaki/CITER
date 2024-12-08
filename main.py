@@ -6,8 +6,8 @@ from trainer import TrainingManager
 
 
 # config = TrainingConfig.load('configs/bert-base-small.yaml')
-# config = TrainingConfig.load('configs/bert-base-tiny.yaml')
-config = TrainingConfig.load('configs/stella-500m.yaml')
+config = TrainingConfig.load('configs/bert-base-tiny.yaml')
+# config = TrainingConfig.load('configs/stella-500m.yaml')
 
 if __name__ == "__main__":
     trainer = TrainingManager(config)
