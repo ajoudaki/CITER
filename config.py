@@ -1,4 +1,5 @@
 # Standard library imports
+import os
 import random 
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -34,17 +35,18 @@ class TrainingConfig:
     overlap: float = 0.5
     
     # Training configuration
+    batch_size: int = 512
+    val_batch_size: int = 1024
+    retrieval_batch_size: int = 1024
+    micro_batch_size: int = 32
+    
     num_epochs: int = 100
     learning_rate: float = 1.5e-4
-    logits_learning_rate: float = 1.5e-2
+    logits_learning_rate: float = 0
     max_grad_norm: float = 1.0
     Adam_eps: float = 1e-8
     weight_decay: float = 0.01
     warmup_steps: int = 0
-    batch_size: int = 512
-    val_batch_size: int = 1024
-    retrieval_batch_size: int = 128
-    micro_batch_size: int = 32
     train_ratio: float = 0.5
     collate_sample_size: Optional[int] = None
     
@@ -54,6 +56,14 @@ class TrainingConfig:
     # Checkpoint configuration
     root_dir: Path = "."  # Default to current directory
     project_name: str = "citation-matching"
+
+    checkpoint_every: int = None
+    project_name: str = "citation-matching"
+    run_name: Optional[str] = None
+    resume_from: Optional[str] = None
+    
+    # Hardware configuration
+    device: Optional[torch.device] = None
     
     @property
     def data_dir(self) -> Path:
@@ -79,13 +89,6 @@ class TrainingConfig:
     def processed_data_dir(self) -> Path:
         return self.data_dir / "processed"
 
-    checkpoint_every: int = 50
-    project_name: str = "citation-matching"
-    run_name: Optional[str] = None
-    resume_from: Optional[str] = None
-    
-    # Hardware configuration
-    device: Optional[torch.device] = None
     
     def __post_init__(self):
         if self.device is None:
@@ -93,6 +96,10 @@ class TrainingConfig:
         # checkpoint after every 50,000 samples have been trained on
         if self.checkpoint_every is None:
             self.checkpoint_every = 50000 // self.batch_size
+
+        # Override root_dir with environment variable if set
+        if "CITER_ROOT" in os.environ:
+            self.root_dir = Path(os.environ["CITER_ROOT"])            
     
     def get_checkpoint_dir(self) -> Path:
         if self.project_name and self.run_name:

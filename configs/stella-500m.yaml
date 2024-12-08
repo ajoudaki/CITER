@@ -1,34 +1,7 @@
-Adam_eps: 1.0e-08
-batch_size: 2048
-val_batch_size: 8000
-collate_sample_size: 400000
-micro_batch_size: 8
+collate_sample_size: 200000
 train_ratio: 0.9
-checkpoint_every: 50
-cite_token: '[[CITE]]'
-ref_token: '[[REF]]'
-cite_token_id: null
-device: 'cuda:1'
-initial_logit_scale: 2.0
-k_values:
-- 1
-- 5
-- 10
-- 50
-- 100
-- 1000
+initial_logit_scale: 2.5
 learning_rate: 0.00002
-logits_learning_rate: 0.0
-max_grad_norm: 1.0
-max_targets: 5
 model_name: 'dunzhang/stella_en_400M_v5'
-num_epochs: 100
-overlap: 0.5
-project_name: citation-matching
-seed: 42
-max_length: 512
-source_len: 512
-target_len: 512
-warmup_steps: 0
-weight_decay: 0.01
+
 
