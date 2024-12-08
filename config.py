@@ -36,7 +36,7 @@ class TrainingConfig:
     
     # Training configuration
     batch_size: int = 512
-    val_batch_size: int = 1024
+    val_batch_size: int = 512
     retrieval_batch_size: int = 1024
     micro_batch_size: int = 32
     
@@ -89,17 +89,50 @@ class TrainingConfig:
     def processed_data_dir(self) -> Path:
         return self.data_dir / "processed"
 
-    
+    def get_gpu_with_most_memory(self) -> Optional[torch.device]:
+        """
+        Returns the GPU device with the most available memory.
+        If no GPUs are available, returns None.
+        """
+        if not torch.cuda.is_available():
+            return None
+            
+        # Get the number of GPUs
+        n_gpus = torch.cuda.device_count()
+        if n_gpus == 0:
+            return None
+            
+        # Find GPU with most free memory
+        max_free_memory = 0
+        selected_gpu = 0
+        
+        for gpu_id in range(n_gpus):
+            # Set current GPU context
+            torch.cuda.set_device(gpu_id)
+            # Clear cache to get accurate memory usage
+            torch.cuda.empty_cache()
+            
+            # Get memory information
+            free_memory = torch.cuda.get_device_properties(gpu_id).total_memory - torch.cuda.memory_allocated(gpu_id)
+            
+            if free_memory > max_free_memory:
+                max_free_memory = free_memory
+                selected_gpu = gpu_id
+        
+        return torch.device(f'cuda:{selected_gpu}')
+
     def __post_init__(self):
         if self.device is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            # Try to get GPU with most memory first
+            self.device = self.get_gpu_with_most_memory() or torch.device("cpu")
+            
         # checkpoint after every 50,000 samples have been trained on
         if self.checkpoint_every is None:
             self.checkpoint_every = 50000 // self.batch_size
-
+            
         # Override root_dir with environment variable if set
         if "CITER_ROOT" in os.environ:
-            self.root_dir = Path(os.environ["CITER_ROOT"])            
+            self.root_dir = Path(os.environ["CITER_ROOT"])          
     
     def get_checkpoint_dir(self) -> Path:
         if self.project_name and self.run_name:
