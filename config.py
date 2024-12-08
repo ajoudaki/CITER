@@ -1,5 +1,6 @@
 # Standard library imports
 import os
+import subprocess
 import random 
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -97,29 +98,36 @@ class TrainingConfig:
         if not torch.cuda.is_available():
             return None
             
-        # Get the number of GPUs
         n_gpus = torch.cuda.device_count()
         if n_gpus == 0:
             return None
+    
+        try:
+            # Get free memory for all GPUs using nvidia-smi
+            result = subprocess.check_output([
+                'nvidia-smi', 
+                '--query-gpu=memory.free',
+                '--format=csv,noheader,nounits'
+            ])
+            free_memories = [int(x) for x in result.decode('utf-8').strip().split('\n')]
             
-        # Find GPU with most free memory
-        max_free_memory = 0
-        selected_gpu = 0
-        
-        for gpu_id in range(n_gpus):
-            # Set current GPU context
-            torch.cuda.set_device(gpu_id)
-            # Clear cache to get accurate memory usage
-            torch.cuda.empty_cache()
+            # Find GPU with most free memory
+            max_free_memory = 0
+            selected_gpu = 0
             
-            # Get memory information
-            free_memory = torch.cuda.get_device_properties(gpu_id).total_memory - torch.cuda.memory_allocated(gpu_id)
+            for gpu_id, free_memory in enumerate(free_memories):
+                print(f"GPU {gpu_id} free memory = {free_memory} MB")
+                
+                if free_memory > max_free_memory:
+                    max_free_memory = free_memory
+                    selected_gpu = gpu_id
+
+            print(f"Selected GPU {selected_gpu}")
+            return torch.device(f'cuda:{selected_gpu}')
             
-            if free_memory > max_free_memory:
-                max_free_memory = free_memory
-                selected_gpu = gpu_id
-        
-        return torch.device(f'cuda:{selected_gpu}')
+        except subprocess.CalledProcessError:
+            return torch.device('cuda:0')  # Fallback to first GPU if nvidia-smi fails
+
 
     def __post_init__(self):
         if self.device is None:

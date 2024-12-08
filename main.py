@@ -17,6 +17,6 @@ if __name__ == "__main__":
     trained_model = trainer.train_citation_matcher(tokenized_data)
     
     # # Or resume from checkpoint
-    # config.resume_from = config.checkpoint_dir / 'daily-pine-230/checkpoint-step-100.pt'
+    # config.resume_from = config.checkpoint_dir / 'valiant-smoke-247/checkpoint-step-100.pt'
     # trainer = TrainingManager(config)
     # trained_model = trainer.train_citation_matcher(tokenized_data)
