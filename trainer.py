@@ -322,11 +322,13 @@ class TrainingManager:
         # Load model state
         self.model.load_state_dict(checkpoint['model_state_dict'])
 
-        # Load config if present
+        # Load config if present, but keep reume from and device 
         if 'config' in checkpoint:
             resume_from = self.config.resume_from
+            device = self.config.device
             self.config = checkpoint['config']
             self.config.resume_from = resume_from
+            self.config.device = device
         
         # Restore RNG states
         if 'rng_state' in checkpoint:
