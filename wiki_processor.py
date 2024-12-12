@@ -58,6 +58,19 @@ class WikiDumpProcessor:
             yield WikiArticle(title=title, text=text, timestamp=timestamp, is_redirect=is_redirect)
             elem.clear()
 
+
+    @staticmethod
+    def sanitize_wiki_content(text: str) -> str:
+        """Cleans wiki content by removing metadata and formatting."""
+        # Find main content starting from first bold title
+        match = re.search(r"'''([^']+?)'''", text)
+        if match:
+            text = text[match.start():]
+
+        # Remove wiki elements and clean up
+        text = re.sub(r'\[\[File:.*\]\]|\[\[Category:.*\]\]|\{\{stub.*\}\}', '', text)
+        return '\n'.join(line for line in text.split('\n') if line.strip())
+
 class ArticleStorage:
     """Handles storage and retrieval of Wikipedia articles."""
     
@@ -75,44 +88,6 @@ class ArticleStorage:
                 f.write('\n')
                 count += 1
         return count
-
-    def save_to_sqlite(self, db_path: Union[str, Path], sample_size: Optional[int] = None,
-                      batch_size: int = 1000) -> int:
-        """Saves articles to a SQLite database."""
-        conn = sqlite3.connect(db_path)
-        c = conn.cursor()
-        
-        c.execute('''CREATE TABLE IF NOT EXISTS articles
-                    (title TEXT PRIMARY KEY, text TEXT, timestamp TEXT, is_redirect INTEGER)''')
-        c.execute('CREATE INDEX IF NOT EXISTS idx_title ON articles(title)')
-        
-        count = 0
-        batch = []
-        
-        try:
-            for i, article in enumerate(self.processor.iter_articles()):
-                if sample_size is not None and i >= sample_size:
-                    break
-                    
-                batch.append((article.title, article.text, article.timestamp, 
-                            1 if article.is_redirect else 0))
-                
-                if len(batch) >= batch_size:
-                    c.executemany('INSERT OR REPLACE INTO articles VALUES (?, ?, ?, ?)', batch)
-                    conn.commit()
-                    count += len(batch)
-                    batch = []
-            
-            if batch:
-                c.executemany('INSERT OR REPLACE INTO articles VALUES (?, ?, ?, ?)', batch)
-                conn.commit()
-                count += len(batch)
-                
-        finally:
-            conn.close()
-            
-        return count
-
 
 
 class CitationExtractor:
