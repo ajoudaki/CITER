@@ -460,7 +460,10 @@ class TrainingManager:
                 indices = np.arange(len(dataset))
                 train_size = int(len(dataset) * config.train_ratio)
                 train_indices = indices[:train_size]
-                val_indices = indices[train_size:]
+                if config.full_batch_validation:
+                    val_indices = indices[:]
+                else:
+                    val_indices = indices[train_size:]
         
                 
                 train_dataset = Subset(dataset, train_indices)

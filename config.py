@@ -50,6 +50,7 @@ class TrainingConfig:
     weight_decay: float = 0.01
     warmup_steps: int = 0
     train_ratio: float = 0.5
+    full_batch_validation: bool = False
     collate_sample_size: int = None
     
     # Evaluation configuration
