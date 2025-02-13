@@ -80,3 +80,159 @@ Because many models and datasets exist, several studies have tried to compare me
 - **Grabmair et al. (2018)**, *“Context-Aware Legal Citation Recommendation using Deep Learning”* – Legal domain model with high Recall@5.
 - **Kolek et al. (2021)**, *“Assessing Citation Integrity in Biomedical Publications”* – Biomedical study using BM25+T5 for finding supporting citations.
 - **PaperswithCode – Citation Recommendation** – Aggregates papers, code, and results on multiple citation recommendation datasets. [Link](https://paperswithcode.com/task/citation-recommendation)
+- 
+
+# Findings on Citation Span Prediction in Scientific Documents
+
+This document summarizes recent research on predicting **exact citation locations** in scientific articles—that is, not just which articles to cite, but the precise positions in the text where citations should occur. The focus is on methods that use modern NLP techniques (especially Transformer-based models) and hybrid models that combine Transformers with graph neural networks (GNNs).
+
+---
+
+## 1. Transformer-Based Approaches for Citation Span Prediction
+
+### A. Cite-Worthiness Classification (Sentence-Level)
+- **Early Work & SVMs**  
+  Early studies (e.g., Sugiyama et al., 2010) formulated the problem as a binary classification task to decide whether a sentence needs a citation. They used SVMs with hand-crafted features (unigrams, proper noun cues, context from neighboring sentences).  
+  *Reference URL*: [Sugiyama et al., 2010](https://www.example.com/sugiyama2010) *(example link)*
+
+- **Neural Approaches with CNNs/RNNs**  
+  Later work (Färber et al., 2018) applied CNNs and RNNs to datasets such as the ACL-ARC corpus. These methods improved performance over feature-based models, but still focused on whether a sentence is “cite-worthy” rather than pinpointing the citation location.
+
+- **Transformer Models (BERT, SciBERT, Longformer)**  
+  - **SciBERT** (Beltagy et al., 2019) has been used to classify sentences as needing citations.  
+  - **Longformer**: Wright & Augenstein (2021) introduced the **CiteWorth** dataset (1.2M sentences across 10 scientific fields) and demonstrated that including paragraph-level context (using a Longformer) boosts F1 by ~5 points over a sentence-only SciBERT baseline.
+  - **Performance**: Their best model achieved around **67.4 F1** on cite-worthiness detection.
+  
+  *Reference URL*: [Wright & Augenstein, 2021](https://www.example.com/wright2021) *(example link)*
+
+### B. Token-Level Citation Placement via Sequence Tagging or Mask-Filling
+- **BERT-Based Token Classification**  
+  Recent studies have reframed the task as a token-level sequence labeling problem. Here, a BERT-based model is fine-tuned to label each token as either a place where a citation should be inserted or not.  
+  - **NER Framing**: Each token is classified as `CITATION` (indicating a citation should follow) or `REGULAR`.
+  
+- **Generative Mask-Filling Approaches (using GPT-2)**  
+  An alternative method uses a generative approach:
+  - **GPT-2 Mask-Filling**: The model iteratively inserts a special mask token into the text and then uses GPT-2 to predict whether a citation-like token (e.g., a placeholder for a citation) should be generated at that location.
+  - **Findings**: On arXiv and S2ORC datasets, the GPT-2 approach has shown to outperform BERT-based token classification in precisely determining citation positions.
+  
+  *Reference URL*: [Buscaldi et al., 2024](https://www.example.com/buscaldi2024) *(example link)*
+
+### C. Large Language Models
+- **GPT-3 Style Approaches**  
+  Some recent studies have explored prompting GPT-3 (or similar large LMs) to decide if a sentence needs an inline citation. While these methods report high performance (F1 between 75–89%), they typically focus on sentence-level detection rather than pinpointing exact token locations.
+  
+  *Reference URL*: [Vajdecka et al., 2023](https://www.example.com/vajdecka2023) *(example link)*
+
+---
+
+## 2. Hybrid Models: Transformer + GNN Approaches
+
+While most work on citation span prediction is primarily NLP-driven, several related studies demonstrate the benefits of combining text models with graph-based approaches:
+
+- **BERT-GCN for Contextual Citation Recommendation**  
+  - **Jeong et al. (2020)** developed a model that merges BERT with a Graph Convolutional Network (GCN) to recommend citations given a text context. Although their focus was on *which* paper to cite (assuming a citation placeholder is given), the architecture illustrates how graph information (the citation network) can complement textual analysis.
+  
+  *Reference URL*: [Jeong et al., 2020](https://www.example.com/jeong2020) *(example link)*
+
+- **GraphCite for Citation Intent**  
+  - **Berrebbi et al. (2021)** combined graph node embeddings from citation networks with textual features to classify the intent of a citation (e.g., background, methodology, etc.). While this work does not directly address citation placement, it demonstrates that GNNs can encode valuable global context that could be extended to determine where citations should occur.
+  
+  *Reference URL*: [Berrebbi et al., 2021](https://www.example.com/berrebbi2021) *(example link)*
+
+- **Future Directions**  
+  Integrating external knowledge graphs (e.g., scholarly knowledge bases or citation networks) into Transformer models could enhance the prediction of citation spans by learning common patterns of citation placement across scientific documents.
+
+---
+
+## 3. Datasets for Citation Span Prediction
+
+### A. Sentence-Level Cite-Worthiness Datasets
+- **ACL-ARC (ACL Anthology Reference Corpus)**  
+  Contains thousands of papers from the ACL Anthology with annotated citation sentences. Imbalanced dataset (approximately 1:13 ratio of cited to uncited sentences).  
+  *Reference URL*: [ACL-ARC Dataset](https://www.example.com/acl-arc) *(example link)*
+
+- **CiteWorth Dataset**  
+  A large-scale dataset with 1.2 million sentences labeled as cite-worthy or not, spanning 10 scientific fields. Provides paragraph-level context to aid in prediction.  
+  *Reference URL*: [CiteWorth Dataset](https://www.example.com/citeworth) *(example link)*
+
+### B. Token-Level Placement Datasets
+- **arXiv-80 & S2ORC-9k**  
+  - **arXiv-80**: A corpus of scientific texts from arXiv papers where citation markers appear in raw text, although with inconsistent formatting.
+  - **S2ORC-9k**: A cleaner, standardized subset of the S2ORC corpus (9,000 Computer Science papers) that has been processed to provide a unified citation format.
+  
+  *Reference URL*: [S2ORC Corpus](https://s2orc.org)  
+  *Reference URL*: [ArXiv-80 Details](https://www.example.com/arxiv80) *(example link)*
+
+- **PubMed OA Citation Dataset (PMOA-CITE)**  
+  Derived from the PubMed Open Access corpus. Contains a massive number of sentences (potentially hundreds of millions) with citation annotations. For practical training, researchers often sample around 1 million sentences.  
+  *Reference URL*: [PMOA-CITE Dataset](https://www.example.com/pmoa-cite) *(example link)*
+
+### C. Wikipedia Citation Needed Datasets (Related)
+- Datasets developed to predict where "[citation needed]" should be inserted in Wikipedia articles, which are analogous in task formulation though the domain is different.
+
+---
+
+## 4. Evaluation Metrics and Benchmarks
+
+- **Metrics**:  
+  - **Sentence-Level**: Precision, Recall, and F1-score are used to measure the effectiveness of cite-worthiness detection.
+  - **Token-Level**: For exact citation placement, models are evaluated on the precision, recall, and F1-score at the token level (e.g., correctly predicting the exact token after which a citation should be inserted).
+
+- **Reported Performance**:  
+  - Early neural methods (CNNs/RNNs) generally achieved F1-scores in the mid-50s on imbalanced datasets.  
+  - Transformer-based models (e.g., SciBERT, Longformer) have pushed F1 scores to around 67.  
+  - Generative approaches with GPT-2 have further improved token-level placement F1 scores, often showing relative improvements (e.g., from ~0.50 to ~0.65 F1) after fine-tuning and post-processing.
+
+- **Benchmarks**:  
+  While there is not yet a unified leaderboard for citation span prediction, researchers typically compare results on datasets like ACL-ARC, CiteWorth, and the S2ORC-9k subset. Cross-domain evaluations (e.g., training on one corpus and testing on another) are also common to assess generalization.
+
+---
+
+## 5. References and Resources
+
+- **Buscaldi et al. (2024)**  
+  *Title*: Automating Citation Placement with NLP and Transformers  
+  *Summary*: Investigates token-level citation placement using both a BERT-based classifier and a GPT-2 mask-filling model.  
+  *URL*: [Buscaldi et al., 2024](https://www.example.com/buscaldi2024)
+
+- **Wright & Augenstein (2021)**  
+  *Title*: CiteWorth: Cite-Worthiness Detection for Improved Scientific Document Understanding  
+  *Summary*: Introduces the large-scale CiteWorth dataset and a Longformer-based model for sentence-level citation need detection.  
+  *URL*: [Wright & Augenstein, 2021](https://www.example.com/wright2021)
+
+- **Gosangi et al. (2021)**  
+  *Title*: On the Use of Context for Predicting Citation Worthiness of Sentences in Scholarly Articles  
+  *Summary*: Compares sequence tagging approaches with and without context using Transformer-based embeddings.  
+  *URL*: [Gosangi et al., 2021](https://www.example.com/gosangi2021)
+
+- **Jeong et al. (2020)**  
+  *Title*: A Context-Aware Citation Recommendation Model with BERT and GCN  
+  *Summary*: Combines BERT with a Graph Convolutional Network to recommend citations given a placeholder, demonstrating hybrid modeling for scholarly documents.  
+  *URL*: [Jeong et al., 2020](https://www.example.com/jeong2020)
+
+- **Berrebbi et al. (2021)**  
+  *Title*: GraphCite: Citation Intent Classification via Graph Embeddings  
+  *Summary*: Uses graph neural networks to classify the intent behind citations, highlighting the potential of graph-enhanced models for related tasks.  
+  *URL*: [Berrebbi et al., 2021](https://www.example.com/berrebbi2021)
+
+- **Vajdecka et al. (2023)**  
+  *Title*: Predicting the Presence of Inline Citations in Academic Text using Binary Classification  
+  *Summary*: Evaluates GPT-style models for deciding whether a sentence requires a citation.  
+  *URL*: [Vajdecka et al., 2023](https://www.example.com/vajdecka2023)
+
+- **Additional Resources**:  
+  - [S2ORC Corpus](https://s2orc.org)  
+  - [PubMed Open Access (PMOA) Citation Datasets](https://www.example.com/pmoa-cite) *(example link)*  
+  - [ACL Anthology Reference Corpus (ACL-ARC)](https://www.example.com/acl-arc) *(example link)*
+
+---
+
+## Summary
+
+- **Transformer-based methods** have significantly improved citation span prediction by leveraging large-scale pre-trained models (e.g., BERT, SciBERT, Longformer, GPT-2) to detect not only whether a citation is needed but also its precise location.
+- **Hybrid models** that incorporate graph neural networks (e.g., BERT-GCN) show promise for integrating global citation network information with local textual context, though most work on token-level placement remains primarily NLP-focused.
+- **Datasets** such as ACL-ARC, CiteWorth, arXiv-80, S2ORC-9k, and PMOA-CITE provide diverse training and evaluation scenarios, each with its own challenges (e.g., class imbalance, inconsistent citation formats).
+- **Evaluation metrics** include precision, recall, and F1 at both the sentence and token levels, with recent models showing notable improvements over earlier baselines.
+
+These advances pave the way toward systems that can automatically not only recommend which references to include but also suggest exactly where to insert citation markers within a manuscript.
+
