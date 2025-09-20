@@ -11,6 +11,13 @@ import pickle
 import json
 import re
 
+
+from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass
+import random
+import numpy as np
+from tqdm import tqdm
+
 from wiki_processor import WikiDumpProcessor
 from config import TrainingConfig
 
@@ -24,9 +31,9 @@ class SearchResult:
 
 class WikiEmbeddingSearch:
     def __init__(self, 
-                 config: TrainingConfig,
-                 model_name: str = "dunzhang/stella_en_400M_v5",
-                 batch_size: int = 64):
+                 config: TrainingConfig):
+        batch_size = config.batch_size
+        model_name = config.model_name 
         self.config = config
         self.model_name = model_name
         self.model = SentenceTransformer(model_name, trust_remote_code=True)
@@ -282,91 +289,6 @@ class WikiEmbeddingSearch:
         return results
 
 
-import random
-from typing import Dict, List, Tuple
-
-class WikiMaskingExperiment:
-    def __init__(self, search_instance):
-        self.search = search_instance
-        
-    def mask_and_test(self, article_title: str) -> Tuple[str, str, List[SearchResult], Optional[int]]:
-        """
-        Masks a random link in the given article and tests retrieval.
-        
-        Returns:
-            Tuple of (masked_text, masked_link, search_results, rank)
-            where rank is the position of the masked link in results (None if not found)
-        """
-        # Get article text and links
-        article_text = self.search.reference_sanitized[article_title]
-        article_links = self.search.reference_links[article_title]
-        
-        if not article_links:
-            raise ValueError("No links found in article")
-            
-        # Get unique links
-        unique_links = list(set(link for _, _, link in article_links))
-        
-        # Randomly select a link to mask
-        link_to_mask = random.choice(unique_links)
-        
-        # Create masked version
-        masked_text = article_text
-        positions = sorted(
-            [(start, end) for start, end, link in article_links if link == link_to_mask],
-            reverse=True  # Process from end to start to preserve positions
-        )
-        
-        for start, end in positions:
-            masked_text = masked_text[:start] + "[[MASKED]]" + masked_text[end:]
-            
-        # Perform search with masked text, retrieving 1000 results
-        results = self.search.search(masked_text, k=1000)
-        
-        # Find rank of masked link in results (if present)
-        rank = None
-        for i, result in enumerate(results, 1):
-            if result.title == link_to_mask:
-                rank = i
-                break
-        
-        return masked_text, link_to_mask, results, rank
-
-def run_masking_experiment(search_instance):
-    experiment = WikiMaskingExperiment(search_instance)
-    
-    print(f"Total articles in database: {len(search_instance.reference_sanitized)}")
-    
-    # Randomly select an article
-    article_title = random.choice(list(search_instance.reference_sanitized.keys()))
-    
-    try:
-        masked_text, masked_link, results, rank = experiment.mask_and_test(article_title)
-        
-        print(f"\nSelected article: {article_title}")
-        print(f"Masked link: {masked_link}")
-        print(f"Masked text preview: {masked_text[:500]}...")
-        
-        if rank is not None:
-            print(f"\nMasked link '{masked_link}' found at rank {rank} out of 1000")
-        else:
-            print(f"\nMasked link '{masked_link}' not found in top 1000 results")
-        
-        print("\nTop 10 search results:")
-        for i, result in enumerate(results[:10], 1):
-            print(f"\n{i}. {result.title} (score: {result.score:.3f})")
-            print(f"   Preview: {result.text_preview[:200]}...")
-            
-    except ValueError as e:
-        print(f"Error processing article {article_title}: {e}")
-
-
-from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass
-import random
-import numpy as np
-from tqdm import tqdm
-
 @dataclass
 class ExperimentResult:
     """Stores the result of a single masking experiment."""
@@ -408,10 +330,11 @@ class WikiMaskingExperiment:
         )
         
         for start, end in positions:
-            masked_text = masked_text[:start] + "[[MASKED]]" + masked_text[end:]
+            masked_text = masked_text[:start] + "[[reference]]" + masked_text[end:]
             
-        # Perform search with masked text, retrieving 1000 results
-        results = self.search.search(masked_text, k=1000)
+        # Perform search with masked text, retrieving max k results
+        max_k = max(self.k_values) if hasattr(self, 'k_values') else 10000
+        results = self.search.search(masked_text, k=max_k)
         
         # Find rank of masked link in results (if present)
         rank = None
@@ -422,8 +345,10 @@ class WikiMaskingExperiment:
         
         return masked_text, link_to_mask, results, rank
 
-    def run_multiple_experiments(self, num_experiments: int = 30) -> List[ExperimentResult]:
+    def run_multiple_experiments(self, num_experiments: int, k_values: List[int]) -> List[ExperimentResult]:
         """Run multiple masking experiments and collect results."""
+        self.k_values = k_values
+        
         results = []
         
         # Get list of articles with at least one link
@@ -450,13 +375,13 @@ class WikiMaskingExperiment:
         return results
 
     @staticmethod
-    def calculate_metrics(results: List[ExperimentResult]) -> Dict:
+    def calculate_metrics(results: List[ExperimentResult], k_values: List[int]) -> Dict:
         """Calculate various retrieval metrics from experiment results."""
+            
         ranks = [r.rank for r in results if r.rank is not None]
         total_experiments = len(results)
         
         # Calculate Hits@K for various K
-        k_values = [1, 5, 10, 50, 100, 1000]
         hits_at_k = {}
         for k in k_values:
             hits = sum(1 for r in ranks if r <= k)
@@ -479,15 +404,180 @@ class WikiMaskingExperiment:
         
         return metrics
 
-def run_masking_experiments(search_instance, num_experiments: int = 50):
+
+class WikiMaskingExperiment:
+    def __init__(self, search_instance):
+        self.search = search_instance
+        
+    def get_valid_segment(self, text: str, links: List[Tuple[int, int, str]]) -> Tuple[str, List[Tuple[int, int, str]], int]:
+        """
+        Get a random segment of text that fits within model's max length and contains at least one link.
+        
+        Returns:
+            Tuple of (segment_text, segment_links, start_offset)
+            where segment_links are adjusted for the new segment positions
+        """
+        # Get model tokenizer
+        tokenizer = self.search.model.tokenizer
+        max_length = self.search.max_length
+        
+        # If text is short enough, use entire text
+        if len(tokenizer.tokenize(text)) <= max_length:
+            return text, links, 0
+            
+        # Get all valid segments (those containing at least one link)
+        valid_segments = []
+        
+        # Try different starting positions
+        step_size = max_length // 2  # Overlap segments to increase chances of finding valid ones
+        for start in range(0, len(text), step_size):
+            # Tokenize a chunk of text
+            segment = text[start:start + max_length * 4]  # Take larger chunk initially
+            tokens = tokenizer.tokenize(segment)
+            
+            if len(tokens) > max_length:
+                # Truncate to max length and get corresponding text
+                tokens = tokens[:max_length]
+                segment = tokenizer.convert_tokens_to_string(tokens)
+            
+            # Find links that fall within this segment
+            segment_links = []
+            for link_start, link_end, link in links:
+                # Adjust link positions relative to segment
+                if link_start >= start and link_end <= start + len(segment):
+                    segment_links.append((
+                        link_start - start,
+                        link_end - start,
+                        link
+                    ))
+            
+            if segment_links:  # If segment contains at least one link
+                valid_segments.append((segment, segment_links, start))
+        
+        if not valid_segments:
+            raise ValueError("No valid segments found containing links")
+            
+        # Randomly select one valid segment
+        return random.choice(valid_segments)
+        
+    def mask_and_test(self, article_title: str) -> Tuple[str, str, List[SearchResult], Optional[int]]:
+        """
+        Masks a random link in a valid segment of the given article and tests retrieval.
+        """
+        # Get article text and links
+        article_text = self.search.reference_sanitized[article_title]
+        article_links = self.search.reference_links[article_title]
+        
+        if not article_links:
+            raise ValueError("No links found in article")
+        
+        # Get valid segment containing links
+        try:
+            segment_text, segment_links, start_offset = self.get_valid_segment(article_text, article_links)
+        except ValueError as e:
+            raise ValueError(f"Could not find valid segment: {str(e)}")
+        
+        if not segment_links:
+            raise ValueError("No links found in selected segment")
+            
+        # Get unique links in this segment
+        unique_links = list(set(link for _, _, link in segment_links))
+        
+        # Randomly select a link to mask
+        link_to_mask = random.choice(unique_links)
+        
+        # Create masked version
+        masked_text = segment_text
+        positions = sorted(
+            [(start, end) for start, end, link in segment_links if link == link_to_mask],
+            reverse=True  # Process from end to start to preserve positions
+        )
+        
+        for start, end in positions:
+            masked_text = masked_text[:start] + "[[reference]]" + masked_text[end:]
+            
+        # Perform search with masked text
+        max_k = max(self.k_values) if hasattr(self, 'k_values') else 10000
+        results = self.search.search(masked_text, k=max_k)
+        
+        # Find rank of masked link in results (if present)
+        rank = None
+        for i, result in enumerate(results, 1):
+            if result.title == link_to_mask:
+                rank = i
+                break
+        
+        return masked_text, link_to_mask, results, rank
+
+    def run_multiple_experiments(self, num_experiments: int, k_values: List[int]) -> List[ExperimentResult]:
+        """Run multiple masking experiments and collect results."""
+        self.k_values = k_values
+        
+        results = []
+        
+        # Get list of articles with at least one link
+        valid_articles = [
+            title for title in self.search.reference_sanitized.keys()
+            if self.search.reference_links[title]
+        ]
+        
+        for _ in tqdm(range(num_experiments), desc="Running experiments"):
+            while True:
+                article_title = random.choice(valid_articles)
+                try:
+                    masked_text, masked_link, search_results, rank = self.mask_and_test(article_title)
+                    results.append(ExperimentResult(
+                        article_title=article_title,
+                        masked_link=masked_link,
+                        rank=rank,
+                        top_score=search_results[0].score if search_results else 0.0
+                    ))
+                    break
+                except ValueError:
+                    continue  # Try another article if this one fails
+                    
+        return results
+
+    @staticmethod
+    def calculate_metrics(results: List[ExperimentResult], k_values: List[int]) -> Dict:
+        """Calculate various retrieval metrics from experiment results."""
+            
+        ranks = [r.rank for r in results if r.rank is not None]
+        total_experiments = len(results)
+        
+        # Calculate Hits@K for various K
+        hits_at_k = {}
+        for k in k_values:
+            hits = sum(1 for r in ranks if r <= k)
+            hits_at_k[f'hits@{k}'] = hits / total_experiments
+            
+        # Calculate MRR (Mean Reciprocal Rank)
+        reciprocal_ranks = [1/r if r is not None else 0 for r in [r.rank for r in results]]
+        mrr = np.mean(reciprocal_ranks)
+        
+        # Calculate other statistics
+        metrics = {
+            'total_experiments': total_experiments,
+            'successful_retrievals': len(ranks),
+            'mrr': mrr,
+            **hits_at_k,
+            'mean_rank': np.mean(ranks) if ranks else float('inf'),
+            'median_rank': np.median(ranks) if ranks else float('inf'),
+            'mean_top_score': np.mean([r.top_score for r in results])
+        }
+        
+        return metrics
+
+def run_masking_experiments(search_instance, num_experiments: int, k_values: List[int]):
     """Run multiple experiments and display comprehensive results."""
+        
     experiment = WikiMaskingExperiment(search_instance)
     
     print(f"Running {num_experiments} masking experiments...")
-    results = experiment.run_multiple_experiments(num_experiments)
+    results = experiment.run_multiple_experiments(num_experiments, k_values)
     
     # Calculate and display metrics
-    metrics = experiment.calculate_metrics(results)
+    metrics = experiment.calculate_metrics(results, k_values)
     
     print("\nExperiment Results:")
     print(f"Total experiments: {metrics['total_experiments']}")
@@ -496,7 +586,7 @@ def run_masking_experiments(search_instance, num_experiments: int = 50):
     print(f"MRR: {metrics['mrr']:.4f}")
     
     print("\nHits@K:")
-    for k in [1, 5, 10, 50, 100, 1000]:
+    for k in k_values:
         print(f"Hits@{k}: {metrics[f'hits@{k}']:.4f}")
     
     print(f"\nRank Statistics:")
@@ -505,11 +595,12 @@ def run_masking_experiments(search_instance, num_experiments: int = 50):
     print(f"Mean Top Score: {metrics['mean_top_score']:.4f}")
     
     # Display some example results
+    samples = random.sample(results, 5)
     print("\nExample Results (first 5 experiments):")
-    for i, result in enumerate(results[:5], 1):
+    for i, result in enumerate(samples, 1):
         print(f"\n{i}. Article: {result.article_title}")
         print(f"   Masked Link: {result.masked_link}")
-        print(f"   Rank: {result.rank if result.rank is not None else 'Not found in top 1000'}")
+        print(f"   Rank: {result.rank if result.rank is not None else 'Not found'}")
         print(f"   Top Score: {result.top_score:.4f}")
 
     return results, metrics
@@ -517,7 +608,8 @@ def run_masking_experiments(search_instance, num_experiments: int = 50):
 
 def main():
     # Initialize config
-    config = TrainingConfig()
+    config = TrainingConfig(batch_size=64, model_name="dunzhang/stella_en_400M_v5") 
+    # config = TrainingConfig(batch_size=64, model_name="sentence-transformers/all-mpnet-base-v2")
     
     # Set up paths
     wiki_dump_path = config.raw_data_dir / "wiki" / "simplewiki-latest-pages-articles.xml.bz2"
@@ -536,7 +628,7 @@ def main():
         search.process_wiki_dump(str(wiki_dump_path), str(cache_dir))
 
     # run_masking_experiment(search)
-    results, metrics = run_masking_experiments(search, num_experiments=1000)
+    results, metrics = run_masking_experiments(search, num_experiments=1000, k_values=[1,5,10,50,100,1000,10000,])
     
     # # Example search
     # query = "Which animal is a reptile without legs that is dangerous? "
