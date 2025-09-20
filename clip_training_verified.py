@@ -217,6 +217,14 @@ def distributed_train_step(model, optimizer, local_x, local_y, config, rank, wor
     # === Phase B: Global normalizers (no grad, streamed) ===
     with torch.no_grad():
         a, b = compute_streaming_log_normalizers(Z_x, Z_y, TAU, M_stream)
+        # --- Exact symmetric CLIP loss over the full GLOBAL batch (Naive-equivalent) ---
+        diag_S = (Z_x * Z_y).sum(dim=1) / TAU   # S[i,i]
+        loss_x = (a - diag_S).mean()
+        loss_y = (b - diag_S).mean()
+        total_loss = 0.5 * (loss_x + loss_y)
+        if rank == 0:
+            print(f"Global loss: {total_loss.item():.6f}")
+
 
     # === Phase C & D: Local gradient construction and VJP (microbatched) ===
     start_idx_global = rank * C

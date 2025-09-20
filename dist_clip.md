@@ -1,97 +1,194 @@
-This document provides a self-contained mathematical description of an efficient and scalable implementation for distributed symmetric contrastive learning. This approach ensures mathematical equivalence to a global batch computation while minimizing synchronization overhead to only two points and avoiding the materialization of the $N \times N$ similarity matrix.
 
-### 1. Mathematical Formulation
+### User Guide: `distributed_clip.py` Interface
 
-#### 1.1 Setup and Notation
+This guide explains how to use the `distributed_clip.py` module for efficient, large-batch contrastive training in a PyTorch Distributed Data Parallel (DDP) environment.
 
-We consider a global batch of $N$ paired samples $\{(x_i, y_i)\}_{i=1}^N$. Two encoders, $f_x$ and $f_y$ (parameterized by $\theta$), process these samples to produce unit-norm embeddings $Z_x, Z_y \in \mathbb{R}^{N \times d}$, where $d$ is the embedding dimension and $\|z_i\|_2 = 1$.
+#### Overview
 
-The similarity matrix $S \in \mathbb{R}^{N \times N}$ is defined as:
-$S = \frac{1}{\tau} Z_x Z_y^\top$
-where $\tau > 0$ is the temperature parameter.
+The module provides a function, `distributed_train_step`, which performs a single optimization step for symmetric contrastive learning (e.g., CLIP). It is designed to handle the complexities of distributed computation, memory efficiency for large batches, and correct gradient synchronization, allowing users to scale training effectively.
 
-We define the row-softmax probabilities $P$ and column-softmax probabilities $Q$:
-$P = \mathrm{softmax}_{\text{row}}(S) \qquad Q = \mathrm{softmax}_{\text{col}}(S)$
+#### Prerequisites
 
-#### 1.2 Symmetric Contrastive Loss
+1.  **Environment:** Requires PyTorch and a CUDA-enabled environment.
+2.  **Execution:** Training must be launched using `torchrun`.
+3.  **DDP Setup:** The distributed process group (`torch.distributed.init_process_group`) must be initialized before calling the training functions.
 
-The objective is the symmetric InfoNCE (CLIP) loss, averaged over the global batch:
+#### Interface: `distributed_train_step`
 
-$\mathcal{L}(\theta) = \frac{1}{2N} \sum_{i=1}^N \left( -\log P_{ii} - \log Q_{ii} \right)$
+```python
+from distributed_clip import distributed_train_step
 
-#### 1.3 Gradient Derivation
+def distributed_train_step(
+    model: torch.nn.Module, 
+    optimizer: torch.optim.Optimizer, 
+    local_x: torch.Tensor, 
+    local_y: torch.Tensor, 
+    config: Dict
+) -> float:
+```
 
-To optimize $\mathcal{L}(\theta)$, we first derive the gradients with respect to the embeddings $Z_x$ and $Z_y$. The derivation, based on the standard cross-entropy gradient, yields the following closed-form expressions:
+##### Parameters
 
-$G_x = \frac{\partial \mathcal{L}}{\partial Z_x} = \frac{1}{2N\tau} \left( P Z_y + Q Z_y - 2 Z_y \right)$
+  * **`model`** (`torch.nn.Module`): The contrastive model. See Model Requirements below.
+  * **`optimizer`** (`torch.optim.Optimizer`): The optimizer (e.g., AdamW, SGD).
+  * **`local_x`**, **`local_y`** (`torch.Tensor`): The local data chunks assigned to the current GPU rank. If the global batch size is $N$ and there are $P$ GPUs, these tensors have a batch dimension of $N/P$.
+  * **`config`** (`Dict`): A dictionary containing the following keys:
+      * `'GLOBAL_BATCH_SIZE'` (N): The total effective batch size across all GPUs.
+      * `'MICRO_BATCH_SIZE'` (B): The size of microbatches used for local processing (gradient accumulation).
+      * `'STREAM_CHUNK_SIZE'` (M): The chunk size used for streaming the similarity matrix calculations (memory optimization parameter).
+      * `'TAU'` ($\\tau$): The temperature parameter for the contrastive loss.
 
-$G_y = \frac{\partial \mathcal{L}}{\partial Z_y} = \frac{1}{2N\tau} \left( P^\top Z_x + Q^\top Z_x - 2 Z_x \right)$
+##### Returns
 
-These formulas are the foundation of the distributed strategy, allowing us to calculate the exact embedding gradients if we have access to the global $Z_x, Z_y, P,$ and $Q$.
+  * `float`: The calculated global batch loss value, suitable for logging during training.
 
-### 2. Distributed Strategy
+#### Model Requirements
 
-The training is distributed across $P$ GPUs. The global batch $N$ is partitioned such that each GPU $g$ handles a disjoint local chunk $I_g$ of size $C=N/P$. The strategy decouples the global gradient calculation from the local backpropagation.
+Your PyTorch model must adhere to a specific interface:
 
-### 3. The 5-Phase Algorithm
+1.  **DDP Wrapping:** The model must be wrapped in `torch.nn.parallel.DistributedDataParallel` (DDP).
+2.  **Forward Method:** The model's `forward` method must accept `(x, y)` and return normalized embeddings `(z_x, z_y)`. Embeddings **must** be L2 normalized.
+3.  **Encoder Access:** The underlying module (i.e., `model.module` when DDP wrapped) must expose the two encoders as attributes named `encoder_x` and `encoder_y`.
 
-The algorithm proceeds in five phases, utilizing streaming for memory efficiency and specific synchronization strategies. $B$ denotes the local microbatch size.
+**Example Model Structure:**
 
-#### Phase A: Forward Embeddings and Synchronization 1
+```python
+import torch.nn as nn
+import torch.nn.functional as F
 
-1.  **Local Computation:** Each GPU $g$ computes the embeddings for its local chunk $\{z_i^x, z_i^y\}_{i\in I_g}$ *without gradient tracking* (`no_grad`).
-2.  **Synchronization 1 (All-Gather):** The local embeddings are gathered. Every GPU now holds the complete, detached global matrices $Z_x$ and $Z_y$. Detaching prevents cross-rank autograd edges.
+class MyContrastiveModel(nn.Module):
+    def __init__(self, encoder1, encoder2):
+        super().__init__()
+        # Must be named encoder_x and encoder_y
+        self.encoder_x = encoder1 
+        self.encoder_y = encoder2
 
-#### Phase B: Global Log-Normalizers (Streaming)
+    def forward(self, x, y):
+        z_x = self.encoder_x(x)
+        z_y = self.encoder_y(y)
+        # Ensure embeddings are normalized
+        z_x = F.normalize(z_x, p=2, dim=-1)
+        z_y = F.normalize(z_y, p=2, dim=-1)
+        return z_x, z_y
+```
 
-We require $P$ and $Q$ to compute the gradients. We compute the necessary components memory-efficiently by first calculating the log-normalizers:
+#### Example Usage (Training Loop)
 
-$a_i = \log \sum_j \exp(S_{ij}) \quad \text{(Row LSE)} \qquad b_j = \log \sum_i \exp(S_{ij}) \quad \text{(Column LSE)}$
+```python
+# Assuming DDP is initialized, model is wrapped, optimizer is set up, 
+# and dataloader with DistributedSampler is ready.
 
-We avoid materializing the $O(N^2)$ matrix $S$. We stream the computation using blocks of size $M$.
+# Define configuration
+TRAIN_CONFIG = { ... }
 
-*   **For $a$:** Iterate over row blocks $R \subset \{1,\dots,N\}$. Compute $S_{R,:} = (Z_x[R] @ Z_y^\top)/\tau$. Calculate $a_R = \text{logsumexp}(S_{R,:}, \text{dim}=1)$. Discard $S_{R,:}$.
-*   **For $b$:** Computed similarly by streaming over rows of $Z_y$ (columns of $S$).
+# Training loop
+for epoch in range(num_epochs):
+    dataloader.sampler.set_epoch(epoch)
+    for batch_idx, (local_x, local_y) in enumerate(dataloader):
+        local_x = local_x.to(device)
+        local_y = local_y.to(device)
 
-#### Phase C: Local Gradient Precomputation (Streaming)
+        # Perform the distributed training step
+        loss = distributed_train_step(
+            model, optimizer, local_x, local_y, TRAIN_CONFIG
+        )
 
-On GPU $g$, we iterate over a microbatch $M \subset I_g$. We aim to compute the embedding gradients $G_x[M]$ and $G_y[M]$.
+        if dist.get_rank() == 0:
+            print(f"Epoch {epoch}, Step {batch_idx}, Loss: {loss:.4f}")
+```
 
-We again employ streaming to avoid materializing $B \times N$ or $N \times B$ probability slices. We stream over the global dimension $N$ in chunks $C$.
+-----
 
-Consider the term $T = P_{M,:} Z_y$ from the $G_x[M]$ calculation. We utilize the distributive property:
-$T = \sum_{\text{Chunks } C} P_{M,C} Z_y[C]$
+### In-Depth Mathematical Description of the Distributed Algorithm
 
-1. Compute the similarity slice $S_{M,C} = (Z_x[M] @ Z_y[C]^\top)/\tau$.
-2. Compute the probability slice $P_{M,C} = \exp(S_{M,C} - a_M \mathbf{1}^\top)$.
-3. Accumulate the contribution $P_{M,C} @ Z_y[C]$.
-4. Discard $S_{M,C}$ and $P_{M,C}$.
+This document provides a rigorous, self-contained mathematical description of the implemented distributed symmetric contrastive learning algorithm. The method ensures exact mathematical equivalence to a global batch computation while minimizing synchronization overhead and memory footprint.
 
-All terms in $G_x[M]$ and $G_y[M]$ are computed this way, keeping memory complexity dominated by $O(N \cdot d)$.
+#### 1\. Problem Formulation
 
-#### Phase D: Recomputation and Vector-Jacobian Product (VJP)
+We aim to optimize a model parameterized by $\\theta$ using a global batch of $N$ paired samples ${(x\_i, y\_i)}\_{i=1}^N$. The model produces unit-norm embeddings $Z\_x, Z\_y \\in \\mathbb{R}^{N \\times d}$.
 
-We now connect the precomputed, detached embedding gradients $G[M]$ (from Phase C) to the model parameters $\theta$.
+The similarity matrix $S \\in \\mathbb{R}^{N \\times N}$ is defined as $S = \\frac{1}{\\tau} Z\_x Z\_y^\\top$.
+We define row-softmax $P = \\mathrm{softmax}*{\\text{row}}(S)$ and column-softmax $Q = \\mathrm{softmax}*{\\text{col}}(S)$.
 
-1.  **Recomputation:** The encoders are rerun on the microbatch $M$, this time *with gradient tracking*, yielding $Z_x'[M]$ and $Z_y'[M]$ connected to the computation graph.
-2.  **Surrogate Loss (VJP):** We define a surrogate loss $\mathcal{L}_M$ as the inner product of the recomputed embeddings and the precomputed gradients:
+The objective is the symmetric InfoNCE loss:
 
-$\mathcal{L}_M = \langle Z_x'[M], G_x[M] \rangle + \langle Z_y'[M], G_y[M] \rangle$
+$\\mathcal{L}(\\theta) = \\frac{1}{2N} \\sum\_{i=1}^N \\left( -\\log P\_{ii} - \\log Q\_{ii} \\right)$
 
-By the chain rule, calling `backward()` on $\mathcal{L}_M$ executes the Vector-Jacobian Product, yielding the exact local parameter gradients $\frac{\partial \mathcal{L}_M}{\partial \theta}$.
+#### 2\. Gradient Derivation and Strategy
 
-#### Phase E: Synchronization 2 and Loss Scaling
+The optimization relies on the gradients of $\\mathcal{L}$ with respect to the embeddings:
 
-We must aggregate the local parameter gradients. The loss definition $\mathcal{L}$ includes a $1/N$ factor, which is already present in the gradients $G_x, G_y$. Therefore, the global parameter gradient is the **SUM** of the local parameter gradients.
+$G\_x = \\frac{\\partial \\mathcal{L}}{\\partial Z\_x} = \\frac{1}{2N\\tau} \\left( P Z\_y + Q Z\_y - 2 Z\_y \\right)$
+$G\_y = \\frac{\\partial \\mathcal{L}}{\\partial Z\_y} = \\frac{1}{2N\\tau} \\left( P^\\top Z\_x + Q^\\top Z\_x - 2 Z\_x \\right)$
 
-However, PyTorch Distributed Data Parallel (DDP) defaults to **AVERAGING** gradients (dividing by $P$).
+The core strategy is to decouple the calculation of these embedding gradients ($G\_x, G\_y$), which require global information, from the backpropagation to the parameters ($\\nabla\_\\theta \\mathcal{L}$), using the Vector-Jacobian Product (VJP).
 
-To achieve a SUM using DDP's synchronization, we employ **Loss Scaling**. In Phase D, we scale the surrogate loss by the world size $P$ before the backward pass:
+#### 3\. The 5-Phase Distributed Algorithm
 
-$\mathcal{L}_M^{\text{Scaled}} = P \cdot \mathcal{L}_M$
+The computation is distributed across $P$ GPUs, each handling a local chunk $I\_g$ of size $C=N/P$. The algorithm avoids $O(N^2)$ memory complexity and limits synchronization to two points.
 
-**Synchronization 2 (All-Reduce):** DDP automatically performs an All-Reduce on the gradients. The resulting global gradient is:
+##### Phase A: Forward Embeddings and Synchronization 1 (All-Gather)
 
-$\nabla_\theta \mathcal{L} = \underbrace{\frac{1}{P}}_{\text{DDP Avg.}} \sum_{g=1}^P \frac{\partial \mathcal{L}_{M_g}^{\text{Scaled}}}{\partial \theta} = \frac{1}{P} \sum_{g=1}^P \left( P \cdot \frac{\partial \mathcal{L}_{M_g}}{\partial \theta} \right) = \sum_{g=1}^P \frac{\partial \mathcal{L}_{M_g}}{\partial \theta}$
+1.  **Local Forward:** Each GPU $g$ computes its local embeddings ${z\_i^x, z\_i^y}\_{i\\in I\_g}$ without gradient tracking (`no_grad`).
+2.  **Synchronization 1:** An All-Gather operation collects these local embeddings. Every GPU now possesses the full, detached global matrices $Z\_x$ and $Z\_y$.
 
-This yields the mathematically correct global gradient. Finally, the optimizer step is executed.
+##### Phase B: Global Normalizers and Loss Calculation (Streaming)
+
+We require the log-normalizers (LogSumExp) for $P$ and $Q$:
+$a\_i = \\log \\sum\_j \\exp(S\_{ij}) \\quad \\text{(Row LSE)} \\qquad b\_j = \\log \\sum\_i \\exp(S\_{ij}) \\quad \\text{(Column LSE)}$
+
+**Memory Efficiency (Streaming):** To avoid materializing $S$, we compute $a$ and $b$ by streaming over blocks of size $M$. For row blocks $R$:
+$S\_{R,:} = (Z\_x[R] @ Z\_y^\\top)/\\tau$
+$a\_R = \\text{logsumexp}(S\_{R,:}, \\text{dim}=1)$
+$S\_{R,:}$ is discarded after use.
+
+**Global Loss Calculation:**
+We can express the loss $\\mathcal{L}$ using the normalizers, as $\\log P\_{ii} = S\_{ii} - a\_i$ and $\\log Q\_{ii} = S\_{ii} - b\_i$:
+
+$\\mathcal{L} = \\frac{1}{2N} \\sum\_{i=1}^N \\left( (a\_i - S\_{ii}) + (b\_i - S\_{ii}) \\right) = \\frac{1}{2N} \\sum\_{i=1}^N \\left( a\_i + b\_i - 2S\_{ii} \\right)$
+
+The diagonal elements $S\_{ii} = \\frac{1}{\\tau} (z\_i^x \\cdot z\_i^y)$ are computed efficiently. Since $Z\_x, Z\_y, a, b$ are globally available, this loss calculation requires no further communication.
+
+##### Phase C: Local Gradient Precomputation (Streaming)
+
+On GPU $g$, we process a microbatch $M \\subset I\_g$ (size $B$) to compute $G\_x[M]$ and $G\_y[M]$.
+
+**Memory Efficiency (Streaming):** We must avoid materializing the $B \\times N$ probability slices (e.g., $P\_{M,:}$). We leverage the distributive property and stream over the global dimension $N$ in chunks $C'$:
+
+$(P Z\_y)*M = P*{M,:} Z\_y = \\sum\_{\\text{Chunks } C'} P\_{M,C'} Z\_y[C']$
+
+In each streaming step:
+
+1.  Compute similarity slice $S\_{M,C'}$.
+2.  Compute probability slice $P\_{M,C'} = \\exp(S\_{M,C'} - a\_M \\mathbf{1}^\\top)$ using precomputed $a\_M$.
+3.  Accumulate $P\_{M,C'} @ Z\_y[C']$.
+4.  Discard $S\_{M,C'}$ and $P\_{M,C'}$.
+
+This results in the detached embedding gradients $G\_x[M]$ and $G\_y[M]$.
+
+##### Phase D: Recomputation and Vector-Jacobian Product (VJP)
+
+We now compute the parameter gradients $\\frac{\\partial \\mathcal{L}}{\\partial \\theta}$ using the precomputed $G[M]$.
+
+1.  **Recomputation:** Rerun the encoders on the microbatch $M$ *with gradient tracking*, yielding $Z'[M]$ tied to the computation graph.
+2.  **VJP via Surrogate Loss:** Define a surrogate loss $\\mathcal{L}\_M$:
+
+$\\mathcal{L}\_M = \\langle Z\_x'[M], G\_x[M] \\rangle + \\langle Z\_y'[M], G\_y[M] \\rangle$
+
+Calling `backward()` on $\\mathcal{L}\_M$ computes the exact local parameter gradient for this microbatch via the chain rule.
+
+##### Phase E: Synchronization 2 (All-Reduce) and Loss Scaling
+
+We must aggregate local parameter gradients. The global loss $\\mathcal{L}$ definition includes a $1/N$ factor, which is already incorporated into $G\_x$ and $G\_y$. Therefore, the global parameter gradient is the **SUM** of the local gradients.
+
+PyTorch DDP, by default, performs an All-Reduce with an **AVERAGE** operation (dividing by $P$).
+
+**Loss Scaling:** To achieve a SUM using DDP's averaging mechanism, we scale the surrogate loss by $P$ in Phase D before backpropagation:
+
+$\\mathcal{L}\_M^{\\text{Scaled}} = P \\cdot \\mathcal{L}\_M$
+
+**Synchronization 2:** DDP performs the All-Reduce (Sync Point 2). The resulting synchronized gradient is:
+
+$\\nabla\_\\theta \\mathcal{L} = \\underbrace{\\frac{1}{P}}*{\\text{DDP Avg.}} \\sum*{g=1}^P \\frac{\\partial \\mathcal{L}*{M\_g}^{\\text{Scaled}}}{\\partial \\theta} = \\frac{1}{P} \\sum*{g=1}^P \\left( P \\cdot \\frac{\\partial \\mathcal{L}*{M\_g}}{\\partial \\theta} \\right) = \\sum*{g=1}^P \\frac{\\partial \\mathcal{L}\_{M\_g}}{\\partial \\theta}$
+
+This yields the exact global gradient, ensuring mathematical equivalence. The optimizer then updates the parameters.
