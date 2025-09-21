@@ -225,6 +225,15 @@ def save_model(cfg: DictConfig, model, rank):
 # ===================================================================
 # Training Function
 # ===================================================================
+def get_epoch_batch_size(batch_size_config, epoch):
+    """Get batch size for current epoch from config (single value or list)."""
+    # Check if it's a list-like object (handles both list and OmegaConf ListConfig)
+    if OmegaConf.is_list(batch_size_config) or isinstance(batch_size_config, list):
+        # Use epoch-specific batch size or last value for remaining epochs
+        idx = min(epoch, len(batch_size_config) - 1)
+        return batch_size_config[idx]
+    return batch_size_config
+
 def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool = False):
     """Main training function."""
     device = torch.device(f'cuda:{rank}') if distributed and torch.cuda.is_available() else \
@@ -239,39 +248,41 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
         if cfg.training.lora.enabled:
             print("LoRA is ENABLED.")
 
+        # Show batch size schedule if using list
+        if OmegaConf.is_list(cfg.training.global_batch_size):
+            print(f"Batch size schedule: {list(cfg.training.global_batch_size)}")
+
     # Setup tokenizer
     tokenizer = AutoTokenizer.from_pretrained(cfg.model.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # Construct dataset path from name and size
+    dataset_path = Path(cfg.dataset.base_path) / f"{cfg.dataset.size}.jsonl"
+
+    if rank == 0:
+        print(f"Loading dataset: {dataset_path}")
+        if not dataset_path.exists():
+            raise FileNotFoundError(f"Dataset not found: {dataset_path}")
+
     # Create datasets
     train_dataset = TheoremLemmaDataset(
-        cfg.dataset.path, tokenizer,
+        str(dataset_path), tokenizer,
         max_length=cfg.training.max_length,
         split='train',
         train_ratio=cfg.dataset.train_ratio,
         seed=cfg.dataset.seed
     )
     val_dataset = TheoremLemmaDataset(
-        cfg.dataset.path, tokenizer,
+        str(dataset_path), tokenizer,
         max_length=cfg.training.max_length,
         split='eval',
         train_ratio=cfg.dataset.train_ratio,
         seed=cfg.dataset.seed
     )
 
-    # Setup data loaders
-    batch_size = cfg.training.global_batch_size // world_size
+    # Initial data loader setup (will be recreated each epoch if batch size changes)
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True) if distributed else None
-
-    train_loader = DataLoader(
-        train_dataset, batch_size=batch_size,
-        sampler=train_sampler,
-        shuffle=(train_sampler is None),
-        num_workers=cfg.runtime.num_workers,
-        pin_memory=True,
-        drop_last=cfg.training.drop_last
-    )
 
     # Setup model
     model = setup_model(cfg, device)
@@ -293,6 +304,24 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
 
     # Training loop
     for epoch in range(cfg.training.num_epochs):
+        # Get batch size for current epoch
+        epoch_batch_size = get_epoch_batch_size(cfg.training.global_batch_size, epoch)
+        batch_size = epoch_batch_size // world_size
+
+        # Create data loader with current epoch's batch size
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size,
+            sampler=train_sampler,
+            shuffle=(train_sampler is None),
+            num_workers=cfg.runtime.num_workers,
+            pin_memory=True,
+            drop_last=cfg.training.drop_last
+        )
+
+        if rank == 0 and (epoch == 0 or (OmegaConf.is_list(cfg.training.global_batch_size) and
+                                          epoch < len(cfg.training.global_batch_size))):
+            print(f"Epoch {epoch+1}: Global batch size = {epoch_batch_size}")
+
         model.train()
         if distributed and train_sampler:
             train_sampler.set_epoch(epoch)
@@ -305,7 +334,7 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
             y_packed = torch.cat([batch['input_ids_y'].to(device), batch['attention_mask_y'].to(device)], dim=1)
             actual_batch_size = x_packed.shape[0] * (world_size if distributed else 1)
 
-            if cfg.training.drop_last and actual_batch_size < cfg.training.global_batch_size:
+            if cfg.training.drop_last and actual_batch_size < epoch_batch_size:
                 if rank == 0:
                     print(f"Skipping incomplete batch of size {actual_batch_size}")
                 continue
