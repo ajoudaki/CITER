@@ -1,0 +1,45 @@
+defaults:
+  - model: qwen-1.5b  # default model choice
+  - training: default
+  - dataset: lemmas_theorems
+  - _self_
+
+# Dataset configuration overrides (if needed)
+dataset:
+  size: small  # Options: toy, tiny, small, medium, full
+  train_ratio: 0.8
+  seed: 42
+
+# Weights & Biases configuration
+wandb:
+  enabled: true
+  project: theorem-contrastive
+  entity: null  # Set to your wandb entity/username
+  name: null  # Run name (auto-generated if null)
+  tags:
+    - contrastive
+    - ${model.name}
+    - ${dataset.size}
+  group: null  # Group runs together
+  notes: null  # Additional notes for the run
+  mode: online  # Options: online, offline, disabled
+
+# Output configuration
+output:
+  save_dir: ./outputs
+  save_lora: true
+
+# Runtime configuration
+runtime:
+  distributed: false  # Will be set automatically if using torchrun
+  num_workers: 4
+
+# Hydra configuration
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+  job:
+    chdir: false  # Don't change working directory

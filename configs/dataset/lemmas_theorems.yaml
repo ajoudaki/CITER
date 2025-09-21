@@ -1,0 +1,14 @@
+# Lemmas and Theorems dataset configuration
+name: lemmas_theorems
+base_path: data/lemmas_theorems
+size: small  # Default size
+train_ratio: 0.8
+seed: 42
+
+# Available sizes with descriptions
+sizes:
+  toy: "20MB - Quick testing"
+  tiny: "4MB - Very small subset"
+  small: "40MB - Small subset for development"
+  medium: "400MB - Medium subset"
+  full: "1.7GB - Complete dataset"

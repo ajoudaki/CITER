@@ -1,0 +1,6 @@
+# BERT Base model configuration
+name: bert-base
+model_name: bert-base-uncased
+model_type: cls_pooling
+hidden_dim: 768
+lora_target_modules: ["query", "key", "value"]
