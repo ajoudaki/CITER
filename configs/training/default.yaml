@@ -12,6 +12,6 @@ drop_last: true
 # LoRA configuration
 lora:
   enabled: true
-  r: 16
-  lora_alpha: 32
+  r: 8
+  lora_alpha: 16
   lora_dropout: 0.05
