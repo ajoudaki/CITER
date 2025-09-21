@@ -47,14 +47,14 @@ MODEL_CHOICE = 'qwen-1.5b'
 SELECTED_MODEL_CONFIG = MODEL_CONFIGS[MODEL_CHOICE]
 
 TRAIN_CONFIG = {
-    'GLOBAL_BATCH_SIZE': 64, # Can be increased with LoRA
+    'GLOBAL_BATCH_SIZE': 128, # Can be increased with LoRA
     'MICRO_BATCH_SIZE': 6,   # Can be increased with LoRA
-    'STREAM_CHUNK_SIZE': 16,
+    'STREAM_CHUNK_SIZE': 256,
     'TAU': 0.07,
     'LR': 2e-4, # A higher LR is common for LoRA
     'NUM_EPOCHS': 10,
     'MAX_LENGTH': 256,
-    'OUTPUT_DIM': 768,
+    'OUTPUT_DIM': 1024,
     'DROP_LAST': True,
     # --- NEW: LoRA Configuration ---
     'LORA_CONFIG': {
@@ -201,8 +201,8 @@ def train(rank: int = 0, world_size: int = 1, distributed: bool = False):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
         
-    train_dataset = TheoremLemmaDataset('data/lemmas_theorems_toy.jsonl', tokenizer, max_length=TRAIN_CONFIG['MAX_LENGTH'], split='train')
-    val_dataset = TheoremLemmaDataset('data/lemmas_theorems_toy.jsonl', tokenizer, max_length=TRAIN_CONFIG['MAX_LENGTH'], split='eval')
+    train_dataset = TheoremLemmaDataset('data/lemmas_theorems_small.jsonl', tokenizer, max_length=TRAIN_CONFIG['MAX_LENGTH'], split='train')
+    val_dataset = TheoremLemmaDataset('data/lemmas_theorems_small.jsonl', tokenizer, max_length=TRAIN_CONFIG['MAX_LENGTH'], split='eval')
 
     batch_size = TRAIN_CONFIG['GLOBAL_BATCH_SIZE'] // world_size
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True) if distributed else None
@@ -246,7 +246,7 @@ def train(rank: int = 0, world_size: int = 1, distributed: bool = False):
         print_trainable_parameters(model)
         
     if distributed:
-        model = DDP(model, device_ids=[rank], find_unused_parameters=TRAIN_CONFIG['LORA_CONFIG']['enabled'])
+        model = DDP(model, device_ids=[rank]) # , find_unused_parameters=TRAIN_CONFIG['LORA_CONFIG']['enabled'])
         
     # --- MODIFIED: Optimizer only sees trainable parameters ---
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=TRAIN_CONFIG['LR'])
