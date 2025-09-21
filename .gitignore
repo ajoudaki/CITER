@@ -35,6 +35,8 @@ experiments/
 # Logs and output files
 logs/
 output/
+outputs/
+multirun/
 
 # Miscellaneous
 .idea/
