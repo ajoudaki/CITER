@@ -1,5 +1,5 @@
 
-### User Guide: `distributed_clip.py` Interface
+###  Guide: `distributed_clip.py` Interface
 
 This guide explains how to use the `distributed_clip.py` module for efficient, large-batch contrastive training in a PyTorch Distributed Data Parallel (DDP) environment.
 
