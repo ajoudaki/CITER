@@ -6,7 +6,7 @@ tau: 0.07
 lr: 2e-4
 num_epochs: 20
 max_length: 256
-output_dim: 1024
+output_dim: 2048
 drop_last: true
 
 # LoRA configuration
