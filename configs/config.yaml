@@ -1,0 +1,30 @@
+defaults:
+  - model: qwen-1.5b  # default model choice
+  - training: default
+  - _self_
+
+# Dataset configuration
+dataset:
+  path: data/lemmas_theorems_small.jsonl
+  train_ratio: 0.8
+  seed: 42
+
+# Output configuration
+output:
+  save_dir: ./outputs
+  save_lora: true
+
+# Runtime configuration
+runtime:
+  distributed: false  # Will be set automatically if using torchrun
+  num_workers: 4
+
+# Hydra configuration
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+  job:
+    chdir: false  # Don't change working directory

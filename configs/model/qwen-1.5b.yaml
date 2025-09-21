@@ -1,0 +1,6 @@
+# Qwen 1.5B model configuration
+name: qwen-1.5b
+model_name: deepseek-ai/deepseek-r1-distill-qwen-1.5b
+model_type: last_token_pooling
+hidden_dim: 1536
+lora_target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]

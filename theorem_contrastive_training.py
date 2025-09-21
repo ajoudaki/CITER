@@ -6,87 +6,25 @@ import os
 import random
 from typing import Dict
 from tqdm import tqdm
+from pathlib import Path
 
 # Set TOKENIZERS_PARALLELISM before any other imports to prevent warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+import hydra
+from hydra import compose, initialize
+from omegaconf import DictConfig, OmegaConf
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from transformers import AutoTokenizer, AutoModel
-# --- NEW: Import PEFT for LoRA ---
 from peft import get_peft_model, LoraConfig, TaskType
 
-# Import the new distributed validation function
+# Import distributed functions
 from distributed_clip import distributed_train_step, trivial_contrastive_step, distributed_validate_step
 
 # ===================================================================
-# Model and Training Configuration
-# ===================================================================
-MODEL_CONFIGS = {
-    'bert-base': {
-        'model_name': 'bert-base-uncased',
-        'model_type': 'cls_pooling',
-        'hidden_dim': 768,
-        # Common target modules for BERT
-        'lora_target_modules': ["query", "key", "value"],
-    },
-    'qwen-1.5b': {
-        'model_name': 'deepseek-ai/deepseek-r1-distill-qwen-1.5b',
-        'model_type': 'last_token_pooling',
-        'hidden_dim': 1536,
-        # Common target modules for Qwen-like models
-        'lora_target_modules': ["q_proj", "v_proj", "k_proj", "o_proj"],
-    }
-}
-
-# --- CHOOSE YOUR MODEL HERE ---
-MODEL_CHOICE = 'qwen-1.5b'
-# ------------------------------
-
-SELECTED_MODEL_CONFIG = MODEL_CONFIGS[MODEL_CHOICE]
-
-TRAIN_CONFIG = {
-    'GLOBAL_BATCH_SIZE': 128, # Can be increased with LoRA
-    'MICRO_BATCH_SIZE': 6,   # Can be increased with LoRA
-    'STREAM_CHUNK_SIZE': 256,
-    'TAU': 0.07,
-    'LR': 2e-4, # A higher LR is common for LoRA
-    'NUM_EPOCHS': 10,
-    'MAX_LENGTH': 256,
-    'OUTPUT_DIM': 1024,
-    'DROP_LAST': True,
-    # --- NEW: LoRA Configuration ---
-    'LORA_CONFIG': {
-        'enabled': True,
-        'r': 16, # Rank of the LoRA matrices
-        'lora_alpha': 32, # A scaling factor
-        'lora_dropout': 0.05,
-        # target_modules are now fetched from MODEL_CONFIGS to be model-agnostic
-        'target_modules': SELECTED_MODEL_CONFIG['lora_target_modules'],
-    },
-}
-# Merge model-specific config into the main training config
-TRAIN_CONFIG.update(SELECTED_MODEL_CONFIG)
-
-
-# --- NEW: Helper function to show LoRA's impact ---
-def print_trainable_parameters(model):
-    """Prints the number of trainable parameters in the model."""
-    trainable_params = 0
-    all_param = 0
-    for _, param in model.named_parameters():
-        all_param += param.numel()
-        if param.requires_grad:
-            trainable_params += param.numel()
-    print(
-        f"trainable params: {trainable_params} || all params: {all_param} || "
-        f"trainable%: {100 * trainable_params / all_param:.2f}"
-    )
-
-
-# ===================================================================
-# Dataset for Theorems and Lemmas (Unchanged)
+# Dataset (unchanged)
 # ===================================================================
 class TheoremLemmaDataset(Dataset):
     """Dataset that loads theorem/lemma pairs from JSONL file"""
@@ -103,7 +41,7 @@ class TheoremLemmaDataset(Dataset):
                 all_statements = paper.get('lemmas', []) + paper.get('theorems', [])
                 if len(all_statements) >= 2:
                     all_papers.append(all_statements)
-        
+
         random.seed(seed)
         random.shuffle(all_papers)
         random.seed()
@@ -120,7 +58,7 @@ class TheoremLemmaDataset(Dataset):
         statements = self.data[idx]
         if self.split == 'eval':
             text_x, text_y = (statements[0], statements[1]) if len(statements) >= 2 else (statements[0], statements[0])
-        else: # train
+        else:
             text_x, text_y = random.sample(statements, 2) if len(statements) >= 2 else (statements[0], statements[0])
 
         tokens_x = self.tokenizer(text_x, padding='max_length', truncation=True, max_length=self.max_length, return_tensors='pt')
@@ -129,9 +67,9 @@ class TheoremLemmaDataset(Dataset):
             'input_ids_x': tokens_x['input_ids'].squeeze(0), 'attention_mask_x': tokens_x['attention_mask'].squeeze(0),
             'input_ids_y': tokens_y['input_ids'].squeeze(0), 'attention_mask_y': tokens_y['attention_mask'].squeeze(0)
         }
-        
+
 # ===================================================================
-# Flexible Models and Wrappers
+# Model Architectures
 # ===================================================================
 class CLSPoolingEncoder(nn.Module):
     """Encoder that uses the [CLS] token embedding."""
@@ -139,7 +77,7 @@ class CLSPoolingEncoder(nn.Module):
         super().__init__()
         self.base_model = AutoModel.from_pretrained(model_name)
         self.projection = nn.Linear(hidden_dim, output_dim)
-    
+
     def forward(self, input_ids, attention_mask):
         outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
         cls_embedding = outputs.last_hidden_state[:, 0, :]
@@ -186,154 +124,265 @@ class TheoremContrastiveModel(nn.Module):
         return self.encoder_x(x_packed), self.encoder_y(y_packed)
 
 # ===================================================================
-# Training Function (MODIFIED for LoRA)
+# Helper Functions
 # ===================================================================
-def train(rank: int = 0, world_size: int = 1, distributed: bool = False):
-    device = torch.device(f'cuda:{rank}') if distributed and torch.cuda.is_available() else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    if distributed: torch.cuda.set_device(rank)
+def print_trainable_parameters(model):
+    """Prints the number of trainable parameters in the model."""
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    all_param = sum(p.numel() for p in model.parameters())
+    print(f"trainable params: {trainable_params:,} || all params: {all_param:,} || "
+          f"trainable%: {100 * trainable_params / all_param:.2f}")
 
-    if rank == 0:
-        print(f"Using model: {TRAIN_CONFIG['model_name']} with {TRAIN_CONFIG['model_type']} strategy.")
-        if TRAIN_CONFIG['LORA_CONFIG']['enabled']:
-            print("LoRA is ENABLED.")
+def setup_model(cfg: DictConfig, device):
+    """Setup model with optional LoRA."""
+    encoder_class = ENCODER_REGISTRY.get(cfg.model.model_type)
+    if encoder_class is None:
+        raise ValueError(f"Unknown model type: {cfg.model.model_type}")
 
-    tokenizer = AutoTokenizer.from_pretrained(TRAIN_CONFIG['model_name'])
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-        
-    train_dataset = TheoremLemmaDataset('data/lemmas_theorems_small.jsonl', tokenizer, max_length=TRAIN_CONFIG['MAX_LENGTH'], split='train')
-    val_dataset = TheoremLemmaDataset('data/lemmas_theorems_small.jsonl', tokenizer, max_length=TRAIN_CONFIG['MAX_LENGTH'], split='eval')
-
-    batch_size = TRAIN_CONFIG['GLOBAL_BATCH_SIZE'] // world_size
-    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True) if distributed else None
-    
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler,
-                              shuffle=(train_sampler is None), num_workers=4, pin_memory=True,
-                              drop_last=TRAIN_CONFIG['DROP_LAST'])
-    
-    encoder_class = ENCODER_REGISTRY.get(TRAIN_CONFIG['model_type'])
     base_encoder = encoder_class(
-        model_name=TRAIN_CONFIG['model_name'],
-        hidden_dim=TRAIN_CONFIG['hidden_dim'],
-        output_dim=TRAIN_CONFIG['OUTPUT_DIM']
+        model_name=cfg.model.model_name,
+        hidden_dim=cfg.model.hidden_dim,
+        output_dim=cfg.training.output_dim
     )
 
-    # --- NEW: Apply LoRA if enabled ---
-    if TRAIN_CONFIG['LORA_CONFIG']['enabled']:
-        # Freeze all parameters of the base model
+    # Apply LoRA if enabled
+    if cfg.training.lora.enabled:
+        # Freeze base model parameters
         for param in base_encoder.base_model.parameters():
             param.requires_grad = False
-            
+
         # Create LoRA config
         peft_config = LoraConfig(
-            task_type=TaskType.FEATURE_EXTRACTION, # Appropriate for embedding models
-            r=TRAIN_CONFIG['LORA_CONFIG']['r'],
-            lora_alpha=TRAIN_CONFIG['LORA_CONFIG']['lora_alpha'],
-            lora_dropout=TRAIN_CONFIG['LORA_CONFIG']['lora_dropout'],
-            target_modules=TRAIN_CONFIG['LORA_CONFIG']['target_modules'],
+            task_type=TaskType.FEATURE_EXTRACTION,
+            r=cfg.training.lora.r,
+            lora_alpha=cfg.training.lora.lora_alpha,
+            lora_dropout=cfg.training.lora.lora_dropout,
+            target_modules=cfg.model.lora_target_modules,
         )
-        
-        # Wrap the base model with LoRA adapters
+
+        # Wrap with LoRA adapters
         base_encoder.base_model = get_peft_model(base_encoder.base_model, peft_config)
-    
-    # The projection head should always be trainable
+
+    # Projection head is always trainable
     for param in base_encoder.projection.parameters():
         param.requires_grad = True
 
-    model = TheoremContrastiveModel(base_encoder, max_length=TRAIN_CONFIG['MAX_LENGTH']).to(device)
+    model = TheoremContrastiveModel(base_encoder, max_length=cfg.training.max_length)
+    return model.to(device)
 
-    if rank == 0:
-        print_trainable_parameters(model)
-        
-    if distributed:
-        model = DDP(model, device_ids=[rank]) # , find_unused_parameters=TRAIN_CONFIG['LORA_CONFIG']['enabled'])
-        
-    # --- MODIFIED: Optimizer only sees trainable parameters ---
-    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=TRAIN_CONFIG['LR'])
-
-    # --- Validation Data Preparation (Unchanged) ---
-    val_x_packed, val_y_packed = None, None
+def prepare_validation_data(val_dataset, device, distributed, rank):
+    """Prepare and distribute validation data."""
     if distributed:
         val_objects = [None, None]
         if rank == 0:
             print("Preparing and distributing validation dataset...")
             val_data = [val_dataset[i] for i in range(len(val_dataset))]
-            val_x = torch.stack([d['input_ids_x'] for d in val_data]); val_mx = torch.stack([d['attention_mask_x'] for d in val_data])
-            val_y = torch.stack([d['input_ids_y'] for d in val_data]); val_my = torch.stack([d['attention_mask_y'] for d in val_data])
-            val_x_packed = torch.cat([val_x, val_mx], dim=1); val_y_packed = torch.cat([val_y, val_my], dim=1)
+            val_x = torch.stack([d['input_ids_x'] for d in val_data])
+            val_mx = torch.stack([d['attention_mask_x'] for d in val_data])
+            val_y = torch.stack([d['input_ids_y'] for d in val_data])
+            val_my = torch.stack([d['attention_mask_y'] for d in val_data])
+            val_x_packed = torch.cat([val_x, val_mx], dim=1)
+            val_y_packed = torch.cat([val_y, val_my], dim=1)
             val_objects = [val_x_packed, val_y_packed]
         dist.broadcast_object_list(val_objects, src=0)
         val_x_packed, val_y_packed = val_objects
     else:
         print("Preparing validation dataset...")
         val_data = [val_dataset[i] for i in range(len(val_dataset))]
-        val_x = torch.stack([d['input_ids_x'] for d in val_data]); val_mx = torch.stack([d['attention_mask_x'] for d in val_data])
-        val_y = torch.stack([d['input_ids_y'] for d in val_data]); val_my = torch.stack([d['attention_mask_y'] for d in val_data])
-        val_x_packed = torch.cat([val_x, val_mx], dim=1); val_y_packed = torch.cat([val_y, val_my], dim=1)
+        val_x = torch.stack([d['input_ids_x'] for d in val_data])
+        val_mx = torch.stack([d['attention_mask_x'] for d in val_data])
+        val_y = torch.stack([d['input_ids_y'] for d in val_data])
+        val_my = torch.stack([d['attention_mask_y'] for d in val_data])
+        val_x_packed = torch.cat([val_x, val_mx], dim=1)
+        val_y_packed = torch.cat([val_y, val_my], dim=1)
 
-    # --- Training and Validation Loops (Unchanged) ---
-    for epoch in range(TRAIN_CONFIG['NUM_EPOCHS']):
+    return val_x_packed, val_y_packed
+
+def save_model(cfg: DictConfig, model, rank):
+    """Save model or LoRA adapters."""
+    if rank != 0:
+        return
+
+    output_dir = Path(cfg.output.save_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    model_to_save = model.module if hasattr(model, 'module') else model
+
+    if cfg.training.lora.enabled and cfg.output.save_lora:
+        # Save LoRA adapters and projection
+        adapter_path = output_dir / f'{cfg.model.name}_lora_adapters'
+        projection_path = output_dir / f'{cfg.model.name}_projection.pt'
+
+        model_to_save.encoder_x.base_encoder.base_model.save_pretrained(str(adapter_path))
+        torch.save(model_to_save.encoder_x.base_encoder.projection.state_dict(), projection_path)
+        print(f"LoRA adapters saved to '{adapter_path}' and projection to '{projection_path}'")
+    else:
+        # Save full model
+        model_path = output_dir / f'{cfg.model.name}_contrastive_model.pt'
+        torch.save(model_to_save.state_dict(), model_path)
+        print(f"Model saved to {model_path}")
+
+# ===================================================================
+# Training Function
+# ===================================================================
+def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool = False):
+    """Main training function."""
+    device = torch.device(f'cuda:{rank}') if distributed and torch.cuda.is_available() else \
+             torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    if distributed:
+        torch.cuda.set_device(rank)
+
+    if rank == 0:
+        print(f"Configuration:\n{OmegaConf.to_yaml(cfg)}")
+        print(f"Using model: {cfg.model.model_name} with {cfg.model.model_type} strategy.")
+        if cfg.training.lora.enabled:
+            print("LoRA is ENABLED.")
+
+    # Setup tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(cfg.model.model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # Create datasets
+    train_dataset = TheoremLemmaDataset(
+        cfg.dataset.path, tokenizer,
+        max_length=cfg.training.max_length,
+        split='train',
+        train_ratio=cfg.dataset.train_ratio,
+        seed=cfg.dataset.seed
+    )
+    val_dataset = TheoremLemmaDataset(
+        cfg.dataset.path, tokenizer,
+        max_length=cfg.training.max_length,
+        split='eval',
+        train_ratio=cfg.dataset.train_ratio,
+        seed=cfg.dataset.seed
+    )
+
+    # Setup data loaders
+    batch_size = cfg.training.global_batch_size // world_size
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True) if distributed else None
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size,
+        sampler=train_sampler,
+        shuffle=(train_sampler is None),
+        num_workers=cfg.runtime.num_workers,
+        pin_memory=True,
+        drop_last=cfg.training.drop_last
+    )
+
+    # Setup model
+    model = setup_model(cfg, device)
+
+    if rank == 0:
+        print_trainable_parameters(model)
+
+    if distributed:
+        model = DDP(model, device_ids=[rank])
+
+    # Setup optimizer (only for trainable parameters)
+    optimizer = torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=cfg.training.lr
+    )
+
+    # Prepare validation data
+    val_x_packed, val_y_packed = prepare_validation_data(val_dataset, device, distributed, rank)
+
+    # Training loop
+    for epoch in range(cfg.training.num_epochs):
         model.train()
-        if distributed and train_sampler: train_sampler.set_epoch(epoch)
+        if distributed and train_sampler:
+            train_sampler.set_epoch(epoch)
+
         total_loss, num_batches = 0, 0
 
-        pbar = tqdm(train_loader, disable=(rank!=0), desc=f"Epoch {epoch+1}/{TRAIN_CONFIG['NUM_EPOCHS']}")
+        pbar = tqdm(train_loader, disable=(rank!=0), desc=f"Epoch {epoch+1}/{cfg.training.num_epochs}")
         for batch in pbar:
             x_packed = torch.cat([batch['input_ids_x'].to(device), batch['attention_mask_x'].to(device)], dim=1)
             y_packed = torch.cat([batch['input_ids_y'].to(device), batch['attention_mask_y'].to(device)], dim=1)
             actual_batch_size = x_packed.shape[0] * (world_size if distributed else 1)
 
-            if TRAIN_CONFIG['DROP_LAST'] and actual_batch_size < TRAIN_CONFIG['GLOBAL_BATCH_SIZE']:
-                if rank == 0: print(f"Skipping incomplete batch of size {actual_batch_size} (< {TRAIN_CONFIG['GLOBAL_BATCH_SIZE']})")
+            if cfg.training.drop_last and actual_batch_size < cfg.training.global_batch_size:
+                if rank == 0:
+                    print(f"Skipping incomplete batch of size {actual_batch_size}")
                 continue
 
-            config_copy = TRAIN_CONFIG.copy()
-            config_copy['GLOBAL_BATCH_SIZE'] = actual_batch_size
-            loss = distributed_train_step(model, optimizer, x_packed, y_packed, config_copy) if distributed else trivial_contrastive_step(model, optimizer, x_packed, y_packed, config_copy)
+            # Create config dict for compatibility with existing functions
+            train_config = {
+                'GLOBAL_BATCH_SIZE': actual_batch_size,
+                'MICRO_BATCH_SIZE': cfg.training.micro_batch_size,
+                'STREAM_CHUNK_SIZE': cfg.training.stream_chunk_size,
+                'TAU': cfg.training.tau
+            }
 
-            total_loss += loss; num_batches += 1
-            if rank == 0: pbar.set_postfix(loss=f'{loss:.4f}')
+            if distributed:
+                loss = distributed_train_step(model, optimizer, x_packed, y_packed, train_config)
+            else:
+                loss = trivial_contrastive_step(model, optimizer, x_packed, y_packed, train_config)
 
-        # --- VALIDATION PHASE ---
-        N_val = val_x_packed.shape[0]; val_world_size = world_size if distributed else 1
+            total_loss += loss
+            num_batches += 1
+            if rank == 0:
+                pbar.set_postfix(loss=f'{loss:.4f}')
+
+        # Validation
+        N_val = val_x_packed.shape[0]
+        val_world_size = world_size if distributed else 1
         C_val = N_val // val_world_size
-        if N_val % val_world_size != 0 and rank == 0: print(f"Warning: Val set size {N_val} not divisible by world size {val_world_size}. Truncating.")
+
+        if N_val % val_world_size != 0 and rank == 0:
+            print(f"Warning: Val set size {N_val} not divisible by world size {val_world_size}")
+
         start, end = rank * C_val, (rank + 1) * C_val
-        local_val_x, local_val_y = val_x_packed[start:end].to(device), val_y_packed[start:end].to(device)
-        val_config = TRAIN_CONFIG.copy(); val_config['GLOBAL_BATCH_SIZE'] = C_val * val_world_size
+        local_val_x = val_x_packed[start:end].to(device)
+        local_val_y = val_y_packed[start:end].to(device)
+
+        val_config = {
+            'GLOBAL_BATCH_SIZE': C_val * val_world_size,
+            'MICRO_BATCH_SIZE': cfg.training.micro_batch_size,
+            'STREAM_CHUNK_SIZE': cfg.training.stream_chunk_size,
+            'TAU': cfg.training.tau
+        }
+
         val_loss, topk_acc = distributed_validate_step(model, local_val_x, local_val_y, val_config)
-        
+
         if rank == 0:
-            avg_train_loss = total_loss / num_batches
-            print(f"\nEpoch [{epoch+1}/{TRAIN_CONFIG['NUM_EPOCHS']}] Summary:")
-            print(f"  Train Loss: {avg_train_loss:.4f}"); print(f"  Val Loss:   {val_loss:.4f}")
-            print(f"  MRR:        {topk_acc.get('MRR', 0):.4f}"); print(f"  Top@1 Acc:  {topk_acc.get(1, 0)*100:.2f}%")
-            print(f"  Top@5 Acc:  {topk_acc.get(5, 0)*100:.2f}%"); print(f"  Top@10 Acc: {topk_acc.get(10, 0)*100:.2f}%\n")
+            avg_train_loss = total_loss / num_batches if num_batches > 0 else 0
+            print(f"\nEpoch [{epoch+1}/{cfg.training.num_epochs}] Summary:")
+            print(f"  Train Loss: {avg_train_loss:.4f}")
+            print(f"  Val Loss:   {val_loss:.4f}")
+            print(f"  MRR:        {topk_acc.get('MRR', 0):.4f}")
+            print(f"  Top@1 Acc:  {topk_acc.get(1, 0)*100:.2f}%")
+            print(f"  Top@5 Acc:  {topk_acc.get(5, 0)*100:.2f}%")
+            print(f"  Top@10 Acc: {topk_acc.get(10, 0)*100:.2f}%\n")
 
-        if distributed: dist.barrier()
+        if distributed:
+            dist.barrier()
 
-    if rank == 0:
-        model_to_save = model.module if hasattr(model, 'module') else model
-        # --- MODIFIED: Save LoRA adapters correctly ---
-        if TRAIN_CONFIG['LORA_CONFIG']['enabled']:
-            # Save only the LoRA adapters and the projection head
-            model_to_save.encoder_x.base_encoder.base_model.save_pretrained(f'{MODEL_CHOICE}_lora_adapters')
-            torch.save(model_to_save.encoder_x.base_encoder.projection.state_dict(), f'{MODEL_CHOICE}_projection.pt')
-            print(f"LoRA adapters saved to '{MODEL_CHOICE}_lora_adapters' and projection head to '{MODEL_CHOICE}_projection.pt'")
-        else:
-            torch.save(model_to_save.state_dict(), f'{MODEL_CHOICE}_contrastive_model.pt')
-            print(f"Model saved to {MODEL_CHOICE}_contrastive_model.pt")
+    # Save model
+    save_model(cfg, model, rank)
 
 # ===================================================================
-# Main Entry Point (Unchanged)
+# Main Entry Point with Hydra
 # ===================================================================
-if __name__ == "__main__":
+@hydra.main(version_base=None, config_path="configs", config_name="config")
+def main(cfg: DictConfig):
+    """Main entry point with Hydra configuration."""
+
+    # Check if running in distributed mode
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         dist.init_process_group(backend="nccl")
-        rank, world_size = dist.get_rank(), dist.get_world_size()
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
         print(f"Running in distributed mode. Rank: {rank}, World Size: {world_size}")
-        train(rank, world_size, distributed=True)
+        train(cfg, rank, world_size, distributed=True)
         dist.destroy_process_group()
     else:
         print("Running in single device mode")
-        train(distributed=False)
+        train(cfg, distributed=False)
+
+if __name__ == "__main__":
+    main()
