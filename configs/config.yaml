@@ -1,11 +1,12 @@
 defaults:
   - model: qwen-1.5b  # default model choice
   - training: default
+  - dataset: lemmas_theorems
   - _self_
 
-# Dataset configuration
+# Dataset configuration overrides (if needed)
 dataset:
-  path: data/lemmas_theorems_small.jsonl
+  size: small  # Options: toy, tiny, small, medium, full
   train_ratio: 0.8
   seed: 42
 
