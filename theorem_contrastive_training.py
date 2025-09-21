@@ -144,10 +144,10 @@ class TheoremContrastiveModel(nn.Module):
 
 TRAIN_CONFIG = {
     'GLOBAL_BATCH_SIZE': 1024,    # Desired total batch size across all GPUs
-    'MICRO_BATCH_SIZE': 32,       # Micro batch size for gradient accumulation
-    'STREAM_CHUNK_SIZE': 32,      # Streaming chunk size for memory efficiency
+    'MICRO_BATCH_SIZE': 64,       # Micro batch size for gradient accumulation
+    'STREAM_CHUNK_SIZE': 64,      # Streaming chunk size for memory efficiency
     'TAU': 0.07,                 # Temperature parameter
-    'LR': 0.0001,                  # Learning rate
+    'LR': 0.00015,                  # Learning rate
     'NUM_EPOCHS': 10,            # Number of training epochs
     'MAX_LENGTH': 256,           # Max token length for BERT
     'OUTPUT_DIM': 768,           # Output embedding dimension
