@@ -32,33 +32,33 @@ The system implements a memory-efficient distributed algorithm that achieves exa
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                     Input: Mathematical Papers              │
-│                  (Theorems & Lemmas in JSONL)              │
+│                  (Theorems & Lemmas in JSONL)               │
 └────────────────────────┬────────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                    Data Processing Layer                     │
+│                    Data Processing Layer                    │
 │   • Pairs theorems/lemmas from same paper                   │
-│   • Tokenizes text (max_length: 256 tokens)                │
+│   • Tokenizes text (max_length: 256 tokens)                 │
 │   • Creates train/validation splits                         │
 └────────────────────────┬────────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                    Model Architecture                        │
-│   ┌──────────────┐              ┌──────────────┐           │
-│   │  Encoder X   │              │  Encoder Y   │           │
-│   │  (Shared)    │              │  (Shared)    │           │
-│   └──────┬───────┘              └──────┬───────┘           │
+│                    Model Architecture                       │
+│   ┌──────────────┐              ┌──────────────┐            │
+│   │  Encoder X   │              │  Encoder Y   │            │
+│   │  (Shared)    │              │  (Shared)    │            │
+│   └──────┬───────┘              └──────┬───────┘            │
 │          │                              │                   │
 │          ▼                              ▼                   │
-│   ┌──────────────┐              ┌──────────────┐           │
-│   │  Projection  │              │  Projection  │           │
-│   │   (Shared)   │              │   (Shared)   │           │
-│   └──────┬───────┘              └──────┬───────┘           │
+│   ┌──────────────┐              ┌──────────────┐            │
+│   │  Projection  │              │  Projection  │            │
+│   │   (Shared)   │              │   (Shared)   │            │
+│   └──────┬───────┘              └───────┬──────┘            │
 │          │                              │                   │
 │          ▼                              ▼                   │
-│      L2 Norm                        L2 Norm                │
+│      L2 Norm                        L2 Norm                 │
 │          │                              │                   │
 │          └──────────────┬───────────────┘                   │
 │                         │                                   │
