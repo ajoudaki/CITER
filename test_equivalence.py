@@ -9,11 +9,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import copy
 
 # Import the module to be tested
-try:
-    from distributed_clip import distributed_train_step, trivial_contrastive_step
-except ImportError:
-    print("Error: distributed_clip.py not found.")
-    sys.exit(1)
+from distributed_clip import distributed_train_step, trivial_contrastive_step
 
 # ===================================================================
 # Test Configuration
