@@ -10,6 +10,20 @@ dataset:
   train_ratio: 0.8
   seed: 42
 
+# Weights & Biases configuration
+wandb:
+  enabled: true
+  project: theorem-contrastive
+  entity: null  # Set to your wandb entity/username
+  name: null  # Run name (auto-generated if null)
+  tags:
+    - contrastive
+    - ${model.name}
+    - ${dataset.size}
+  group: null  # Group runs together
+  notes: null  # Additional notes for the run
+  mode: online  # Options: online, offline, disabled
+
 # Output configuration
 output:
   save_dir: ./outputs

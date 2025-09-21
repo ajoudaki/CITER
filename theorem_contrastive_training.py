@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 import random
-from typing import Dict
+from typing import Dict, Optional
 from tqdm import tqdm
 from pathlib import Path
 
@@ -19,6 +19,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from transformers import AutoTokenizer, AutoModel
 from peft import get_peft_model, LoraConfig, TaskType
+import wandb
 
 # Import distributed functions
 from distributed_clip import distributed_train_step, trivial_contrastive_step, distributed_validate_step
@@ -126,12 +127,54 @@ class TheoremContrastiveModel(nn.Module):
 # ===================================================================
 # Helper Functions
 # ===================================================================
+def init_wandb(cfg: DictConfig, rank: int = 0) -> Optional[object]:
+    """Initialize Weights & Biases logging."""
+    if not cfg.wandb.enabled or rank != 0:
+        return None
+
+    # Resolve interpolations in tags
+    tags = OmegaConf.to_container(cfg.wandb.tags, resolve=True)
+
+    # Auto-generate run name if not provided
+    run_name = cfg.wandb.name
+    if run_name is None:
+        run_name = f"{cfg.model.name}_{cfg.dataset.size}_bs{cfg.training.global_batch_size[0] if OmegaConf.is_list(cfg.training.global_batch_size) else cfg.training.global_batch_size}"
+
+    # Initialize wandb
+    run = wandb.init(
+        project=cfg.wandb.project,
+        entity=cfg.wandb.entity,
+        name=run_name,
+        tags=tags,
+        group=cfg.wandb.group,
+        notes=cfg.wandb.notes,
+        mode=cfg.wandb.mode,
+        config=OmegaConf.to_container(cfg, resolve=True)
+    )
+
+    print(f"Weights & Biases initialized: {wandb.run.url}")
+    return run
+
+def log_metrics(metrics: Dict, step: int, prefix: str = ""):
+    """Log metrics to wandb if enabled."""
+    if wandb.run is not None:
+        log_dict = {f"{prefix}/{k}" if prefix else k: v for k, v in metrics.items()}
+        wandb.log(log_dict, step=step)
+
 def print_trainable_parameters(model):
     """Prints the number of trainable parameters in the model."""
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     all_param = sum(p.numel() for p in model.parameters())
     print(f"trainable params: {trainable_params:,} || all params: {all_param:,} || "
           f"trainable%: {100 * trainable_params / all_param:.2f}")
+
+    # Log to wandb
+    if wandb.run is not None:
+        wandb.config.update({
+            "trainable_params": trainable_params,
+            "total_params": all_param,
+            "trainable_percent": 100 * trainable_params / all_param
+        })
 
 def setup_model(cfg: DictConfig, device):
     """Setup model with optional LoRA."""
@@ -242,6 +285,9 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
     if distributed:
         torch.cuda.set_device(rank)
 
+    # Initialize wandb (only on rank 0)
+    wandb_run = init_wandb(cfg, rank)
+
     if rank == 0:
         print(f"Configuration:\n{OmegaConf.to_yaml(cfg)}")
         print(f"Using model: {cfg.model.model_name} with {cfg.model.model_type} strategy.")
@@ -302,6 +348,9 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
     # Prepare validation data
     val_x_packed, val_y_packed = prepare_validation_data(val_dataset, device, distributed, rank)
 
+    # Track global step for wandb
+    global_step = 0
+
     # Training loop
     for epoch in range(cfg.training.num_epochs):
         # Get batch size for current epoch
@@ -354,8 +403,16 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
 
             total_loss += loss
             num_batches += 1
+            global_step += 1
+
+            # Log training metrics
             if rank == 0:
                 pbar.set_postfix(loss=f'{loss:.4f}')
+                log_metrics({
+                    'loss': loss,
+                    'learning_rate': cfg.training.lr,
+                    'batch_size': actual_batch_size
+                }, step=global_step, prefix='train')
 
         # Validation
         N_val = val_x_packed.shape[0]
@@ -388,11 +445,31 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
             print(f"  Top@5 Acc:  {topk_acc.get(5, 0)*100:.2f}%")
             print(f"  Top@10 Acc: {topk_acc.get(10, 0)*100:.2f}%\n")
 
+            # Log validation metrics
+            log_metrics({
+                'loss': val_loss,
+                'mrr': topk_acc.get('MRR', 0),
+                'top1_acc': topk_acc.get(1, 0),
+                'top5_acc': topk_acc.get(5, 0),
+                'top10_acc': topk_acc.get(10, 0)
+            }, step=global_step, prefix='val')
+
+            # Log epoch summary
+            log_metrics({
+                'epoch': epoch + 1,
+                'avg_train_loss': avg_train_loss,
+                'epoch_batch_size': epoch_batch_size
+            }, step=global_step)
+
         if distributed:
             dist.barrier()
 
     # Save model
     save_model(cfg, model, rank)
+
+    # Close wandb
+    if wandb_run is not None:
+        wandb.finish()
 
 # ===================================================================
 # Main Entry Point with Hydra
