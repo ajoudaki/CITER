@@ -1,194 +1,524 @@
+# Mathematical Theorem Contrastive Learning System
 
-###  Guide: `distributed_clip.py` Interface
+## Table of Contents
+1. [Overview](#overview)
+2. [High-Level Architecture](#high-level-architecture)
+3. [Quick Start](#quick-start)
+4. [Configuration System](#configuration-system)
+5. [Model Architecture](#model-architecture)
+6. [Distributed Training Algorithm](#distributed-training-algorithm)
+7. [Advanced Usage](#advanced-usage)
+8. [Monitoring & Logging](#monitoring--logging)
+9. [Implementation Details](#implementation-details)
 
-This guide explains how to use the `distributed_clip.py` module for efficient, large-batch contrastive training in a PyTorch Distributed Data Parallel (DDP) environment.
+## Overview
 
-#### Overview
+This project implements a state-of-the-art contrastive learning system for mathematical theorems and lemmas. Using CLIP-style symmetric contrastive learning, the system learns to create embeddings where theorems/lemmas from the same mathematical paper are close in the embedding space, while those from different papers are far apart.
 
-The module provides a function, `distributed_train_step`, which performs a single optimization step for symmetric contrastive learning (e.g., CLIP). It is designed to handle the complexities of distributed computation, memory efficiency for large batches, and correct gradient synchronization, allowing users to scale training effectively.
+### Key Goals
+- **Learn semantic relationships** between mathematical statements through self-supervised learning
+- **Scale efficiently** to large batches (1024+) using distributed training
+- **Minimize memory footprint** through streaming computation techniques
+- **Support multiple model architectures** (BERT, Qwen, etc.) with LoRA fine-tuning
 
-#### Prerequisites
+### Core Innovation
+The system implements a memory-efficient distributed algorithm that achieves exact mathematical equivalence to global batch computation while:
+- Limiting synchronization to only 2 points (vs. continuous communication)
+- Avoiding O(N²) memory complexity through streaming
+- Supporting gradient accumulation for large effective batch sizes
 
-1.  **Environment:** Requires PyTorch and a CUDA-enabled environment.
-2.  **Execution:** Training must be launched using `torchrun`.
-3.  **DDP Setup:** The distributed process group (`torch.distributed.init_process_group`) must be initialized before calling the training functions.
+## High-Level Architecture
 
-#### Interface: `distributed_train_step`
-
-```python
-from distributed_clip import distributed_train_step
-
-def distributed_train_step(
-    model: torch.nn.Module, 
-    optimizer: torch.optim.Optimizer, 
-    local_x: torch.Tensor, 
-    local_y: torch.Tensor, 
-    config: Dict
-) -> float:
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Input: Mathematical Papers              │
+│                  (Theorems & Lemmas in JSONL)              │
+└────────────────────────┬────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    Data Processing Layer                     │
+│   • Pairs theorems/lemmas from same paper                   │
+│   • Tokenizes text (max_length: 256 tokens)                │
+│   • Creates train/validation splits                         │
+└────────────────────────┬────────────────────────────────────┘
+                         │
+                         ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    Model Architecture                        │
+│   ┌──────────────┐              ┌──────────────┐           │
+│   │  Encoder X   │              │  Encoder Y   │           │
+│   │  (Shared)    │              │  (Shared)    │           │
+│   └──────┬───────┘              └──────┬───────┘           │
+│          │                              │                   │
+│          ▼                              ▼                   │
+│   ┌──────────────┐              ┌──────────────┐           │
+│   │  Projection  │              │  Projection  │           │
+│   │   (Shared)   │              │   (Shared)   │           │
+│   └──────┬───────┘              └──────┬───────┘           │
+│          │                              │                   │
+│          ▼                              ▼                   │
+│      L2 Norm                        L2 Norm                │
+│          │                              │                   │
+│          └──────────────┬───────────────┘                   │
+│                         │                                   │
+│                         ▼                                   │
+│              Symmetric InfoNCE Loss                         │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-##### Parameters
+## Quick Start
 
-  * **`model`** (`torch.nn.Module`): The contrastive model. See Model Requirements below.
-  * **`optimizer`** (`torch.optim.Optimizer`): The optimizer (e.g., AdamW, SGD).
-  * **`local_x`**, **`local_y`** (`torch.Tensor`): The local data chunks assigned to the current GPU rank. If the global batch size is $N$ and there are $P$ GPUs, these tensors have a batch dimension of $N/P$.
-  * **`config`** (`Dict`): A dictionary containing the following keys:
-      * `'GLOBAL_BATCH_SIZE'` (N): The total effective batch size across all GPUs.
-      * `'MICRO_BATCH_SIZE'` (B): The size of microbatches used for local processing (gradient accumulation).
-      * `'STREAM_CHUNK_SIZE'` (M): The chunk size used for streaming the similarity matrix calculations (memory optimization parameter).
-      * `'TAU'` ($\tau$): The temperature parameter for the contrastive loss.
+### Installation
+```bash
+# Install dependencies
+pip install torch transformers peft hydra-core wandb tqdm
 
-##### Returns
+# Clone the repository
+git clone <repository-url>
+cd paperGPT
+```
 
-  * `float`: The calculated global batch loss value, suitable for logging during training.
+### Basic Training
 
-#### Model Requirements
+#### Single GPU
+```bash
+python theorem_contrastive_training.py
+```
 
-Your PyTorch model must adhere to a specific interface:
+#### Multi-GPU (Distributed)
+```bash
+# Using 2 GPUs
+torchrun --nproc_per_node=2 theorem_contrastive_training.py
 
-1.  **DDP Wrapping:** The model must be wrapped in `torch.nn.parallel.DistributedDataParallel` (DDP).
-2.  **Forward Method:** The model's `forward` method must accept `(x, y)` and return normalized embeddings `(z_x, z_y)`. Embeddings **must** be L2 normalized.
-3.  **Encoder Access:** The underlying module (i.e., `model.module` when DDP wrapped) must expose the two encoders as attributes named `encoder_x` and `encoder_y`.
+# Using 4 GPUs with custom config
+torchrun --nproc_per_node=4 theorem_contrastive_training.py \
+    dataset.size=small \
+    training.global_batch_size=512 \
+    training.num_epochs=10
+```
 
-**Example Model Structure:**
+### Quick Configurations
 
+```bash
+# Use tiny dataset for testing
+python theorem_contrastive_training.py dataset.size=tiny
+
+# Disable wandb logging
+python theorem_contrastive_training.py wandb.mode=disabled
+
+# Use different model
+python theorem_contrastive_training.py model=bert-base
+
+# Custom batch size and learning rate
+python theorem_contrastive_training.py \
+    training.global_batch_size=256 \
+    training.lr=1e-4
+```
+
+## Configuration System
+
+The project uses Hydra for configuration management with a hierarchical structure:
+
+### Configuration Hierarchy
+```
+configs/
+├── config.yaml           # Main config with defaults
+├── dataset/
+│   └── lemmas_theorems.yaml  # Dataset configurations
+├── model/
+│   ├── bert-base.yaml    # BERT model config
+│   └── qwen-1.5b.yaml    # Qwen model config
+└── training/
+    ├── default.yaml      # Default training params
+    └── small_model.yaml  # Lightweight config
+```
+
+### Key Configuration Parameters
+
+#### Dataset Configuration (`configs/dataset/`)
+```yaml
+name: lemmas_theorems
+size: small  # Options: toy, tiny, small, medium, full
+train_ratio: 0.8
+seed: 42
+
+# Dataset sizes:
+# toy:    ~20MB  - Quick testing
+# tiny:   ~4MB   - Very small subset
+# small:  ~40MB  - Development
+# medium: ~400MB - Medium scale
+# full:   ~1.7GB - Complete dataset
+```
+
+#### Model Configuration (`configs/model/`)
+```yaml
+# Example: bert-base.yaml
+name: bert-base
+model_name: bert-base-uncased
+model_type: cls_pooling  # or last_token_pooling
+hidden_dim: 768
+lora_target_modules: ["query", "key", "value"]
+```
+
+#### Training Configuration (`configs/training/`)
+```yaml
+global_batch_size: [64, 64, 1024]  # Can be list for scheduling
+micro_batch_size: 6     # Per-GPU batch for gradient accumulation
+stream_chunk_size: 256  # Memory optimization parameter
+tau: 0.07              # Temperature for contrastive loss
+lr: 2e-4
+num_epochs: 20
+max_length: 256        # Max token length
+output_dim: 2048       # Embedding dimension
+
+# LoRA configuration
+lora:
+  enabled: true
+  r: 8                 # LoRA rank
+  lora_alpha: 16
+  lora_dropout: 0.05
+```
+
+### Dynamic Batch Size Scheduling
+
+The system supports dynamic batch size scheduling for curriculum learning:
+```yaml
+# Gradually increase batch size across epochs
+global_batch_size: [64, 64, 1024]
+# Epoch 1-2: batch_size = 64
+# Epoch 3+:  batch_size = 1024
+```
+
+## Model Architecture
+
+### Encoder Types
+
+#### 1. CLS Pooling Encoder
+Uses the [CLS] token embedding (BERT-style):
 ```python
-import torch.nn as nn
-import torch.nn.functional as F
+class CLSPoolingEncoder:
+    def forward(self, input_ids, attention_mask):
+        outputs = base_model(input_ids, attention_mask)
+        cls_embedding = outputs.last_hidden_state[:, 0, :]
+        return normalize(projection(cls_embedding))
+```
 
-class MyContrastiveModel(nn.Module):
-    def __init__(self, encoder1, encoder2):
+#### 2. Last Token Encoder
+Uses the last non-padding token (GPT-style):
+```python
+class LastTokenEncoder:
+    def forward(self, input_ids, attention_mask):
+        outputs = base_model(input_ids, attention_mask)
+        last_positions = attention_mask.sum(dim=1) - 1
+        last_token = outputs[range(batch), last_positions]
+        return normalize(projection(last_token))
+```
+
+### Parameter Sharing
+Both encoders (X and Y) share the same weights for efficiency:
+```python
+self.encoder_x = base_encoder
+self.encoder_y = self.encoder_x  # Shared parameters
+```
+
+### LoRA Integration
+When enabled, LoRA adapters are applied to specified modules:
+- **BERT**: targets `["query", "key", "value"]`
+- **Qwen**: targets `["q_proj", "v_proj", "k_proj", "o_proj"]`
+
+Only LoRA parameters and projection layers are trainable, keeping base model frozen.
+
+## Distributed Training Algorithm
+
+### Overview
+The distributed algorithm implements a 5-phase approach that achieves exact mathematical equivalence to global batch training while minimizing memory usage and synchronization overhead.
+
+### Mathematical Foundation
+
+Given N paired samples {(x_i, y_i)}, the symmetric InfoNCE loss is:
+
+```
+L = 1/2N Σ[-log P_ii - log Q_ii]
+```
+
+Where:
+- S = (1/τ) * Z_x @ Z_y^T  (similarity matrix)
+- P = softmax_row(S)
+- Q = softmax_col(S)
+
+### The 5-Phase Algorithm
+
+#### Phase A: Forward & Sync 1 (All-Gather)
+```python
+# Each GPU computes local embeddings
+local_Z_x = encoder_x(local_data_x)  # No gradients
+local_Z_y = encoder_y(local_data_y)
+
+# Synchronization Point 1: All-Gather
+global_Z_x = all_gather(local_Z_x).detach()
+global_Z_y = all_gather(local_Z_y).detach()
+```
+
+#### Phase B: Global Loss (Streaming)
+```python
+# Compute log-normalizers without materializing S
+for chunk in stream_chunks(global_Z_x, M):
+    S_chunk = chunk @ global_Z_y.T / tau
+    a[chunk_idx] = logsumexp(S_chunk, dim=1)
+    # S_chunk is discarded
+
+# Similarly for column normalizers (b)
+loss = (a.sum() + b.sum() - 2*diag.sum()) / 2N
+```
+
+#### Phase C: Gradient Precomputation (Streaming)
+```python
+# Compute embedding gradients G_x, G_y
+for microbatch in local_data:
+    for chunk in stream_chunks(global_data, M):
+        S_chunk = microbatch @ chunk.T / tau
+        P_chunk = exp(S_chunk - a)
+        accumulate(P_chunk @ chunk)
+    G_x[microbatch] = accumulated_gradient
+```
+
+#### Phase D: VJP & Backpropagation
+```python
+# Recompute with gradients enabled
+Z_x_grad = encoder_x(microbatch_x)  # With gradients
+Z_y_grad = encoder_y(microbatch_y)
+
+# Surrogate loss for VJP
+surrogate_loss = (Z_x_grad * G_x).sum() + (Z_y_grad * G_y).sum()
+scaled_loss = surrogate_loss * world_size  # Compensate for DDP averaging
+scaled_loss.backward()
+```
+
+#### Phase E: Sync 2 (All-Reduce)
+```python
+# DDP automatically performs All-Reduce
+# Gradients are averaged across GPUs
+optimizer.step()
+```
+
+### Memory Efficiency
+
+The streaming approach ensures:
+- **Space Complexity**: O(N*d + M*N/P) instead of O(N²)
+- **Only 2 sync points** vs continuous communication
+- **Exact gradients** - mathematically equivalent to global batch
+
+Key parameters:
+- `STREAM_CHUNK_SIZE (M)`: Controls memory vs computation trade-off
+- `MICRO_BATCH_SIZE (B)`: Controls gradient accumulation granularity
+
+## Advanced Usage
+
+### Custom Model Integration
+
+To add a new model type:
+
+1. Create encoder class:
+```python
+class CustomEncoder(nn.Module):
+    def __init__(self, model_name, hidden_dim, output_dim):
         super().__init__()
-        # Must be named encoder_x and encoder_y
-        self.encoder_x = encoder1 
-        self.encoder_y = encoder2
+        self.base_model = load_your_model(model_name)
+        self.projection = nn.Linear(hidden_dim, output_dim)
 
-    def forward(self, x, y):
-        z_x = self.encoder_x(x)
-        z_y = self.encoder_y(y)
-        # Ensure embeddings are normalized
-        z_x = F.normalize(z_x, p=2, dim=-1)
-        z_y = F.normalize(z_y, p=2, dim=-1)
-        return z_x, z_y
+    def forward(self, input_ids, attention_mask):
+        features = self.base_model(input_ids, attention_mask)
+        return F.normalize(self.projection(features), p=2, dim=-1)
 ```
 
-#### Example Usage (Training Loop)
+2. Register in `ENCODER_REGISTRY`:
+```python
+ENCODER_REGISTRY = {
+    'custom_pooling': CustomEncoder,
+    # ... other encoders
+}
+```
+
+3. Create config file `configs/model/custom.yaml`:
+```yaml
+name: custom
+model_name: path/to/model
+model_type: custom_pooling
+hidden_dim: 1024
+lora_target_modules: ["attention", "mlp"]
+```
+
+### Performance Tuning
+
+#### Batch Size Selection
+- Start with `global_batch_size = 8 * num_gpus` for testing
+- Scale up gradually: [64, 256, 1024]
+- Monitor GPU memory with larger batches
+
+#### Stream Chunk Size
+- Smaller values (128-256): Less memory, more computation
+- Larger values (512-1024): More memory, less computation
+- Default 256 works well for most cases
+
+#### Gradient Accumulation
+```bash
+# Large effective batch with limited GPU memory
+python theorem_contrastive_training.py \
+    training.global_batch_size=1024 \
+    training.micro_batch_size=4  # Only 4 samples per GPU at once
+```
+
+### Multi-Node Training
+
+For training across multiple nodes:
+```bash
+# On node 0
+torchrun --nproc_per_node=4 --nnodes=2 --node_rank=0 \
+    --master_addr=<node0_ip> --master_port=29500 \
+    theorem_contrastive_training.py
+
+# On node 1
+torchrun --nproc_per_node=4 --nnodes=2 --node_rank=1 \
+    --master_addr=<node0_ip> --master_port=29500 \
+    theorem_contrastive_training.py
+```
+
+## Monitoring & Logging
+
+### Weights & Biases Integration
+
+The system integrates with W&B for experiment tracking:
+
+```bash
+# Login (one-time)
+wandb login
+
+# Run with logging
+python theorem_contrastive_training.py \
+    wandb.project=my-experiments \
+    wandb.name=baseline-run
+```
+
+#### Logged Metrics
+- **Training**: loss, learning_rate, batch_size (per step)
+- **Validation**: loss, MRR, top-1/5/10 accuracy (per epoch)
+- **Model**: trainable_params, total_params, trainable_percent
+- **System**: GPU utilization, memory usage
+
+#### Offline Mode
+```bash
+# Train offline
+python theorem_contrastive_training.py wandb.mode=offline
+
+# Sync later
+wandb sync
+```
+
+### Output Structure
+```
+outputs/
+├── 2024-01-15/
+│   └── 14-30-00/
+│       ├── .hydra/           # Hydra configs
+│       ├── theorem_contrastive_training.log
+│       ├── qwen-1.5b_lora_adapters/  # Saved LoRA
+│       └── qwen-1.5b_projection.pt   # Projection layer
+```
+
+## Implementation Details
+
+### Numerical Stability
+
+The implementation ensures numerical stability through:
+
+1. **LogSumExp for normalizers**: Prevents overflow in softmax
+```python
+a = torch.logsumexp(S, dim=1)  # Instead of log(sum(exp(S)))
+```
+
+2. **Detached operations**: Prevents gradient graph explosion
+```python
+global_Z = all_gather(local_Z).detach()
+```
+
+3. **Streaming computation**: Avoids large intermediate tensors
+
+### Gradient Correctness
+
+The algorithm guarantees exact gradients through:
+
+1. **Vector-Jacobian Product (VJP)**: Separates gradient computation from backprop
+2. **Loss scaling**: Compensates for DDP averaging
+3. **Proper synchronization**: All-Gather for embeddings, All-Reduce for gradients
+
+### Error Recovery
+
+The system includes robustness features:
 
 ```python
-# Assuming DDP is initialized, model is wrapped, optimizer is set up, 
-# and dataloader with DistributedSampler is ready.
+# Checkpoint saving
+if epoch % save_interval == 0:
+    save_checkpoint(model, optimizer, epoch)
 
-# Define configuration
-TRAIN_CONFIG = { ... }
-
-# Training loop
-for epoch in range(num_epochs):
-    dataloader.sampler.set_epoch(epoch)
-    for batch_idx, (local_x, local_y) in enumerate(dataloader):
-        local_x = local_x.to(device)
-        local_y = local_y.to(device)
-
-        # Perform the distributed training step
-        loss = distributed_train_step(
-            model, optimizer, local_x, local_y, TRAIN_CONFIG
-        )
-
-        if dist.get_rank() == 0:
-            print(f"Epoch {epoch}, Step {batch_idx}, Loss: {loss:.4f}")
+# Automatic mixed precision (if enabled)
+with autocast():
+    loss = distributed_train_step(...)
 ```
 
------
+### Testing & Validation
 
-### In-Depth Mathematical Description of the Distributed Algorithm
+Run the test suite:
+```bash
+# Test gradient equivalence
+python test_equivalence.py
 
-This document provides a rigorous, self-contained mathematical description of the implemented distributed symmetric contrastive learning algorithm. The method ensures exact mathematical equivalence to a global batch computation while minimizing synchronization overhead and memory footprint.
+# Analyze token lengths for dataset
+python analyze_lengths.py
+```
 
-#### 1. Problem Formulation
+## Troubleshooting
 
-We aim to optimize a model parameterized by $\theta$ using a global batch of $N$ paired samples ${(x_i, y_i)}_{i=1}^N$. The model produces unit-norm embeddings $Z_x, Z_y \in \mathbb{R}^{N \times d}$.
+### Common Issues
 
-The similarity matrix $S \in \mathbb{R}^{N \times N}$ is defined as $S = \frac{1}{\tau} Z_x Z_y^\top$.
-We define row-softmax $P = \mathrm{softmax}*{\text{row}}(S)$ and column-softmax $Q = \mathrm{softmax}*{\text{col}}(S)$.
+#### OOM Errors
+- Reduce `micro_batch_size`
+- Reduce `stream_chunk_size`
+- Enable gradient checkpointing
 
-The objective is the symmetric InfoNCE loss:
+#### Slow Training
+- Increase `stream_chunk_size` if memory allows
+- Ensure data loading isn't bottleneck (`num_workers`)
+- Check network bandwidth for multi-node
 
-$$\mathcal{L}(\theta) = \frac{1}{2N} \sum_{i=1}^N \left( -\log P_{ii} - \log Q_{ii} \right)$$
+#### NaN Loss
+- Reduce learning rate
+- Check for empty/corrupted data samples
+- Ensure embeddings are normalized
 
-#### 2. Gradient Derivation and Strategy
+### Debug Mode
+```bash
+# Verbose logging
+HYDRA_FULL_ERROR=1 python theorem_contrastive_training.py \
+    hydra.verbose=true
+```
 
-The optimization relies on the gradients of $\mathcal{L}$ with respect to the embeddings:
+## Citation
 
-$$G_x = \frac{\partial \mathcal{L}}{\partial Z_x} = \frac{1}{2N\tau} \left( P Z_y + Q Z_y - 2 Z_y \right)$$
-$$G_y = \frac{\partial \mathcal{L}}{\partial Z_y} = \frac{1}{2N\tau} \left( P^\top Z_x + Q^\top Z_x - 2 Z_x \right)$$
+If you use this codebase, please cite:
+```bibtex
+@software{theorem_contrastive_2024,
+  title={Distributed Contrastive Learning for Mathematical Theorems},
+  author={Your Name},
+  year={2024},
+  url={repository-url}
+}
+```
 
-The core strategy is to decouple the calculation of these embedding gradients ($G_x, G_y$), which require global information, from the backpropagation to the parameters ($\nabla_\theta \mathcal{L}$), using the Vector-Jacobian Product (VJP).
+## License
 
-#### 3. The 5-Phase Distributed Algorithm
+[Specify your license here]
 
-The computation is distributed across $P$ GPUs, each handling a local chunk $I_g$ of size $C=N/P$. The algorithm avoids $O(N^2)$ memory complexity and limits synchronization to two points.
+---
 
-##### Phase A: Forward Embeddings and Synchronization 1 (All-Gather)
-
-1.  **Local Forward:** Each GPU $g$ computes its local embeddings ${z_i^x, z_i^y}_{i\in I_g}$ without gradient tracking (`no_grad`).
-2.  **Synchronization 1:** An All-Gather operation collects these local embeddings. Every GPU now possesses the full, detached global matrices $Z_x$ and $Z_y$.
-
-##### Phase B: Global Normalizers and Loss Calculation (Streaming)
-
-We require the log-normalizers (LogSumExp) for $P$ and $Q$:
-$$a_i = \log \sum_j \exp(S_{ij}) \quad \text{(Row LSE)} \qquad b_j = \log \sum_i \exp(S_{ij}) \quad \text{(Column LSE)}$$
-
-**Memory Efficiency (Streaming):** To avoid materializing $S$, we compute $a$ and $b$ by streaming over blocks of size $M$. For row blocks $R$:
-$S_{R,:} = (Z_x[R] @ Z_y^\top)/\tau$
-$a_R = \text{logsumexp}(S_{R,:}, \text{dim}=1)$
-$S_{R,:}$ is discarded after use.
-
-**Global Loss Calculation:**
-We can express the loss $\mathcal{L}$ using the normalizers, as $\log P_{ii} = S_{ii} - a_i$ and $\log Q_{ii} = S_{ii} - b_i$:
-
-$$\mathcal{L} = \frac{1}{2N} \sum_{i=1}^N \left( (a_i - S_{ii}) + (b_i - S_{ii}) \right) = \frac{1}{2N} \sum_{i=1}^N \left( a_i + b_i - 2S_{ii} \right)$$
-
-The diagonal elements $S_{ii} = \frac{1}{\tau} (z_i^x \cdot z_i^y)$ are computed efficiently. Since $Z_x, Z_y, a, b$ are globally available, this loss calculation requires no further communication.
-
-##### Phase C: Local Gradient Precomputation (Streaming)
-
-On GPU $g$, we process a microbatch $M \subset I_g$ (size $B$) to compute $G_x[M]$ and $G_y[M]$.
-
-**Memory Efficiency (Streaming):** We must avoid materializing the $B \times N$ probability slices (e.g., $P_{M,:}$). We leverage the distributive property and stream over the global dimension $N$ in chunks $C'$:
-
-$$(P Z_y)*M = P*{M,:} Z_y = \sum_{\text{Chunks } C'} P_{M,C'} Z_y[C']$$
-
-In each streaming step:
-
-1.  Compute similarity slice $S_{M,C'}$.
-2.  Compute probability slice $P_{M,C'} = \exp(S_{M,C'} - a_M \mathbf{1}^\top)$ using precomputed $a_M$.
-3.  Accumulate $P_{M,C'} @ Z_y[C']$.
-4.  Discard $S_{M,C'}$ and $P_{M,C'}$.
-
-This results in the detached embedding gradients $G_x[M]$ and $G_y[M]$.
-
-##### Phase D: Recomputation and Vector-Jacobian Product (VJP)
-
-We now compute the parameter gradients $\frac{\partial \mathcal{L}}{\partial \theta}$ using the precomputed $G[M]$.
-
-1.  **Recomputation:** Rerun the encoders on the microbatch $M$ *with gradient tracking*, yielding $Z'[M]$ tied to the computation graph.
-2.  **VJP via Surrogate Loss:** Define a surrogate loss $\mathcal{L}_M$:
-
-$$\mathcal{L}_M = \langle Z_x'[M], G_x[M] \rangle + \langle Z_y'[M], G_y[M] \rangle$$
-
-Calling `backward()` on $\mathcal{L}_M$ computes the exact local parameter gradient for this microbatch via the chain rule.
-
-##### Phase E: Synchronization 2 (All-Reduce) and Loss Scaling
-
-We must aggregate local parameter gradients. The global loss $\mathcal{L}$ definition includes a $1/N$ factor, which is already incorporated into $G_x$ and $G_y$. Therefore, the global parameter gradient is the **SUM** of the local gradients.
-
-PyTorch DDP, by default, performs an All-Reduce with an **AVERAGE** operation (dividing by $P$).
-
-**Loss Scaling:** To achieve a SUM using DDP's averaging mechanism, we scale the surrogate loss by $P$ in Phase D before backpropagation:
-
-$\mathcal{L}_M^{\text{Scaled}} = P \cdot \mathcal{L}_M$
-
-**Synchronization 2:** DDP performs the All-Reduce (Sync Point 2). The resulting synchronized gradient is:
-
-$\nabla_\theta \mathcal{L} = \underbrace{\frac{1}{P}}*{\text{DDP Avg.}} \sum*{g=1}^P \frac{\partial \mathcal{L}*{M_g}^{\text{Scaled}}}{\partial \theta} = \frac{1}{P} \sum*{g=1}^P \left( P \cdot \frac{\partial \mathcal{L}*{M_g}}{\partial \theta} \right) = \sum*{g=1}^P \frac{\partial \mathcal{L}_{M_g}}{\partial \theta}$
-
-This yields the exact global gradient, ensuring mathematical equivalence. The optimizer then updates the parameters.
+*For questions or issues, please open a GitHub issue or contact the maintainers.*
