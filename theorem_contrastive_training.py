@@ -106,6 +106,7 @@ TRAIN_CONFIG = {
     'NUM_EPOCHS': 10,
     'MAX_LENGTH': 256,
     'OUTPUT_DIM': 768,
+    'DROP_LAST': True,  # Skip incomplete batches smaller than GLOBAL_BATCH_SIZE
 }
 
 # ===================================================================
@@ -123,7 +124,9 @@ def train(rank: int = 0, world_size: int = 1, distributed: bool = False):
     batch_size = TRAIN_CONFIG['GLOBAL_BATCH_SIZE'] // world_size if distributed else TRAIN_CONFIG['GLOBAL_BATCH_SIZE']
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True) if distributed else None
     
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler, shuffle=(train_sampler is None), num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=train_sampler,
+                             shuffle=(train_sampler is None), num_workers=4, pin_memory=True,
+                             drop_last=TRAIN_CONFIG['DROP_LAST'])
     
     bert_encoder = BERTEncoder(output_dim=TRAIN_CONFIG['OUTPUT_DIM'])
     model = TheoremContrastiveModel(bert_encoder, max_length=TRAIN_CONFIG['MAX_LENGTH']).to(device)
@@ -169,11 +172,18 @@ def train(rank: int = 0, world_size: int = 1, distributed: bool = False):
             y_packed = torch.cat([batch['input_ids_y'].to(device), batch['attention_mask_y'].to(device)], dim=1)
 
             actual_batch_size = x_packed.shape[0] * (world_size if distributed else 1)
+
+            # Skip batch if it's smaller than GLOBAL_BATCH_SIZE and DROP_LAST is True
+            if TRAIN_CONFIG['DROP_LAST'] and actual_batch_size < TRAIN_CONFIG['GLOBAL_BATCH_SIZE']:
+                if rank == 0:
+                    print(f"Skipping incomplete batch of size {actual_batch_size} (< {TRAIN_CONFIG['GLOBAL_BATCH_SIZE']})")
+                continue
+
             config_copy = TRAIN_CONFIG.copy()
             config_copy['GLOBAL_BATCH_SIZE'] = actual_batch_size
-            
+
             loss = distributed_train_step(model, optimizer, x_packed, y_packed, config_copy) if distributed else trivial_contrastive_step(model, optimizer, x_packed, y_packed, config_copy)
-            
+
             total_loss += loss
             num_batches += 1
             if rank == 0: pbar.set_postfix(loss=f'{loss:.4f}')
