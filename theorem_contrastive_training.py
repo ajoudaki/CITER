@@ -210,6 +210,7 @@ def train(rank: int = 0, world_size: int = 1, distributed: bool = False):
             print(f"\nEpoch [{epoch+1}/{TRAIN_CONFIG['NUM_EPOCHS']}] Summary:")
             print(f"  Train Loss: {avg_train_loss:.4f}")
             print(f"  Val Loss:   {val_loss:.4f}")
+            print(f"  MRR:        {topk_acc.get('MRR', 0):.4f}")
             print(f"  Top@1 Acc:  {topk_acc.get(1, 0)*100:.2f}%")
             print(f"  Top@5 Acc:  {topk_acc.get(5, 0)*100:.2f}%")
             print(f"  Top@10 Acc: {topk_acc.get(10, 0)*100:.2f}%\n")

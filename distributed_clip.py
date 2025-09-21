@@ -225,12 +225,14 @@ def distributed_validate_step(
         # Compute similarities for the local chunk of x against all y
         S_local = torch.matmul(local_Z_x, Z_y.T) / TAU
         
-        # Get top-k predictions
+        # Get top-k predictions (need enough for MRR calculation)
         k_vals = [1, 5, 10]
         max_k = min(max(k_vals), N)
-        _, topk_indices = S_local.topk(k=max_k, dim=1)
+        # Get enough predictions to find rank of correct item (up to N)
+        topk_for_mrr = min(N, S_local.shape[1])
+        _, topk_indices = S_local.topk(k=topk_for_mrr, dim=1)
 
-        # Count correct predictions locally
+        # Count correct predictions locally for top-k accuracy
         correct_counts = []
         for k in k_vals:
             if k > max_k:
@@ -239,13 +241,29 @@ def distributed_validate_step(
             correct = (topk_indices[:, :k] == labels.unsqueeze(1)).any(dim=1).sum()
             correct_counts.append(correct.item())
 
-        # --- Sync Point 2: Aggregate counts from all GPUs ---
-        correct_counts_tensor = torch.tensor(correct_counts, device=local_x.device, dtype=torch.float32)
+        # Calculate reciprocal ranks locally
+        reciprocal_ranks = []
+        for i in range(C):
+            # Find position of correct label in top-k predictions
+            positions = (topk_indices[i] == labels[i]).nonzero(as_tuple=True)[0]
+            if len(positions) > 0:
+                rank = positions[0].item() + 1  # Rank is 1-indexed
+                reciprocal_ranks.append(1.0 / rank)
+            else:
+                reciprocal_ranks.append(0.0)  # Correct item not in top-k
+
+        # --- Sync Point 2: Aggregate counts and MRR from all GPUs ---
+        local_mrr_sum = sum(reciprocal_ranks)
+        metrics_tensor = torch.tensor(correct_counts + [local_mrr_sum], device=local_x.device, dtype=torch.float32)
         if P > 1:
-            dist.all_reduce(correct_counts_tensor, op=dist.ReduceOp.SUM)
-        
-        total_correct = correct_counts_tensor.cpu().numpy()
+            dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
+
+        total_metrics = metrics_tensor.cpu().numpy()
+        total_correct = total_metrics[:len(k_vals)]
+        total_mrr_sum = total_metrics[-1]
+
         topk_acc = {k: count / N for k, count in zip(k_vals, total_correct)}
+        topk_acc['MRR'] = total_mrr_sum / N  # Mean Reciprocal Rank
 
     return global_loss, topk_acc
 
