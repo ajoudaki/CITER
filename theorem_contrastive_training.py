@@ -140,6 +140,13 @@ def init_wandb(cfg: DictConfig, rank: int = 0) -> Optional[object]:
     if run_name is None:
         run_name = f"{cfg.model.name}_{cfg.dataset.size}_bs{cfg.training.global_batch_size[0] if OmegaConf.is_list(cfg.training.global_batch_size) else cfg.training.global_batch_size}"
 
+    # Convert config to dict, handling ListConfig properly
+    config_dict = OmegaConf.to_container(cfg, resolve=True)
+
+    # Convert ListConfig to regular list for JSON serialization
+    if isinstance(config_dict.get('training', {}).get('global_batch_size'), list):
+        config_dict['training']['global_batch_size'] = list(config_dict['training']['global_batch_size'])
+
     # Initialize wandb
     run = wandb.init(
         project=cfg.wandb.project,
@@ -149,7 +156,7 @@ def init_wandb(cfg: DictConfig, rank: int = 0) -> Optional[object]:
         group=cfg.wandb.group,
         notes=cfg.wandb.notes,
         mode=cfg.wandb.mode,
-        config=OmegaConf.to_container(cfg, resolve=True)
+        config=config_dict
     )
 
     print(f"Weights & Biases initialized: {wandb.run.url}")
@@ -195,12 +202,15 @@ def setup_model(cfg: DictConfig, device):
             param.requires_grad = False
 
         # Create LoRA config
+        # Convert target_modules to list if it's a ListConfig
+        target_modules = list(cfg.model.lora_target_modules) if OmegaConf.is_list(cfg.model.lora_target_modules) else cfg.model.lora_target_modules
+
         peft_config = LoraConfig(
             task_type=TaskType.FEATURE_EXTRACTION,
             r=cfg.training.lora.r,
             lora_alpha=cfg.training.lora.lora_alpha,
             lora_dropout=cfg.training.lora.lora_dropout,
-            target_modules=cfg.model.lora_target_modules,
+            target_modules=target_modules,
         )
 
         # Wrap with LoRA adapters
