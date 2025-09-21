@@ -143,11 +143,11 @@ class TheoremContrastiveModel(nn.Module):
 # ===================================================================
 
 TRAIN_CONFIG = {
-    'GLOBAL_BATCH_SIZE': 32,    # Total batch size across all GPUs
-    'MICRO_BATCH_SIZE': 4,       # Micro batch size for gradient accumulation
+    'GLOBAL_BATCH_SIZE': 64,    # Desired total batch size across all GPUs
+    'MICRO_BATCH_SIZE': 8,       # Micro batch size for gradient accumulation
     'STREAM_CHUNK_SIZE': 8,      # Streaming chunk size for memory efficiency
     'TAU': 0.07,                 # Temperature parameter
-    'LR': 5e-5,                  # Learning rate
+    'LR': 0.0001,                  # Learning rate
     'NUM_EPOCHS': 10,            # Number of training epochs
     'MAX_LENGTH': 256,           # Max token length for BERT
     'OUTPUT_DIM': 256,           # Output embedding dimension
@@ -172,7 +172,7 @@ def train(rank: int = 0, world_size: int = 1, distributed: bool = False):
 
     # Create dataset
     dataset = TheoremLemmaDataset(
-        'data/lemmas_theorems_toy.jsonl',
+        'data/lemmas_theorems.jsonl',
         tokenizer,
         max_length=TRAIN_CONFIG['MAX_LENGTH']
     )
@@ -204,7 +204,7 @@ def train(rank: int = 0, world_size: int = 1, distributed: bool = False):
 
     # Wrap in DDP if distributed
     if distributed:
-        model = DDP(model, device_ids=[rank])
+        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
     # Create optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=TRAIN_CONFIG['LR'])
@@ -232,8 +232,12 @@ def train(rank: int = 0, world_size: int = 1, distributed: bool = False):
 
             if distributed:
                 # Use distributed training step
+                # Update config to match actual batch size
+                actual_batch_size = x_packed.shape[0] * dist.get_world_size()
+                config_copy = TRAIN_CONFIG.copy()
+                config_copy['GLOBAL_BATCH_SIZE'] = actual_batch_size
                 loss = distributed_train_step(
-                    model, optimizer, x_packed, y_packed, TRAIN_CONFIG
+                    model, optimizer, x_packed, y_packed, config_copy
                 )
             else:
                 # Use trivial implementation for single GPU
