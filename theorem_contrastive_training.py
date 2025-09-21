@@ -20,12 +20,13 @@ from distributed_clip import distributed_train_step, trivial_contrastive_step
 class TheoremLemmaDataset(Dataset):
     """Dataset that loads theorem/lemma pairs from JSONL file"""
 
-    def __init__(self, jsonl_path: str, tokenizer, max_length: int = 512):
+    def __init__(self, jsonl_path: str, tokenizer, max_length: int = 512, split: str = 'train', train_ratio: float = 0.8):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.data = []
 
         # Load all papers from JSONL
+        all_papers = []
         with open(jsonl_path, 'r') as f:
             for line in f:
                 paper = json.loads(line)
@@ -37,7 +38,14 @@ class TheoremLemmaDataset(Dataset):
 
                 # Create pairs from same paper (positive pairs)
                 if len(all_statements) >= 2:
-                    self.data.append(all_statements)
+                    all_papers.append(all_statements)
+
+        # Split data
+        n_train = int(len(all_papers) * train_ratio)
+        if split == 'train':
+            self.data = all_papers[:n_train]
+        else:  # 'eval'
+            self.data = all_papers[n_train:]
 
     def __len__(self):
         return len(self.data)
@@ -143,15 +151,78 @@ class TheoremContrastiveModel(nn.Module):
 # ===================================================================
 
 TRAIN_CONFIG = {
-    'GLOBAL_BATCH_SIZE': 1024,    # Desired total batch size across all GPUs
-    'MICRO_BATCH_SIZE': 64,       # Micro batch size for gradient accumulation
-    'STREAM_CHUNK_SIZE': 64,      # Streaming chunk size for memory efficiency
-    'TAU': 0.07,                 # Temperature parameter
-    'LR': 0.00015,                  # Learning rate
-    'NUM_EPOCHS': 10,            # Number of training epochs
-    'MAX_LENGTH': 256,           # Max token length for BERT
-    'OUTPUT_DIM': 768,           # Output embedding dimension
+    'GLOBAL_BATCH_SIZE': 128,    # Desired total batch size across all GPUs
+    'MICRO_BATCH_SIZE': 32,       # Micro batch size for gradient accumulation
+    'STREAM_CHUNK_SIZE': 32,      # Streaming chunk size for memory efficiency
+    'TAU': 0.07,                  # Temperature parameter
+    'LR': 0.0001,                 # Learning rate
+    'NUM_EPOCHS': 10,             # Number of training epochs
+    'MAX_LENGTH': 256,            # Max token length for BERT
+    'OUTPUT_DIM': 256,            # Output embedding dimension
 }
+
+# ===================================================================
+# Validation Function
+# ===================================================================
+
+def validate(model, dataloader, device, config):
+    """Validate model and compute top-k accuracy metrics"""
+    model.eval()
+
+    total_loss = 0
+    num_batches = 0
+
+    # For top-k accuracy
+    correct_at_k = {1: 0, 5: 0, 10: 0}
+    total_samples = 0
+
+    with torch.no_grad():
+        for batch in dataloader:
+            # Pack data
+            x_packed = torch.cat([
+                batch['input_ids_x'].to(device),
+                batch['attention_mask_x'].to(device)
+            ], dim=1)
+
+            y_packed = torch.cat([
+                batch['input_ids_y'].to(device),
+                batch['attention_mask_y'].to(device)
+            ], dim=1)
+
+            # Forward pass
+            z_x, z_y = model(x_packed, y_packed)
+
+            # Compute similarity matrix
+            S = torch.matmul(z_x, z_y.T) / config['TAU']
+
+            # Compute loss
+            labels = torch.arange(z_x.shape[0], device=device)
+            loss_x = F.cross_entropy(S, labels, reduction='sum')
+            loss_y = F.cross_entropy(S.T, labels, reduction='sum')
+            loss = (loss_x + loss_y) / (2 * z_x.shape[0])
+
+            total_loss += loss.item()
+            num_batches += 1
+
+            # Compute top-k accuracy
+            # For each x, find top-k similar y's
+            _, top_k_indices = S.topk(k=min(10, S.shape[1]), dim=1)
+
+            batch_size = z_x.shape[0]
+            for k in [1, 5, 10]:
+                if k <= S.shape[1]:
+                    # Check if correct y is in top-k
+                    correct = (top_k_indices[:, :k] == labels.unsqueeze(1)).any(dim=1).sum().item()
+                    correct_at_k[k] += correct
+
+            total_samples += batch_size
+
+    # Calculate metrics
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0
+    top_k_acc = {k: correct_at_k[k] / total_samples if total_samples > 0 else 0
+                 for k in correct_at_k}
+
+    return avg_loss, top_k_acc
 
 # ===================================================================
 # Training Function
@@ -170,26 +241,51 @@ def train(rank: int = 0, world_size: int = 1, distributed: bool = False):
     # Initialize tokenizer
     tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
 
-    # Create dataset
-    dataset = TheoremLemmaDataset(
-        'data/lemmas_theorems.jsonl',
+    # Create train and eval datasets
+    data_path = 'data/lemmas_theorems.jsonl'  # Full dataset
+
+    train_dataset = TheoremLemmaDataset(
+        data_path,
         tokenizer,
-        max_length=TRAIN_CONFIG['MAX_LENGTH']
+        max_length=TRAIN_CONFIG['MAX_LENGTH'],
+        split='train',
+        train_ratio=0.8
     )
 
-    # Create data loader
+    eval_dataset = TheoremLemmaDataset(
+        data_path,
+        tokenizer,
+        max_length=TRAIN_CONFIG['MAX_LENGTH'],
+        split='eval',
+        train_ratio=0.8
+    )
+
+    if rank == 0:
+        print(f"Train dataset size: {len(train_dataset)}")
+        print(f"Eval dataset size: {len(eval_dataset)}")
+
+    # Create data loaders
     if distributed:
-        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank)
+        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank)
         batch_size = TRAIN_CONFIG['GLOBAL_BATCH_SIZE'] // world_size
     else:
-        sampler = None
+        train_sampler = None
         batch_size = TRAIN_CONFIG['GLOBAL_BATCH_SIZE']
 
-    dataloader = DataLoader(
-        dataset,
+    train_dataloader = DataLoader(
+        train_dataset,
         batch_size=batch_size,
-        sampler=sampler,
-        shuffle=(sampler is None),
+        sampler=train_sampler,
+        shuffle=(train_sampler is None),
+        num_workers=2,
+        pin_memory=True
+    )
+
+    # Eval dataloader - use full batch for validation
+    eval_dataloader = DataLoader(
+        eval_dataset,
+        batch_size=min(256, len(eval_dataset)),  # Cap at 256 for memory
+        shuffle=False,
         num_workers=2,
         pin_memory=True
     )
@@ -211,13 +307,15 @@ def train(rank: int = 0, world_size: int = 1, distributed: bool = False):
 
     # Training loop
     for epoch in range(TRAIN_CONFIG['NUM_EPOCHS']):
-        if distributed and sampler is not None:
-            sampler.set_epoch(epoch)
+        if distributed and train_sampler is not None:
+            train_sampler.set_epoch(epoch)
 
+        # Training phase
+        model.train()
         total_loss = 0
         num_batches = 0
 
-        for batch_idx, batch in enumerate(dataloader):
+        for batch_idx, batch in enumerate(train_dataloader):
             # Pack data into tensors for distributed_clip compatibility
             # Concatenate input_ids and attention_mask
             x_packed = torch.cat([
@@ -264,14 +362,24 @@ def train(rank: int = 0, world_size: int = 1, distributed: bool = False):
             # Log progress
             if rank == 0 and batch_idx % 10 == 0:
                 print(f"Epoch [{epoch+1}/{TRAIN_CONFIG['NUM_EPOCHS']}], "
-                      f"Batch [{batch_idx}/{len(dataloader)}], "
+                      f"Batch [{batch_idx}/{len(train_dataloader)}], "
                       f"Loss: {loss:.4f}")
 
-        # Log epoch summary
+        # Training epoch summary
         if rank == 0:
-            avg_loss = total_loss / num_batches
-            print(f"Epoch [{epoch+1}/{TRAIN_CONFIG['NUM_EPOCHS']}] completed. "
-                  f"Average Loss: {avg_loss:.4f}")
+            avg_train_loss = total_loss / num_batches
+            print(f"\nEpoch [{epoch+1}/{TRAIN_CONFIG['NUM_EPOCHS']}] Training completed.")
+            print(f"Average Training Loss: {avg_train_loss:.4f}")
+
+            # Validation phase (only on rank 0 for simplicity)
+            val_model = model.module if hasattr(model, 'module') else model
+            val_loss, top_k_acc = validate(val_model, eval_dataloader, device, TRAIN_CONFIG)
+
+            print(f"Validation Loss: {val_loss:.4f}")
+            print(f"Top-1 Accuracy: {top_k_acc[1]:.2%}")
+            print(f"Top-5 Accuracy: {top_k_acc[5]:.2%}")
+            print(f"Top-10 Accuracy: {top_k_acc[10]:.2%}")
+            print("-" * 50)
 
     # Save model (only from rank 0)
     if rank == 0:
