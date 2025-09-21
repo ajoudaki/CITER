@@ -2,26 +2,31 @@
 """Simple analysis of theorem/lemma token lengths"""
 
 import json
+import random
 from transformers import AutoTokenizer
 import matplotlib.pyplot as plt
 
 # Load tokenizer
 tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
 
+# Sample 1000 random lines
+print("Loading file...")
+with open('data/lemmas_theorems.jsonl', 'r') as f:
+    all_lines = f.readlines()
+
+print(f"Total papers: {len(all_lines)}")
+sampled_lines = random.sample(all_lines, min(1000, len(all_lines)))
+
 # Collect lengths
 lengths = []
+for line in sampled_lines:
+    paper = json.loads(line)
+    statements = paper.get('lemmas', []) + paper.get('theorems', [])
 
-with open('data/lemmas_theorems.jsonl', 'r') as f:
-    for i, line in enumerate(f):
-        if i % 1000 == 0:
-            print(f"Processing paper {i}...")
-        paper = json.loads(line)
-        statements = paper.get('lemmas', []) + paper.get('theorems', [])
-
-        for stmt in statements:
-            if stmt:  # Skip empty statements
-                tokens = tokenizer(stmt, truncation=False, add_special_tokens=True)
-                lengths.append(len(tokens['input_ids']))
+    for stmt in statements:
+        if stmt:  # Skip empty statements
+            tokens = tokenizer.encode(stmt, add_special_tokens=True)
+            lengths.append(len(tokens))
 
 # Basic stats
 print(f"Total statements: {len(lengths)}")
