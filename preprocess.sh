@@ -43,12 +43,6 @@ head -n $MEDIUM_SIZE data/lemmas_theorems.jsonl > data/lemmas_theorems/medium.js
 echo "  Copying full dataset..."
 cp data/lemmas_theorems.jsonl data/lemmas_theorems/full.jsonl
 
-# Create a toy dataset (optional, for very quick testing)
-TOY_SIZE=5000  # ~20MB
-if [ $TOTAL_LINES -ge $TOY_SIZE ]; then
-    echo "  Creating toy dataset (first $TOY_SIZE papers)..."
-    head -n $TOY_SIZE data/lemmas_theorems.jsonl > data/lemmas_theorems/toy.jsonl
-fi
 
 # Display created files
 echo -e "\nDataset variants created:"
