@@ -1,11 +1,11 @@
 # Fast training configuration for testing
-global_batch_size: 32
-micro_batch_size: 4
-stream_chunk_size: 64
+global_batch_size: 128
+micro_batch_size: 6
+stream_chunk_size: 128
 tau: 0.07
 lr: 1e-3
 num_epochs: 2
-max_length: 128
+max_length: 256
 output_dim: 512
 drop_last: true
 
