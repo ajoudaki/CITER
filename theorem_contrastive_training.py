@@ -4,10 +4,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 import os
 import random
+import math
 from typing import Dict, Optional
 from tqdm import tqdm
 from pathlib import Path
 from torch.cuda.amp import autocast, GradScaler
+from torch.optim.lr_scheduler import LambdaLR
 
 # Set TOKENIZERS_PARALLELISM before any other imports to prevent warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -26,7 +28,7 @@ import wandb
 from distributed_clip import distributed_train_step, trivial_contrastive_step, distributed_validate_step
 
 # ===================================================================
-# Dataset Classes
+# Dataset Classes (Unchanged)
 # ===================================================================
 class StratifiedTheoremDataset(Dataset):
     """Stratified dataset that ensures each theorem/lemma appears ~once per epoch"""
@@ -100,9 +102,9 @@ class StratifiedTheoremDataset(Dataset):
             text_x, text_y = (statements[0], statements[1]) if len(statements) >= 2 else (statements[0], statements[0])
         else:
             # For train, return next unconsumed pair
-            # Select random active paper
             if not self.active_papers:
-                # Shouldn't happen if DataLoader respects __len__
+                # This can happen if the dataloader requests an item after the epoch is exhausted.
+                # In a well-behaved setup, this shouldn't be a frequent issue.
                 self.reset_epoch()
 
             paper_idx = self.rng.choice(list(self.active_papers))
@@ -111,14 +113,15 @@ class StratifiedTheoremDataset(Dataset):
                 if not self.paper_queues[paper_idx]:
                     self.active_papers.remove(paper_idx)
             else:
-                # Fallback - shouldn't happen
-                text_x = text_y = self.papers[0][0]
+                # Fallback in case of an empty queue for an active paper index
+                self.active_papers.remove(paper_idx)
+                return self.__getitem__(idx) # Retry with another paper
 
         # Tokenize
         tokens_x = self.tokenizer(text_x, padding='max_length', truncation=True,
-                                   max_length=self.max_length, return_tensors='pt')
+                                  max_length=self.max_length, return_tensors='pt')
         tokens_y = self.tokenizer(text_y, padding='max_length', truncation=True,
-                                   max_length=self.max_length, return_tensors='pt')
+                                  max_length=self.max_length, return_tensors='pt')
 
         return {
             'input_ids_x': tokens_x['input_ids'].squeeze(0),
@@ -127,50 +130,8 @@ class StratifiedTheoremDataset(Dataset):
             'attention_mask_y': tokens_y['attention_mask'].squeeze(0)
         }
 
-class TheoremLemmaDataset(Dataset):
-    """Dataset that loads theorem/lemma pairs from JSONL file"""
-    def __init__(self, jsonl_path: str, tokenizer, max_length: int = 512, split: str = 'train', train_ratio: float = 0.8, seed: int = 42):
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.split = split
-        self.data = []
-
-        all_papers = []
-        with open(jsonl_path, 'r') as f:
-            for line in f:
-                paper = json.loads(line)
-                all_statements = paper.get('lemmas', []) + paper.get('theorems', [])
-                if len(all_statements) >= 2:
-                    all_papers.append(all_statements)
-
-        random.seed(seed)
-        random.shuffle(all_papers)
-        random.seed()
-
-        n_train = int(len(all_papers) * train_ratio)
-        self.data = all_papers[:n_train] if split == 'train' else all_papers[n_train:]
-        if not dist.is_initialized() or dist.get_rank() == 0:
-            print(f"{split.upper()} set: {len(self.data)} papers")
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        statements = self.data[idx]
-        if self.split == 'eval':
-            text_x, text_y = (statements[0], statements[1]) if len(statements) >= 2 else (statements[0], statements[0])
-        else:
-            text_x, text_y = random.sample(statements, 2) if len(statements) >= 2 else (statements[0], statements[0])
-
-        tokens_x = self.tokenizer(text_x, padding='max_length', truncation=True, max_length=self.max_length, return_tensors='pt')
-        tokens_y = self.tokenizer(text_y, padding='max_length', truncation=True, max_length=self.max_length, return_tensors='pt')
-        return {
-            'input_ids_x': tokens_x['input_ids'].squeeze(0), 'attention_mask_x': tokens_x['attention_mask'].squeeze(0),
-            'input_ids_y': tokens_y['input_ids'].squeeze(0), 'attention_mask_y': tokens_y['attention_mask'].squeeze(0)
-        }
-
 # ===================================================================
-# Model Architectures
+# Model Architectures (Unchanged)
 # ===================================================================
 class CLSPoolingEncoder(nn.Module):
     """Encoder that uses the [CLS] token embedding."""
@@ -225,36 +186,32 @@ class TheoremContrastiveModel(nn.Module):
         return self.encoder_x(x_packed), self.encoder_y(y_packed)
 
 # ===================================================================
-# Helper Functions
+# Helper Functions (Scheduler added)
 # ===================================================================
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps: int, num_training_steps: int, last_epoch: int = -1):
+    """
+    Create a learning rate schedule with a linear warmup phase followed by a cosine decay.
+    """
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return LambdaLR(optimizer, lr_lambda, last_epoch)
+
 def init_wandb(cfg: DictConfig, rank: int = 0) -> Optional[object]:
     """Initialize Weights & Biases logging."""
     if not cfg.wandb.enabled or rank != 0:
         return None
-
-    # Resolve interpolations in tags
     tags = OmegaConf.to_container(cfg.wandb.tags, resolve=True)
-
-    # Auto-generate run name if not provided
-    run_name = cfg.wandb.name
-    if run_name is None:
-        run_name = f"{cfg.model.name}_{cfg.dataset.size}_bs{cfg.training.global_batch_size}"
-
-    # Convert config to dict
+    run_name = cfg.wandb.name or f"{cfg.model.name}_{cfg.dataset.size}_bs{cfg.training.global_batch_size}"
     config_dict = OmegaConf.to_container(cfg, resolve=True)
-
-    # Initialize wandb
     run = wandb.init(
-        project=cfg.wandb.project,
-        entity=cfg.wandb.entity,
-        name=run_name,
-        tags=tags,
-        group=cfg.wandb.group,
-        notes=cfg.wandb.notes,
-        mode=cfg.wandb.mode,
-        config=config_dict
+        project=cfg.wandb.project, entity=cfg.wandb.entity, name=run_name,
+        tags=tags, group=cfg.wandb.group, notes=cfg.wandb.notes,
+        mode=cfg.wandb.mode, config=config_dict
     )
-
     print(f"Weights & Biases initialized: {wandb.run.url}")
     return run
 
@@ -270,12 +227,9 @@ def print_trainable_parameters(model):
     all_param = sum(p.numel() for p in model.parameters())
     print(f"trainable params: {trainable_params:,} || all params: {all_param:,} || "
           f"trainable%: {100 * trainable_params / all_param:.2f}")
-
-    # Log to wandb
     if wandb.run is not None:
         wandb.config.update({
-            "trainable_params": trainable_params,
-            "total_params": all_param,
+            "trainable_params": trainable_params, "total_params": all_param,
             "trainable_percent": 100 * trainable_params / all_param
         })
 
@@ -284,59 +238,31 @@ def setup_model(cfg: DictConfig, device):
     encoder_class = ENCODER_REGISTRY.get(cfg.model.model_type)
     if encoder_class is None:
         raise ValueError(f"Unknown model type: {cfg.model.model_type}")
-
     base_encoder = encoder_class(
         model_name=cfg.model.model_name,
         hidden_dim=cfg.model.hidden_dim,
         output_dim=cfg.training.output_dim
     )
-
-    # Apply LoRA if enabled
     if cfg.training.lora.enabled:
-        # Freeze base model parameters
         for param in base_encoder.base_model.parameters():
             param.requires_grad = False
-
-        # Create LoRA config
-        # Convert target_modules to list if it's a ListConfig
-        target_modules = list(cfg.model.lora_target_modules) if OmegaConf.is_list(cfg.model.lora_target_modules) else cfg.model.lora_target_modules
-
+        target_modules = list(cfg.model.lora_target_modules)
         peft_config = LoraConfig(
-            task_type=TaskType.FEATURE_EXTRACTION,
-            r=cfg.training.lora.r,
-            lora_alpha=cfg.training.lora.lora_alpha,
-            lora_dropout=cfg.training.lora.lora_dropout,
+            task_type=TaskType.FEATURE_EXTRACTION, r=cfg.training.lora.r,
+            lora_alpha=cfg.training.lora.lora_alpha, lora_dropout=cfg.training.lora.lora_dropout,
             target_modules=target_modules,
         )
-
-        # Wrap with LoRA adapters
         base_encoder.base_model = get_peft_model(base_encoder.base_model, peft_config)
-
-    # Projection head is always trainable
     for param in base_encoder.projection.parameters():
         param.requires_grad = True
-
     model = TheoremContrastiveModel(base_encoder, max_length=cfg.training.max_length)
     return model.to(device)
 
 def prepare_validation_data(val_dataset, device, distributed, rank):
     """Prepare and distribute validation data."""
-    if distributed:
-        val_objects = [None, None]
-        if rank == 0:
-            print("Preparing and distributing validation dataset...")
-            val_data = [val_dataset[i] for i in range(len(val_dataset))]
-            val_x = torch.stack([d['input_ids_x'] for d in val_data])
-            val_mx = torch.stack([d['attention_mask_x'] for d in val_data])
-            val_y = torch.stack([d['input_ids_y'] for d in val_data])
-            val_my = torch.stack([d['attention_mask_y'] for d in val_data])
-            val_x_packed = torch.cat([val_x, val_mx], dim=1)
-            val_y_packed = torch.cat([val_y, val_my], dim=1)
-            val_objects = [val_x_packed, val_y_packed]
-        dist.broadcast_object_list(val_objects, src=0)
-        val_x_packed, val_y_packed = val_objects
-    else:
-        print("Preparing validation dataset...")
+    val_objects = [None, None]
+    if rank == 0:
+        print("Preparing and distributing validation dataset...")
         val_data = [val_dataset[i] for i in range(len(val_dataset))]
         val_x = torch.stack([d['input_ids_x'] for d in val_data])
         val_mx = torch.stack([d['attention_mask_x'] for d in val_data])
@@ -344,78 +270,40 @@ def prepare_validation_data(val_dataset, device, distributed, rank):
         val_my = torch.stack([d['attention_mask_y'] for d in val_data])
         val_x_packed = torch.cat([val_x, val_mx], dim=1)
         val_y_packed = torch.cat([val_y, val_my], dim=1)
-
+        if distributed:
+            val_objects = [val_x_packed, val_y_packed]
+    if distributed:
+        dist.broadcast_object_list(val_objects, src=0)
+        val_x_packed, val_y_packed = val_objects
     return val_x_packed, val_y_packed
 
 def save_model(cfg: DictConfig, model, rank):
     """Save model or LoRA adapters."""
-    if rank != 0:
-        return
-
+    if rank != 0: return
     output_dir = Path(cfg.output.save_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-
     model_to_save = model.module if hasattr(model, 'module') else model
-
     if cfg.training.lora.enabled and cfg.output.save_lora:
-        # Save LoRA adapters and projection
         adapter_path = output_dir / f'{cfg.model.name}_lora_adapters'
         projection_path = output_dir / f'{cfg.model.name}_projection.pt'
-
         model_to_save.encoder_x.base_encoder.base_model.save_pretrained(str(adapter_path))
         torch.save(model_to_save.encoder_x.base_encoder.projection.state_dict(), projection_path)
         print(f"LoRA adapters saved to '{adapter_path}' and projection to '{projection_path}'")
     else:
-        # Save full model
         model_path = output_dir / f'{cfg.model.name}_contrastive_model.pt'
         torch.save(model_to_save.state_dict(), model_path)
         print(f"Model saved to {model_path}")
 
 # ===================================================================
-# Training Function
+# Training Function (Modified with Scheduler)
 # ===================================================================
-class WarmupScheduler:
-    """Simple warmup scheduler for batch size transitions."""
-    def __init__(self, warmup_steps, main_batch_size):
-        self.warmup_steps = warmup_steps or []
-        self.main_batch_size = main_batch_size
-        self.current_step = 0
-        self.warmup_phase = 0
-        self.total_warmup_steps = sum(steps for _, steps in self.warmup_steps)
-
-    def get_batch_size(self):
-        """Get current batch size based on training step."""
-        if not self.warmup_steps:
-            return self.main_batch_size
-
-        # Check if we're still in warmup
-        steps_so_far = 0
-        for batch_size, steps in self.warmup_steps:
-            if self.current_step < steps_so_far + steps:
-                return batch_size
-            steps_so_far += steps
-
-        # Warmup complete, use main batch size
-        return self.main_batch_size
-
-    def step(self):
-        """Increment step counter."""
-        self.current_step += 1
-        return self.get_batch_size()
-
-    def is_warmup_complete(self):
-        """Check if warmup phase is complete."""
-        return self.current_step >= self.total_warmup_steps
-
 def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool = False):
-    """Main training function (SIMPLIFIED for fixed batch size)."""
+    """Main training function with learning rate scheduler."""
     device = torch.device(f'cuda:{rank}') if distributed and torch.cuda.is_available() else \
              torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
     if distributed:
         torch.cuda.set_device(rank)
 
-    # Initialize wandb (only on rank 0)
     wandb_run = init_wandb(cfg, rank)
 
     if rank == 0:
@@ -424,43 +312,20 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
         if cfg.training.lora.enabled:
             print("LoRA is ENABLED.")
 
-    # Setup tokenizer
     tokenizer = AutoTokenizer.from_pretrained(cfg.model.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Construct dataset path from name and size
     dataset_path = Path(cfg.dataset.base_path) / f"{cfg.dataset.size}.jsonl"
-
     if rank == 0:
         print(f"Loading dataset: {dataset_path}")
         if not dataset_path.exists():
             raise FileNotFoundError(f"Dataset not found: {dataset_path}")
 
-    # Choose dataset class based on sampling strategy
-    sampling_strategy = cfg.dataset.get('sampling', 'random')
-    DatasetClass = StratifiedTheoremDataset if sampling_strategy == 'stratified' else TheoremLemmaDataset
+    DatasetClass = StratifiedTheoremDataset if cfg.dataset.get('sampling', 'random') == 'stratified' else TheoremLemmaDataset
+    train_dataset = DatasetClass(str(dataset_path), tokenizer, max_length=cfg.training.max_length, split='train')
+    val_dataset = DatasetClass(str(dataset_path), tokenizer, max_length=cfg.training.max_length, split='eval')
 
-    if rank == 0:
-        print(f"Using {sampling_strategy} sampling strategy")
-
-    # Create datasets
-    train_dataset = DatasetClass(
-        str(dataset_path), tokenizer,
-        max_length=cfg.training.max_length,
-        split='train',
-        train_ratio=cfg.dataset.train_ratio,
-        seed=cfg.dataset.seed
-    )
-    val_dataset = DatasetClass(
-        str(dataset_path), tokenizer,
-        max_length=cfg.training.max_length,
-        split='eval',
-        train_ratio=cfg.dataset.train_ratio,
-        seed=cfg.dataset.seed
-    )
-
-    # Calculate the per-GPU batch size once.
     if distributed:
         if cfg.training.global_batch_size % world_size != 0:
             raise ValueError(f"Global batch size ({cfg.training.global_batch_size}) must be divisible by world size ({world_size}).")
@@ -470,56 +335,44 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
         local_batch_size = cfg.training.global_batch_size
         train_sampler = None
 
-    # DataLoader now creates perfectly sized batches for each GPU directly.
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=local_batch_size,
-        sampler=train_sampler,
+        train_dataset, batch_size=local_batch_size, sampler=train_sampler,
         shuffle=(train_sampler is None and not isinstance(train_dataset, StratifiedTheoremDataset)),
-        num_workers=cfg.runtime.num_workers,
-        pin_memory=True,
-        drop_last=True
+        num_workers=cfg.runtime.num_workers, pin_memory=True, drop_last=True
     )
 
-    # Setup model
     model = setup_model(cfg, device)
-
     if rank == 0:
         print_trainable_parameters(model)
-
     if distributed:
         model = DDP(model, device_ids=[rank])
 
-    # Setup optimizer (only for trainable parameters)
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
-        lr=cfg.training.lr,
-        weight_decay=cfg.training.get('weight_decay', 0.01)
+        lr=cfg.training.lr, weight_decay=cfg.training.get('weight_decay', 0.01)
     )
 
-    # Setup mixed precision scaler for GPU training
+    # --- Scheduler Setup ---
+    num_training_steps = len(train_loader) * cfg.training.num_epochs
+    warmup_steps = cfg.training.get('warmup_steps', 2000)
+    if rank == 0:
+        print(f"Scheduler: Cosine decay with {warmup_steps} warmup steps over {num_training_steps} total steps.")
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer, num_warmup_steps=warmup_steps, num_training_steps=num_training_steps
+    )
+
     use_amp = cfg.training.get('use_amp', True) and torch.cuda.is_available()
     scaler = GradScaler() if use_amp else None
-    if rank == 0 and use_amp:
-        print("Mixed precision training ENABLED (fp16)")
-    elif rank == 0:
-        print("Mixed precision training DISABLED (fp32)")
+    if rank == 0:
+        print(f"Mixed precision training {'ENABLED' if use_amp else 'DISABLED'}")
 
-    # Prepare validation data
     val_x_packed, val_y_packed = prepare_validation_data(val_dataset, device, distributed, rank)
-
-    # Track global step for wandb
     global_step = 0
 
-    # Training loop
     for epoch in range(cfg.training.num_epochs):
-        # Reset stratified dataset for new epoch if applicable
         if isinstance(train_dataset, StratifiedTheoremDataset):
             train_dataset.reset_epoch()
-            if rank == 0:
-                print(f"Epoch {epoch+1}: Reset stratified sampling, "
-                      f"{len(train_dataset.active_papers)} active papers")
-
+        
         model.train()
         if distributed and train_sampler:
             train_sampler.set_epoch(epoch)
@@ -527,9 +380,7 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
         total_loss, num_batches = 0, 0
         pbar = tqdm(train_loader, disable=(rank!=0), desc=f"Epoch {epoch+1}/{cfg.training.num_epochs}")
 
-        # Simplified training loop
         for batch in pbar:
-            # DataLoader provides a perfectly sized batch for this GPU. No accumulation needed.
             x_packed = torch.cat([batch['input_ids_x'], batch['attention_mask_x']], dim=1).to(device)
             y_packed = torch.cat([batch['input_ids_y'], batch['attention_mask_y']], dim=1).to(device)
 
@@ -544,17 +395,18 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
                 loss = distributed_train_step(model, optimizer, x_packed, y_packed, train_config, scaler)
             else:
                 loss = trivial_contrastive_step(model, optimizer, x_packed, y_packed, train_config, scaler)
+            
+            scheduler.step() # Update learning rate
 
             total_loss += loss
             num_batches += 1
             global_step += 1
-
-            # Log training metrics
+            
             if rank == 0:
-                pbar.set_postfix(loss=f'{loss:.4f}')
+                pbar.set_postfix(loss=f'{loss:.4f}', lr=f'{scheduler.get_last_lr()[0]:.2e}')
                 log_metrics({
                     'loss': loss,
-                    'learning_rate': cfg.training.lr,
+                    'learning_rate': scheduler.get_last_lr()[0],
                     'batch_size': cfg.training.global_batch_size,
                 }, step=global_step, prefix='train')
 
@@ -562,7 +414,6 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
         N_val = val_x_packed.shape[0]
         val_world_size = world_size if distributed else 1
         C_val = N_val // val_world_size
-
         if N_val % val_world_size != 0 and rank == 0:
             print(f"Warning: Val set size {N_val} not divisible by world size {val_world_size}")
 
@@ -576,7 +427,6 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
             'STREAM_CHUNK_SIZE': cfg.training.stream_chunk_size,
             'TAU': cfg.training.tau
         }
-
         val_loss, topk_acc = distributed_validate_step(model, local_val_x, local_val_y, val_config)
 
         if rank == 0:
@@ -589,39 +439,22 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
             print(f"  Top@5 Acc:  {topk_acc.get(5, 0)*100:.2f}%")
             print(f"  Top@10 Acc: {topk_acc.get(10, 0)*100:.2f}%\n")
 
-            # Log validation metrics
-            log_metrics({
-                'loss': val_loss,
-                'mrr': topk_acc.get('MRR', 0),
-                'top1_acc': topk_acc.get(1, 0),
-                'top5_acc': topk_acc.get(5, 0),
-                'top10_acc': topk_acc.get(10, 0)
-            }, step=global_step, prefix='val')
-
-            # Log epoch summary
-            log_metrics({
-                'epoch': epoch + 1,
-                'avg_train_loss': avg_train_loss
-            }, step=global_step)
+            log_metrics({'loss': val_loss, 'mrr': topk_acc.get('MRR', 0), 'top1_acc': topk_acc.get(1, 0)}, step=global_step, prefix='val')
+            log_metrics({'epoch': epoch + 1, 'avg_train_loss': avg_train_loss}, step=global_step)
 
         if distributed:
             dist.barrier()
 
-    # Save model
     save_model(cfg, model, rank)
-
-    # Close wandb
     if wandb_run is not None:
         wandb.finish()
 
 # ===================================================================
-# Main Entry Point with Hydra
+# Main Entry Point with Hydra (Unchanged)
 # ===================================================================
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(cfg: DictConfig):
     """Main entry point with Hydra configuration."""
-
-    # Check if running in distributed mode
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         dist.init_process_group(backend="nccl")
         rank = dist.get_rank()

@@ -4,11 +4,12 @@ stream_chunk_size: 256
 tau: 0.07
 lr: 2e-4
 weight_decay: 0.01  # L2 regularization for AdamW
-num_epochs: 20
+num_epochs: 10
 max_length: 256
 output_dim: 2048
 drop_last: true
 use_amp: true  # Enable automatic mixed precision for memory efficiency
+warmup_steps: 2000
 
 # LoRA configuration
 lora:
