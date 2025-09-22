@@ -4,6 +4,7 @@ base_path: data/lemmas_theorems
 size: small  # Default size
 train_ratio: 0.8
 seed: 42
+sampling: stratified  # Options: 'random' or 'stratified'
 
 # Available sizes with descriptions
 sizes:

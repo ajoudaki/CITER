@@ -26,8 +26,107 @@ import wandb
 from distributed_clip import distributed_train_step, trivial_contrastive_step, distributed_validate_step
 
 # ===================================================================
-# Dataset (unchanged)
+# Dataset Classes
 # ===================================================================
+class StratifiedTheoremDataset(Dataset):
+    """Stratified dataset that ensures each theorem/lemma appears ~once per epoch"""
+
+    def __init__(self, jsonl_path: str, tokenizer, max_length: int = 512,
+                 split: str = 'train', train_ratio: float = 0.8, seed: int = 42):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.split = split
+        self.seed = seed
+
+        # Load papers
+        all_papers = []
+        with open(jsonl_path, 'r') as f:
+            for line in f:
+                paper = json.loads(line)
+                statements = paper.get('lemmas', []) + paper.get('theorems', [])
+                if len(statements) >= 2:
+                    all_papers.append(statements)
+
+        # Split train/eval
+        random.seed(seed)
+        random.shuffle(all_papers)
+        n_train = int(len(all_papers) * train_ratio)
+        self.papers = all_papers[:n_train] if split == 'train' else all_papers[n_train:]
+
+        # Initialize paper states for stratified sampling
+        self.reset_epoch()
+
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            print(f"{split.upper()} set: {len(self.papers)} papers, "
+                  f"~{self.total_pairs} theorem/lemma pairs")
+
+    def reset_epoch(self):
+        """Reset paper states for new epoch - call at epoch start"""
+        self.rng = random.Random(self.seed + (self.current_epoch if hasattr(self, 'current_epoch') else 0))
+        self.current_epoch = getattr(self, 'current_epoch', 0) + 1
+
+        # Prepare each paper's theorem pairs
+        self.paper_queues = []
+        self.total_pairs = 0
+
+        for paper_statements in self.papers:
+            # Shuffle statements for this epoch
+            statements = paper_statements.copy()
+            self.rng.shuffle(statements)
+
+            # Make even by repeating one if odd
+            if len(statements) % 2 == 1:
+                statements.append(self.rng.choice(statements))
+
+            # Create pairs queue for this paper
+            pairs = [(statements[i], statements[i+1])
+                     for i in range(0, len(statements), 2)]
+            self.paper_queues.append(pairs)
+            self.total_pairs += len(pairs)
+
+        # Track active papers (those with remaining pairs)
+        self.active_papers = set(range(len(self.papers)))
+        self.consumed_pairs = 0
+
+    def __len__(self):
+        """Return number of batches we can create"""
+        return self.total_pairs if self.split == 'train' else len(self.papers)
+
+    def __getitem__(self, idx):
+        """Get a single pair - DataLoader will batch these"""
+        if self.split == 'eval':
+            # For eval, use fixed first two statements
+            statements = self.papers[idx % len(self.papers)]
+            text_x, text_y = (statements[0], statements[1]) if len(statements) >= 2 else (statements[0], statements[0])
+        else:
+            # For train, return next unconsumed pair
+            # Select random active paper
+            if not self.active_papers:
+                # Shouldn't happen if DataLoader respects __len__
+                self.reset_epoch()
+
+            paper_idx = self.rng.choice(list(self.active_papers))
+            if self.paper_queues[paper_idx]:
+                text_x, text_y = self.paper_queues[paper_idx].pop(0)
+                if not self.paper_queues[paper_idx]:
+                    self.active_papers.remove(paper_idx)
+            else:
+                # Fallback - shouldn't happen
+                text_x = text_y = self.papers[0][0]
+
+        # Tokenize
+        tokens_x = self.tokenizer(text_x, padding='max_length', truncation=True,
+                                   max_length=self.max_length, return_tensors='pt')
+        tokens_y = self.tokenizer(text_y, padding='max_length', truncation=True,
+                                   max_length=self.max_length, return_tensors='pt')
+
+        return {
+            'input_ids_x': tokens_x['input_ids'].squeeze(0),
+            'attention_mask_x': tokens_x['attention_mask'].squeeze(0),
+            'input_ids_y': tokens_y['input_ids'].squeeze(0),
+            'attention_mask_y': tokens_y['attention_mask'].squeeze(0)
+        }
+
 class TheoremLemmaDataset(Dataset):
     """Dataset that loads theorem/lemma pairs from JSONL file"""
     def __init__(self, jsonl_path: str, tokenizer, max_length: int = 512, split: str = 'train', train_ratio: float = 0.8, seed: int = 42):
@@ -322,15 +421,22 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
         if not dataset_path.exists():
             raise FileNotFoundError(f"Dataset not found: {dataset_path}")
 
+    # Choose dataset class based on sampling strategy
+    sampling_strategy = cfg.dataset.get('sampling', 'random')
+    DatasetClass = StratifiedTheoremDataset if sampling_strategy == 'stratified' else TheoremLemmaDataset
+
+    if rank == 0:
+        print(f"Using {sampling_strategy} sampling strategy")
+
     # Create datasets
-    train_dataset = TheoremLemmaDataset(
+    train_dataset = DatasetClass(
         str(dataset_path), tokenizer,
         max_length=cfg.training.max_length,
         split='train',
         train_ratio=cfg.dataset.train_ratio,
         seed=cfg.dataset.seed
     )
-    val_dataset = TheoremLemmaDataset(
+    val_dataset = DatasetClass(
         str(dataset_path), tokenizer,
         max_length=cfg.training.max_length,
         split='eval',
@@ -373,6 +479,13 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
 
     # Training loop
     for epoch in range(cfg.training.num_epochs):
+        # Reset stratified dataset for new epoch if applicable
+        if isinstance(train_dataset, StratifiedTheoremDataset):
+            train_dataset.reset_epoch()
+            if rank == 0:
+                print(f"Epoch {epoch+1}: Reset stratified sampling, "
+                      f"{len(train_dataset.active_papers)} active papers")
+
         # Get batch size for current epoch
         epoch_batch_size = get_epoch_batch_size(cfg.training.global_batch_size, epoch)
         batch_size = epoch_batch_size // world_size
@@ -381,7 +494,7 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size,
             sampler=train_sampler,
-            shuffle=(train_sampler is None),
+            shuffle=(train_sampler is None and not isinstance(train_dataset, StratifiedTheoremDataset)),
             num_workers=cfg.runtime.num_workers,
             pin_memory=True,
             drop_last=cfg.training.drop_last
