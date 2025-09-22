@@ -9,7 +9,7 @@ max_length: 256
 output_dim: 2048
 drop_last: true
 use_amp: true  # Enable automatic mixed precision for memory efficiency
-warmup_steps: 2000
+warmup_steps: 100
 
 # LoRA configuration
 lora:

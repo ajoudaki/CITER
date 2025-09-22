@@ -10,6 +10,7 @@ from tqdm import tqdm
 from pathlib import Path
 from torch.cuda.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import LambdaLR
+import numpy as np  # Import numpy for the new implementation
 
 # Set TOKENIZERS_PARALLELISM before any other imports to prevent warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -28,96 +29,98 @@ import wandb
 from distributed_clip import distributed_train_step, trivial_contrastive_step, distributed_validate_step
 
 # ===================================================================
-# Dataset Classes (Unchanged)
+# Dataset Class (Re-implemented for efficiency)
 # ===================================================================
 class StratifiedTheoremDataset(Dataset):
-    """Stratified dataset that ensures each theorem/lemma appears ~once per epoch"""
-
+    """
+    Stratified dataset that ensures each theorem/lemma appears ~once per epoch.
+    This implementation pre-computes an array of all pairs for the epoch, making
+    __getitem__ a fast lookup.
+    """
     def __init__(self, jsonl_path: str, tokenizer, max_length: int = 512,
                  split: str = 'train', train_ratio: float = 0.8, seed: int = 42):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.split = split
         self.seed = seed
+        self.epoch = 0
 
-        # Load papers
-        all_papers = []
+        # Load papers' statements into a list of lists
+        all_papers_statements = []
         with open(jsonl_path, 'r') as f:
             for line in f:
                 paper = json.loads(line)
                 statements = paper.get('lemmas', []) + paper.get('theorems', [])
                 if len(statements) >= 2:
-                    all_papers.append(statements)
+                    all_papers_statements.append(statements)
 
-        # Split train/eval
-        random.seed(seed)
-        random.shuffle(all_papers)
-        n_train = int(len(all_papers) * train_ratio)
-        self.papers = all_papers[:n_train] if split == 'train' else all_papers[n_train:]
-
-        # Initialize paper states for stratified sampling
+        # Split train/eval using a reproducible shuffle
+        rng = np.random.default_rng(self.seed)
+        indices = np.arange(len(all_papers_statements))
+        rng.shuffle(indices)
+        n_train = int(len(all_papers_statements) * train_ratio)
+        split_indices = indices[:n_train] if split == 'train' else indices[n_train:]
+        
+        self.papers = [all_papers_statements[i] for i in split_indices]
+        self.epoch_pairs = np.array([]) # Will be populated in reset_epoch
         self.reset_epoch()
 
         if not dist.is_initialized() or dist.get_rank() == 0:
-            print(f"{split.upper()} set: {len(self.papers)} papers, "
-                  f"~{self.total_pairs} theorem/lemma pairs")
+            print(f"{self.split.upper()} set: {len(self.papers)} papers, "
+                  f"{len(self.epoch_pairs)} theorem/lemma pairs per epoch.")
 
     def reset_epoch(self):
-        """Reset paper states for new epoch - call at epoch start"""
-        self.rng = random.Random(self.seed + (self.current_epoch if hasattr(self, 'current_epoch') else 0))
-        self.current_epoch = getattr(self, 'current_epoch', 0) + 1
+        """
+        Generates and shuffles all possible statement pairs for the upcoming epoch.
+        This is called once at the beginning of each epoch.
+        """
+        # Use an epoch-specific seed for reproducibility
+        rng = np.random.default_rng(self.seed + self.epoch)
+        self.epoch += 1
 
-        # Prepare each paper's theorem pairs
-        self.paper_queues = []
-        self.total_pairs = 0
-
-        for paper_statements in self.papers:
-            # Shuffle statements for this epoch
-            statements = paper_statements.copy()
-            self.rng.shuffle(statements)
-
-            # Make even by repeating one if odd
-            if len(statements) % 2 == 1:
-                statements.append(self.rng.choice(statements))
-
-            # Create pairs queue for this paper
-            pairs = [(statements[i], statements[i+1])
-                     for i in range(0, len(statements), 2)]
-            self.paper_queues.append(pairs)
-            self.total_pairs += len(pairs)
-
-        # Track active papers (those with remaining pairs)
-        self.active_papers = set(range(len(self.papers)))
-        self.consumed_pairs = 0
+        all_pairs = []
+        for paper_idx, statements in enumerate(self.papers):
+            stmt_indices = np.arange(len(statements))
+            
+            # If odd number of statements, duplicate a random one to make it even
+            if len(stmt_indices) % 2 != 0:
+                random_choice = rng.choice(stmt_indices)
+                stmt_indices = np.append(stmt_indices, random_choice)
+            
+            # Shuffle and form pairs
+            rng.shuffle(stmt_indices)
+            paired_indices = stmt_indices.reshape(-1, 2)
+            
+            # Store pairs as (paper_idx, stmt_idx)
+            for stmt_idx1, stmt_idx2 in paired_indices:
+                all_pairs.append([[paper_idx, stmt_idx1], [paper_idx, stmt_idx2]])
+        
+        # Create a single numpy array and shuffle it for random batch access
+        self.epoch_pairs = np.array(all_pairs)
+        rng.shuffle(self.epoch_pairs, axis=0)
 
     def __len__(self):
-        """Return number of batches we can create"""
-        return self.total_pairs if self.split == 'train' else len(self.papers)
+        """Return the total number of pairs available for the epoch."""
+        return len(self.epoch_pairs) if self.split == 'train' else len(self.papers)
 
-    def __getitem__(self, idx):
-        """Get a single pair - DataLoader will batch these"""
+    def __getitem__(self, idx: int):
+        """
+        Retrieves a pre-computed pair by index and tokenizes it.
+        This method is now a simple, fast lookup.
+        """
         if self.split == 'eval':
-            # For eval, use fixed first two statements
+            # For eval, use fixed first two statements for consistency
             statements = self.papers[idx % len(self.papers)]
-            text_x, text_y = (statements[0], statements[1]) if len(statements) >= 2 else (statements[0], statements[0])
+            text_x, text_y = statements[0], statements[1]
         else:
-            # For train, return next unconsumed pair
-            if not self.active_papers:
-                # This can happen if the dataloader requests an item after the epoch is exhausted.
-                # In a well-behaved setup, this shouldn't be a frequent issue.
-                self.reset_epoch()
+            # For train, retrieve the pre-shuffled pair indices
+            pair_indices = self.epoch_pairs[idx]
+            paper_idx_x, stmt_idx_x = pair_indices[0]
+            paper_idx_y, stmt_idx_y = pair_indices[1]
+            text_x = self.papers[paper_idx_x][stmt_idx_x]
+            text_y = self.papers[paper_idx_y][stmt_idx_y]
 
-            paper_idx = self.rng.choice(list(self.active_papers))
-            if self.paper_queues[paper_idx]:
-                text_x, text_y = self.paper_queues[paper_idx].pop(0)
-                if not self.paper_queues[paper_idx]:
-                    self.active_papers.remove(paper_idx)
-            else:
-                # Fallback in case of an empty queue for an active paper index
-                self.active_papers.remove(paper_idx)
-                return self.__getitem__(idx) # Retry with another paper
-
-        # Tokenize
+        # Tokenize the selected text pair
         tokens_x = self.tokenizer(text_x, padding='max_length', truncation=True,
                                   max_length=self.max_length, return_tensors='pt')
         tokens_y = self.tokenizer(text_y, padding='max_length', truncation=True,
@@ -186,7 +189,7 @@ class TheoremContrastiveModel(nn.Module):
         return self.encoder_x(x_packed), self.encoder_y(y_packed)
 
 # ===================================================================
-# Helper Functions (Scheduler added)
+# Helper Functions (Unchanged)
 # ===================================================================
 def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps: int, num_training_steps: int, last_epoch: int = -1):
     """
@@ -295,7 +298,7 @@ def save_model(cfg: DictConfig, model, rank):
         print(f"Model saved to {model_path}")
 
 # ===================================================================
-# Training Function (Modified with Scheduler)
+# Training Function (Unchanged)
 # ===================================================================
 def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool = False):
     """Main training function with learning rate scheduler."""
@@ -322,7 +325,7 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
         if not dataset_path.exists():
             raise FileNotFoundError(f"Dataset not found: {dataset_path}")
 
-    DatasetClass = StratifiedTheoremDataset if cfg.dataset.get('sampling', 'random') == 'stratified' else TheoremLemmaDataset
+    DatasetClass = StratifiedTheoremDataset # Hard-coding to the improved class
     train_dataset = DatasetClass(str(dataset_path), tokenizer, max_length=cfg.training.max_length, split='train')
     val_dataset = DatasetClass(str(dataset_path), tokenizer, max_length=cfg.training.max_length, split='eval')
 
@@ -337,7 +340,8 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
 
     train_loader = DataLoader(
         train_dataset, batch_size=local_batch_size, sampler=train_sampler,
-        shuffle=(train_sampler is None and not isinstance(train_dataset, StratifiedTheoremDataset)),
+        # No need for DataLoader shuffle; dataset is pre-shuffled per epoch
+        shuffle=False, 
         num_workers=cfg.runtime.num_workers, pin_memory=True, drop_last=True
     )
 
@@ -351,8 +355,7 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=cfg.training.lr, weight_decay=cfg.training.get('weight_decay', 0.01)
     )
-
-    # --- Scheduler Setup ---
+    
     num_training_steps = len(train_loader) * cfg.training.num_epochs
     warmup_steps = cfg.training.get('warmup_steps', 2000)
     if rank == 0:
@@ -370,8 +373,8 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
     global_step = 0
 
     for epoch in range(cfg.training.num_epochs):
-        if isinstance(train_dataset, StratifiedTheoremDataset):
-            train_dataset.reset_epoch()
+        # The dataset's epoch must be synced with the training loop's epoch
+        train_dataset.reset_epoch()
         
         model.train()
         if distributed and train_sampler:
@@ -396,7 +399,7 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
             else:
                 loss = trivial_contrastive_step(model, optimizer, x_packed, y_packed, train_config, scaler)
             
-            scheduler.step() # Update learning rate
+            scheduler.step()
 
             total_loss += loss
             num_batches += 1
