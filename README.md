@@ -180,15 +180,9 @@ lora:
   lora_dropout: 0.05
 ```
 
-### Dynamic Batch Size Scheduling
+### Warmup
 
-The system supports dynamic batch size scheduling for curriculum learning:
-```yaml
-# Gradually increase batch size across epochs
-global_batch_size: [64, 64, 1024]
-# Epoch 1-2: batch_size = 64
-# Epoch 3+:  batch_size = 1024
-```
+There is a warmup that gows up linearly, and a cosine lr decay. can be set via `training.warmup_steps` config. 
 
 ## Model Architecture
 
