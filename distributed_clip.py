@@ -143,7 +143,7 @@ def distributed_train_step(
         for i in range(0, C, B):
             z_x = module.encoder_x(local_x[i:i+B])
             z_y = module.encoder_y(local_y[i:i+B])
-            local_Z_x.append(z_x)  # Ensure float32 for all-gather
+            local_Z_x.append(z_x)  # Use float16 for all-gather embeddings 
             local_Z_y.append(z_y)
     local_Z_x, local_Z_y = torch.cat(local_Z_x, dim=0), torch.cat(local_Z_y, dim=0)
 
