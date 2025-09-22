@@ -7,6 +7,7 @@ import random
 from typing import Dict, Optional
 from tqdm import tqdm
 from pathlib import Path
+from torch.cuda.amp import autocast, GradScaler
 
 # Set TOKENIZERS_PARALLELISM before any other imports to prevent warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -355,6 +356,14 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
         lr=cfg.training.lr
     )
 
+    # Setup mixed precision scaler for GPU training
+    use_amp = cfg.training.get('use_amp', True) and torch.cuda.is_available()
+    scaler = GradScaler() if use_amp else None
+    if rank == 0 and use_amp:
+        print("Mixed precision training ENABLED (fp16)")
+    elif rank == 0:
+        print("Mixed precision training DISABLED (fp32)")
+
     # Prepare validation data
     val_x_packed, val_y_packed = prepare_validation_data(val_dataset, device, distributed, rank)
 
@@ -407,9 +416,9 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
             }
 
             if distributed:
-                loss = distributed_train_step(model, optimizer, x_packed, y_packed, train_config)
+                loss = distributed_train_step(model, optimizer, x_packed, y_packed, train_config, scaler)
             else:
-                loss = trivial_contrastive_step(model, optimizer, x_packed, y_packed, train_config)
+                loss = trivial_contrastive_step(model, optimizer, x_packed, y_packed, train_config, scaler)
 
             total_loss += loss
             num_batches += 1

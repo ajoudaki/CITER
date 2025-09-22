@@ -21,11 +21,16 @@ echo "Total papers in dataset: $TOTAL_LINES"
 
 # Define size variants
 # Adjust these numbers based on your needs
+TOY_SIZE=200        # ~800KB (for quick testing/debugging)
 TINY_SIZE=1000      # ~4MB
 SMALL_SIZE=10000    # ~40MB
 MEDIUM_SIZE=100000  # ~400MB
 
 echo "Creating dataset variants..."
+
+# Create toy dataset (for debugging)
+echo "  Creating toy dataset (first $TOY_SIZE papers)..."
+head -n $TOY_SIZE data/lemmas_theorems.jsonl > data/lemmas_theorems/toy.jsonl
 
 # Create tiny dataset
 echo "  Creating tiny dataset (first $TINY_SIZE papers)..."
@@ -59,6 +64,7 @@ done
 
 echo -e "\nPreprocessing complete!"
 echo "You can now use these datasets with:"
+echo "  python theorem_contrastive_training.py dataset.size=toy    # For debugging"
 echo "  python theorem_contrastive_training.py dataset.size=tiny"
 echo "  python theorem_contrastive_training.py dataset.size=small"
 echo "  python theorem_contrastive_training.py dataset.size=medium"

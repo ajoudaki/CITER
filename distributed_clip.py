@@ -4,7 +4,8 @@ import torch.nn.functional as F
 import torch.distributed as dist
 import math
 from contextlib import nullcontext
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
+from torch.cuda.amp import autocast
 
 # ===================================================================
 # Distributed Utilities
@@ -105,14 +106,16 @@ def compute_streaming_gradients(
 # ===================================================================
 
 def distributed_train_step(
-    model: torch.nn.Module, 
-    optimizer: torch.optim.Optimizer, 
-    local_x: torch.Tensor, 
-    local_y: torch.Tensor, 
-    config: Dict
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    local_x: torch.Tensor,
+    local_y: torch.Tensor,
+    config: Dict,
+    scaler: Optional[object] = None
 ) -> float:
     """
     Implements the 5-phase distributed, memory-efficient training step.
+    Supports automatic mixed precision when scaler is provided.
     """
     if dist.is_initialized():
         P, rank = dist.get_world_size(), dist.get_rank()
@@ -132,12 +135,15 @@ def distributed_train_step(
     if not hasattr(module, 'encoder_x') or not hasattr(module, 'encoder_y'):
         raise AttributeError("Model must expose 'encoder_x' and 'encoder_y'.")
 
+    # Use autocast context if scaler is provided, otherwise no-op
+    amp_context = autocast() if scaler is not None else nullcontext()
+
     local_Z_x, local_Z_y = [], []
-    with torch.no_grad():
+    with torch.no_grad(), amp_context:
         for i in range(0, C, B):
             z_x = module.encoder_x(local_x[i:i+B])
             z_y = module.encoder_y(local_y[i:i+B])
-            local_Z_x.append(z_x)
+            local_Z_x.append(z_x)  # Ensure float32 for all-gather
             local_Z_y.append(z_y)
     local_Z_x, local_Z_y = torch.cat(local_Z_x, dim=0), torch.cat(local_Z_y, dim=0)
 
@@ -160,16 +166,25 @@ def distributed_train_step(
         with context:
             with torch.no_grad():
                 G_x_M, G_y_M = compute_streaming_gradients(
-                    Z_x, Z_y, Z_x[global_start:global_end], Z_y[global_start:global_end], 
-                    a, b, a[global_start:global_end], b[global_start:global_end], 
+                    Z_x, Z_y, Z_x[global_start:global_end], Z_y[global_start:global_end],
+                    a, b, a[global_start:global_end], b[global_start:global_end],
                     TAU, N, M_stream)
 
-            Z_x_M_grad, Z_y_M_grad = model(local_x[mb_start:mb_end], local_y[mb_start:mb_end])
-            surrogate_loss = (Z_x_M_grad * G_x_M).sum() + (Z_y_M_grad * G_y_M).sum()
-            scaled_surrogate_loss = surrogate_loss * P
-            scaled_surrogate_loss.backward()
+            with amp_context:
+                Z_x_M_grad, Z_y_M_grad = model(local_x[mb_start:mb_end], local_y[mb_start:mb_end])
+                surrogate_loss = (Z_x_M_grad.float() * G_x_M).sum() + (Z_y_M_grad.float() * G_y_M).sum()
+                scaled_surrogate_loss = surrogate_loss * P
 
-    optimizer.step()
+            if scaler is not None:
+                scaler.scale(scaled_surrogate_loss).backward()
+            else:
+                scaled_surrogate_loss.backward()
+
+    if scaler is not None:
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        optimizer.step()
     return global_loss
 
 def distributed_validate_step(
@@ -268,25 +283,38 @@ def distributed_validate_step(
     return global_loss, topk_acc
 
 def trivial_contrastive_step(
-    model: torch.nn.Module, 
-    optimizer: torch.optim.Optimizer, 
-    global_x: torch.Tensor, 
-    global_y: torch.Tensor, 
-    config: Dict
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    global_x: torch.Tensor,
+    global_y: torch.Tensor,
+    config: Dict,
+    scaler: Optional[object] = None
 ) -> float:
     """
     A standard, mathematically equivalent implementation of symmetric CLIP loss.
+    Supports automatic mixed precision when scaler is provided.
     """
     N, TAU = global_x.shape[0], config['TAU']
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    Z_x, Z_y = model(global_x, global_y)
-    S = torch.matmul(Z_x, Z_y.T) / TAU
-    labels = torch.arange(N, device=Z_x.device)
-    loss_x = F.cross_entropy(S, labels, reduction='sum')
-    loss_y = F.cross_entropy(S.T, labels, reduction='sum')
-    total_loss = (loss_x + loss_y) / (2 * N)
-    total_loss.backward()
-    optimizer.step()
+
+    # Use autocast if scaler is provided
+    amp_context = autocast() if scaler is not None else nullcontext()
+
+    with amp_context:
+        Z_x, Z_y = model(global_x, global_y)
+        S = torch.matmul(Z_x, Z_y.T) / TAU
+        labels = torch.arange(N, device=Z_x.device)
+        loss_x = F.cross_entropy(S, labels, reduction='sum')
+        loss_y = F.cross_entropy(S.T, labels, reduction='sum')
+        total_loss = (loss_x + loss_y) / (2 * N)
+
+    if scaler is not None:
+        scaler.scale(total_loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+    else:
+        total_loss.backward()
+        optimizer.step()
     return total_loss.item()
 
