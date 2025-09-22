@@ -1,4 +1,4 @@
-global_batch_size: [64, 64, 1024]  # Gradual increase, for optimal flop/loss trade off
+global_batch_size: 1024  # Main batch size after warmup
 micro_batch_size: 8
 stream_chunk_size: 256
 tau: 0.07

@@ -238,14 +238,10 @@ def init_wandb(cfg: DictConfig, rank: int = 0) -> Optional[object]:
     # Auto-generate run name if not provided
     run_name = cfg.wandb.name
     if run_name is None:
-        run_name = f"{cfg.model.name}_{cfg.dataset.size}_bs{cfg.training.global_batch_size[0] if OmegaConf.is_list(cfg.training.global_batch_size) else cfg.training.global_batch_size}"
+        run_name = f"{cfg.model.name}_{cfg.dataset.size}_bs{cfg.training.global_batch_size}"
 
-    # Convert config to dict, handling ListConfig properly
+    # Convert config to dict
     config_dict = OmegaConf.to_container(cfg, resolve=True)
-
-    # Convert ListConfig to regular list for JSON serialization
-    if isinstance(config_dict.get('training', {}).get('global_batch_size'), list):
-        config_dict['training']['global_batch_size'] = list(config_dict['training']['global_batch_size'])
 
     # Initialize wandb
     run = wandb.init(
@@ -378,17 +374,41 @@ def save_model(cfg: DictConfig, model, rank):
 # ===================================================================
 # Training Function
 # ===================================================================
-def get_epoch_batch_size(batch_size_config, epoch):
-    """Get batch size for current epoch from config (single value or list)."""
-    # Check if it's a list-like object (handles both list and OmegaConf ListConfig)
-    if OmegaConf.is_list(batch_size_config) or isinstance(batch_size_config, list):
-        # Use epoch-specific batch size or last value for remaining epochs
-        idx = min(epoch, len(batch_size_config) - 1)
-        return batch_size_config[idx]
-    return batch_size_config
+class WarmupScheduler:
+    """Simple warmup scheduler for batch size transitions."""
+    def __init__(self, warmup_steps, main_batch_size):
+        self.warmup_steps = warmup_steps or []
+        self.main_batch_size = main_batch_size
+        self.current_step = 0
+        self.warmup_phase = 0
+        self.total_warmup_steps = sum(steps for _, steps in self.warmup_steps)
+
+    def get_batch_size(self):
+        """Get current batch size based on training step."""
+        if not self.warmup_steps:
+            return self.main_batch_size
+
+        # Check if we're still in warmup
+        steps_so_far = 0
+        for batch_size, steps in self.warmup_steps:
+            if self.current_step < steps_so_far + steps:
+                return batch_size
+            steps_so_far += steps
+
+        # Warmup complete, use main batch size
+        return self.main_batch_size
+
+    def step(self):
+        """Increment step counter."""
+        self.current_step += 1
+        return self.get_batch_size()
+
+    def is_warmup_complete(self):
+        """Check if warmup phase is complete."""
+        return self.current_step >= self.total_warmup_steps
 
 def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool = False):
-    """Main training function."""
+    """Main training function (SIMPLIFIED for fixed batch size)."""
     device = torch.device(f'cuda:{rank}') if distributed and torch.cuda.is_available() else \
              torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -403,10 +423,6 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
         print(f"Using model: {cfg.model.model_name} with {cfg.model.model_type} strategy.")
         if cfg.training.lora.enabled:
             print("LoRA is ENABLED.")
-
-        # Show batch size schedule if using list
-        if OmegaConf.is_list(cfg.training.global_batch_size):
-            print(f"Batch size schedule: {list(cfg.training.global_batch_size)}")
 
     # Setup tokenizer
     tokenizer = AutoTokenizer.from_pretrained(cfg.model.model_name)
@@ -444,8 +460,26 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
         seed=cfg.dataset.seed
     )
 
-    # Initial data loader setup (will be recreated each epoch if batch size changes)
-    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True) if distributed else None
+    # Calculate the per-GPU batch size once.
+    if distributed:
+        if cfg.training.global_batch_size % world_size != 0:
+            raise ValueError(f"Global batch size ({cfg.training.global_batch_size}) must be divisible by world size ({world_size}).")
+        local_batch_size = cfg.training.global_batch_size // world_size
+        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    else:
+        local_batch_size = cfg.training.global_batch_size
+        train_sampler = None
+
+    # DataLoader now creates perfectly sized batches for each GPU directly.
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=local_batch_size,
+        sampler=train_sampler,
+        shuffle=(train_sampler is None and not isinstance(train_dataset, StratifiedTheoremDataset)),
+        num_workers=cfg.runtime.num_workers,
+        pin_memory=True,
+        drop_last=True
+    )
 
     # Setup model
     model = setup_model(cfg, device)
@@ -460,7 +494,7 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=cfg.training.lr,
-        weight_decay=cfg.training.get('weight_decay', 0.01)  # Default to 0.01 if not specified
+        weight_decay=cfg.training.get('weight_decay', 0.01)
     )
 
     # Setup mixed precision scaler for GPU training
@@ -486,44 +520,21 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
                 print(f"Epoch {epoch+1}: Reset stratified sampling, "
                       f"{len(train_dataset.active_papers)} active papers")
 
-        # Get batch size for current epoch
-        epoch_batch_size = get_epoch_batch_size(cfg.training.global_batch_size, epoch)
-        batch_size = epoch_batch_size // world_size
-
-        # Create data loader with current epoch's batch size
-        train_loader = DataLoader(
-            train_dataset, batch_size=batch_size,
-            sampler=train_sampler,
-            shuffle=(train_sampler is None and not isinstance(train_dataset, StratifiedTheoremDataset)),
-            num_workers=cfg.runtime.num_workers,
-            pin_memory=True,
-            drop_last=cfg.training.drop_last
-        )
-
-        if rank == 0 and (epoch == 0 or (OmegaConf.is_list(cfg.training.global_batch_size) and
-                                          epoch < len(cfg.training.global_batch_size))):
-            print(f"Epoch {epoch+1}: Global batch size = {epoch_batch_size}")
-
         model.train()
         if distributed and train_sampler:
             train_sampler.set_epoch(epoch)
 
         total_loss, num_batches = 0, 0
-
         pbar = tqdm(train_loader, disable=(rank!=0), desc=f"Epoch {epoch+1}/{cfg.training.num_epochs}")
+
+        # Simplified training loop
         for batch in pbar:
-            x_packed = torch.cat([batch['input_ids_x'].to(device), batch['attention_mask_x'].to(device)], dim=1)
-            y_packed = torch.cat([batch['input_ids_y'].to(device), batch['attention_mask_y'].to(device)], dim=1)
-            actual_batch_size = x_packed.shape[0] * (world_size if distributed else 1)
+            # DataLoader provides a perfectly sized batch for this GPU. No accumulation needed.
+            x_packed = torch.cat([batch['input_ids_x'], batch['attention_mask_x']], dim=1).to(device)
+            y_packed = torch.cat([batch['input_ids_y'], batch['attention_mask_y']], dim=1).to(device)
 
-            if cfg.training.drop_last and actual_batch_size < epoch_batch_size:
-                if rank == 0:
-                    print(f"Skipping incomplete batch of size {actual_batch_size}")
-                continue
-
-            # Create config dict for compatibility with existing functions
             train_config = {
-                'GLOBAL_BATCH_SIZE': actual_batch_size,
+                'GLOBAL_BATCH_SIZE': cfg.training.global_batch_size,
                 'MICRO_BATCH_SIZE': cfg.training.micro_batch_size,
                 'STREAM_CHUNK_SIZE': cfg.training.stream_chunk_size,
                 'TAU': cfg.training.tau
@@ -544,7 +555,7 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
                 log_metrics({
                     'loss': loss,
                     'learning_rate': cfg.training.lr,
-                    'batch_size': actual_batch_size
+                    'batch_size': cfg.training.global_batch_size,
                 }, step=global_step, prefix='train')
 
         # Validation
@@ -590,8 +601,7 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
             # Log epoch summary
             log_metrics({
                 'epoch': epoch + 1,
-                'avg_train_loss': avg_train_loss,
-                'epoch_batch_size': epoch_batch_size
+                'avg_train_loss': avg_train_loss
             }, step=global_step)
 
         if distributed:
