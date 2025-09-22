@@ -353,7 +353,8 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
     # Setup optimizer (only for trainable parameters)
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
-        lr=cfg.training.lr
+        lr=cfg.training.lr,
+        weight_decay=cfg.training.get('weight_decay', 0.01)  # Default to 0.01 if not specified
     )
 
     # Setup mixed precision scaler for GPU training
