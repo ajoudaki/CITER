@@ -28,14 +28,81 @@ import wandb
 # Import distributed functions
 from distributed_clip import distributed_train_step, trivial_contrastive_step, distributed_validate_step
 
+from numba import njit # Import the Numba JIT compiler
+
+# ===================================================================
+# Numba-Optimized Helper Function for Pair Generation
+# ===================================================================
+@njit(cache=True)
+def _generate_shuffled_pairs_numba(paper_lengths: np.ndarray, seed: int) -> np.ndarray:
+    """
+    A Numba-JIT compiled function to generate and shuffle theorem pairs efficiently.
+
+    Args:
+        paper_lengths: A 1D NumPy array where each element is the number of statements in a paper.
+        seed: An integer for the random number generator.
+
+    Returns:
+        A 3D NumPy array of shape (total_pairs, 2, 2) containing the shuffled pairs.
+    """
+    # Numba requires its own random seed initialization
+    np.random.seed(seed)
+
+    # 1. Pre-calculate the total number of pairs to pre-allocate the final array
+    total_num_pairs = 0
+    for length in paper_lengths:
+        # This is an efficient way to calculate ceil(length / 2) using integer division
+        total_num_pairs += (length + 1) // 2
+
+    # 2. Pre-allocate the memory for the output array. This is much faster than appending.
+    all_pairs_arr = np.empty((total_num_pairs, 2, 2), dtype=np.int64)
+    current_pair_idx = 0
+
+    # 3. Iterate through each paper to generate its pairs
+    for paper_idx, num_stmts in enumerate(paper_lengths):
+
+        # If there's an odd number of statements, we need to add a duplicate
+        if num_stmts % 2 != 0:
+            stmt_indices = np.empty(num_stmts + 1, dtype=np.int64)
+            # Pick a random statement to duplicate
+            random_choice = np.random.randint(0, num_stmts)
+            stmt_indices[num_stmts] = random_choice
+        else:
+            stmt_indices = np.empty(num_stmts, dtype=np.int64)
+
+        # Populate the indices array
+        for i in range(num_stmts):
+            stmt_indices[i] = i
+
+        # Shuffle the indices in-place and form pairs
+        np.random.shuffle(stmt_indices)
+
+        num_paper_pairs = len(stmt_indices) // 2
+        for i in range(num_paper_pairs):
+            stmt_idx1 = stmt_indices[2 * i]
+            stmt_idx2 = stmt_indices[2 * i + 1]
+
+            # Store the pair directly into the pre-allocated array
+            all_pairs_arr[current_pair_idx][0][0] = paper_idx
+            all_pairs_arr[current_pair_idx][0][1] = stmt_idx1
+            all_pairs_arr[current_pair_idx][1][0] = paper_idx
+            all_pairs_arr[current_pair_idx][1][1] = stmt_idx2
+
+            current_pair_idx += 1
+
+    # 4. Shuffle the entire array of pairs globally
+    np.random.shuffle(all_pairs_arr)
+    return all_pairs_arr
+
+
 # ===================================================================
 # Dataset Class (Re-implemented for efficiency)
 # ===================================================================
 class StratifiedTheoremDataset(Dataset):
     """
     Stratified dataset that ensures each theorem/lemma appears ~once per epoch.
-    This implementation pre-computes an array of all pairs for the epoch, making
-    __getitem__ a fast lookup.
+    This implementation pre-computes an array of all pairs for the epoch using a
+    fast, Numba-compiled helper function.
     """
     def __init__(self, jsonl_path: str, tokenizer, max_length: int = 512,
                  split: str = 'train', train_ratio: float = 0.8, seed: int = 42):
@@ -55,13 +122,18 @@ class StratifiedTheoremDataset(Dataset):
                     all_papers_statements.append(statements)
 
         # Split train/eval using a reproducible shuffle
+        # Use numpy's older RandomState for compatibility if needed, but default_rng is fine here
         rng = np.random.default_rng(self.seed)
         indices = np.arange(len(all_papers_statements))
         rng.shuffle(indices)
         n_train = int(len(all_papers_statements) * train_ratio)
         split_indices = indices[:n_train] if split == 'train' else indices[n_train:]
-        
+
         self.papers = [all_papers_statements[i] for i in split_indices]
+
+        # Create a NumPy array of paper lengths for the Numba function
+        self.paper_lengths = np.array([len(p) for p in self.papers], dtype=np.int64)
+
         self.epoch_pairs = np.array([]) # Will be populated in reset_epoch
         self.reset_epoch()
 
@@ -71,33 +143,13 @@ class StratifiedTheoremDataset(Dataset):
 
     def reset_epoch(self):
         """
-        Generates and shuffles all possible statement pairs for the upcoming epoch.
-        This is called once at the beginning of each epoch.
+        Generates and shuffles all possible statement pairs for the upcoming epoch
+        by calling the high-performance Numba-compiled helper function.
         """
-        # Use an epoch-specific seed for reproducibility
-        rng = np.random.default_rng(self.seed + self.epoch)
+        # The core logic is now offloaded to the fast, compiled function
+        epoch_seed = self.seed + self.epoch
+        self.epoch_pairs = _generate_shuffled_pairs_numba(self.paper_lengths, epoch_seed)
         self.epoch += 1
-
-        all_pairs = []
-        for paper_idx, statements in enumerate(self.papers):
-            stmt_indices = np.arange(len(statements))
-            
-            # If odd number of statements, duplicate a random one to make it even
-            if len(stmt_indices) % 2 != 0:
-                random_choice = rng.choice(stmt_indices)
-                stmt_indices = np.append(stmt_indices, random_choice)
-            
-            # Shuffle and form pairs
-            rng.shuffle(stmt_indices)
-            paired_indices = stmt_indices.reshape(-1, 2)
-            
-            # Store pairs as (paper_idx, stmt_idx)
-            for stmt_idx1, stmt_idx2 in paired_indices:
-                all_pairs.append([[paper_idx, stmt_idx1], [paper_idx, stmt_idx2]])
-        
-        # Create a single numpy array and shuffle it for random batch access
-        self.epoch_pairs = np.array(all_pairs)
-        rng.shuffle(self.epoch_pairs, axis=0)
 
     def __len__(self):
         """Return the total number of pairs available for the epoch."""
@@ -358,8 +410,13 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
     
     num_training_steps = len(train_loader) * cfg.training.num_epochs
     warmup_steps = cfg.training.get('warmup_steps', 2000)
+    validation_interval = cfg.training.get('validation_interval', 0)
     if rank == 0:
         print(f"Scheduler: Cosine decay with {warmup_steps} warmup steps over {num_training_steps} total steps.")
+        if validation_interval > 0:
+            print(f"Validation: Will run every {validation_interval} steps + at epoch end")
+        else:
+            print(f"Validation: Will run only at epoch end")
     scheduler = get_cosine_schedule_with_warmup(
         optimizer, num_warmup_steps=warmup_steps, num_training_steps=num_training_steps
     )
@@ -371,6 +428,45 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
 
     val_x_packed, val_y_packed = prepare_validation_data(val_dataset, device, distributed, rank)
     global_step = 0
+
+    # Helper function for validation
+    def run_validation(step_num, epoch_num=None):
+        model.eval()
+        N_val = val_x_packed.shape[0]
+        val_world_size = world_size if distributed else 1
+        C_val = N_val // val_world_size
+        if N_val % val_world_size != 0 and rank == 0:
+            print(f"Warning: Val set size {N_val} not divisible by world size {val_world_size}")
+
+        start, end = rank * C_val, (rank + 1) * C_val
+        local_val_x = val_x_packed[start:end].to(device)
+        local_val_y = val_y_packed[start:end].to(device)
+
+        val_config = {
+            'GLOBAL_BATCH_SIZE': C_val * val_world_size,
+            'MICRO_BATCH_SIZE': cfg.training.micro_batch_size,
+            'STREAM_CHUNK_SIZE': cfg.training.stream_chunk_size,
+            'TAU': cfg.training.tau
+        }
+
+        with torch.no_grad():
+            val_loss, topk_acc = distributed_validate_step(model, local_val_x, local_val_y, val_config)
+
+        if rank == 0:
+            if epoch_num is not None:
+                print(f"\n[Epoch {epoch_num+1}] Validation at step {step_num}:")
+            else:
+                print(f"\nValidation at step {step_num}:")
+            print(f"  Val Loss:   {val_loss:.4f}")
+            print(f"  MRR:        {topk_acc.get('MRR', 0):.4f}")
+            print(f"  Top@1 Acc:  {topk_acc.get(1, 0)*100:.2f}%")
+            print(f"  Top@5 Acc:  {topk_acc.get(5, 0)*100:.2f}%")
+            print(f"  Top@10 Acc: {topk_acc.get(10, 0)*100:.2f}%\n")
+
+            log_metrics({'loss': val_loss, 'mrr': topk_acc.get('MRR', 0), 'top1_acc': topk_acc.get(1, 0)}, step=step_num, prefix='val')
+
+        model.train()
+        return val_loss, topk_acc
 
     for epoch in range(cfg.training.num_epochs):
         # The dataset's epoch must be synced with the training loop's epoch
@@ -404,7 +500,7 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
             total_loss += loss
             num_batches += 1
             global_step += 1
-            
+
             if rank == 0:
                 pbar.set_postfix(loss=f'{loss:.4f}', lr=f'{scheduler.get_last_lr()[0]:.2e}')
                 log_metrics({
@@ -413,27 +509,17 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
                     'batch_size': cfg.training.global_batch_size,
                 }, step=global_step, prefix='train')
 
-        # Validation
-        N_val = val_x_packed.shape[0]
-        val_world_size = world_size if distributed else 1
-        C_val = N_val // val_world_size
-        if N_val % val_world_size != 0 and rank == 0:
-            print(f"Warning: Val set size {N_val} not divisible by world size {val_world_size}")
+            # Run validation at specified intervals during training
+            if validation_interval > 0 and global_step % validation_interval == 0:
+                val_loss, topk_acc = run_validation(global_step, epoch_num=epoch)
+                if distributed:
+                    dist.barrier()
 
-        start, end = rank * C_val, (rank + 1) * C_val
-        local_val_x = val_x_packed[start:end].to(device)
-        local_val_y = val_y_packed[start:end].to(device)
-
-        val_config = {
-            'GLOBAL_BATCH_SIZE': C_val * val_world_size,
-            'MICRO_BATCH_SIZE': cfg.training.micro_batch_size,
-            'STREAM_CHUNK_SIZE': cfg.training.stream_chunk_size,
-            'TAU': cfg.training.tau
-        }
-        val_loss, topk_acc = distributed_validate_step(model, local_val_x, local_val_y, val_config)
+        # End of epoch validation (always run)
+        avg_train_loss = total_loss / num_batches if num_batches > 0 else 0
+        val_loss, topk_acc = run_validation(global_step, epoch_num=epoch)
 
         if rank == 0:
-            avg_train_loss = total_loss / num_batches if num_batches > 0 else 0
             print(f"\nEpoch [{epoch+1}/{cfg.training.num_epochs}] Summary:")
             print(f"  Train Loss: {avg_train_loss:.4f}")
             print(f"  Val Loss:   {val_loss:.4f}")
@@ -442,7 +528,6 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
             print(f"  Top@5 Acc:  {topk_acc.get(5, 0)*100:.2f}%")
             print(f"  Top@10 Acc: {topk_acc.get(10, 0)*100:.2f}%\n")
 
-            log_metrics({'loss': val_loss, 'mrr': topk_acc.get('MRR', 0), 'top1_acc': topk_acc.get(1, 0)}, step=global_step, prefix='val')
             log_metrics({'epoch': epoch + 1, 'avg_train_loss': avg_train_loss}, step=global_step)
 
         if distributed:

@@ -6,6 +6,7 @@ import math
 from contextlib import nullcontext
 from typing import Dict, Tuple, Optional
 from torch.cuda.amp import autocast
+from tqdm import tqdm
 
 # ===================================================================
 # Distributed Utilities
@@ -187,18 +188,18 @@ def distributed_train_step(
         optimizer.step()
     return global_loss
 
+
 def distributed_validate_step(
     model: torch.nn.Module,
     local_x: torch.Tensor,
     local_y: torch.Tensor,
     config: Dict
-) -> Tuple[float, Dict[int, float]]:
+) -> Tuple[float, Dict[str, float]]:
     """
-    Performs a distributed, memory-efficient validation step.
-    Treats the entire validation set as one global batch.
+    Performs a distributed, memory-efficient validation step with a progress bar.
     """
     model.eval()
-    
+
     if dist.is_initialized():
         P, rank = dist.get_world_size(), dist.get_rank()
     else:
@@ -214,8 +215,8 @@ def distributed_validate_step(
         module = model.module if hasattr(model, 'module') else model
         if not hasattr(module, 'encoder_x') or not hasattr(module, 'encoder_y'):
             raise AttributeError("Model must expose 'encoder_x' and 'encoder_y'.")
-        
-        # --- Phase A: Compute local embeddings (micro-batched) ---
+
+        # Phase A: Compute local embeddings
         local_Z_x, local_Z_y = [], []
         for i in range(0, C, B):
             z_x = module.encoder_x(local_x[i:i+B])
@@ -225,51 +226,59 @@ def distributed_validate_step(
         local_Z_x = torch.cat(local_Z_x, dim=0)
         local_Z_y = torch.cat(local_Z_y, dim=0)
 
-        # --- Sync Point 1: All-gather to get global embeddings ---
+        # Sync Point 1: All-gather to get global embeddings
         Z_x = all_gather_embeddings(local_Z_x)
         Z_y = all_gather_embeddings(local_Z_y)
 
-        # --- Phase B: Compute global loss (streamed) ---
+        # Phase B: Compute global loss
         a, b = compute_streaming_log_normalizers(Z_x, Z_y, TAU, M_stream)
         global_loss = calculate_global_loss(Z_x, Z_y, a, b, TAU, N)
 
-        # --- Top-K Accuracy Calculation (local chunk vs all) ---
+        # Streamed Top-K Accuracy and MRR Calculation
         start_idx_global = rank * C
         labels = torch.arange(start_idx_global, start_idx_global + C, device=local_x.device)
-        
-        # Compute similarities for the local chunk of x against all y
-        S_local = torch.matmul(local_Z_x, Z_y.T) / TAU
-        
-        # Get top-k predictions (need enough for MRR calculation)
         k_vals = [1, 5, 10]
         max_k = min(max(k_vals), N)
-        # Get enough predictions to find rank of correct item (up to N)
-        topk_for_mrr = min(N, S_local.shape[1])
-        _, topk_indices = S_local.topk(k=topk_for_mrr, dim=1)
+        topk_for_mrr = min(N, Z_y.shape[0])
 
-        # Count correct predictions locally for top-k accuracy
-        correct_counts = []
-        for k in k_vals:
-            if k > max_k:
-                correct_counts.append(0)
-                continue
-            correct = (topk_indices[:, :k] == labels.unsqueeze(1)).any(dim=1).sum()
-            correct_counts.append(correct.item())
+        val_micro_batch_size = config.get('MICRO_BATCH_SIZE', 128)
+        num_local_chunks = math.ceil(C / val_micro_batch_size)
 
-        # Calculate reciprocal ranks locally
-        reciprocal_ranks = []
-        for i in range(C):
-            # Find position of correct label in top-k predictions
-            positions = (topk_indices[i] == labels[i]).nonzero(as_tuple=True)[0]
-            if len(positions) > 0:
-                rank = positions[0].item() + 1  # Rank is 1-indexed
-                reciprocal_ranks.append(1.0 / rank)
-            else:
-                reciprocal_ranks.append(0.0)  # Correct item not in top-k
+        all_reciprocal_ranks = []
+        all_correct_counts = {k: 0 for k in k_vals}
 
-        # --- Sync Point 2: Aggregate counts and MRR from all GPUs ---
-        local_mrr_sum = sum(reciprocal_ranks)
+        # --- PROGRESS BAR ADDITION START ---
+        pbar = tqdm(range(num_local_chunks), desc="Validation", disable=(rank != 0))
+        # --- PROGRESS BAR ADDITION END ---
+
+        for i in pbar: # <-- Use the pbar object here
+            start = i * val_micro_batch_size
+            end = min((i + 1) * val_micro_batch_size, C)
+            if start >= end: continue
+
+            local_Z_x_chunk = local_Z_x[start:end]
+            chunk_labels = labels[start:end]
+            S_chunk = torch.matmul(local_Z_x_chunk, Z_y.T) / TAU
+            _, topk_indices_chunk = S_chunk.topk(k=topk_for_mrr, dim=1)
+
+            for k in k_vals:
+                if k <= max_k:
+                    correct = (topk_indices_chunk[:, :k] == chunk_labels.unsqueeze(1)).any(dim=1).sum()
+                    all_correct_counts[k] += correct.item()
+
+            for j in range(len(chunk_labels)):
+                positions = (topk_indices_chunk[j] == chunk_labels[j]).nonzero(as_tuple=True)[0]
+                if len(positions) > 0:
+                    rank_val = positions[0].item() + 1
+                    all_reciprocal_ranks.append(1.0 / rank_val)
+                else:
+                    all_reciprocal_ranks.append(0.0)
+
+        # Sync Point 2: Aggregate metrics from all GPUs
+        correct_counts = [all_correct_counts[k] for k in k_vals]
+        local_mrr_sum = sum(all_reciprocal_ranks)
         metrics_tensor = torch.tensor(correct_counts + [local_mrr_sum], device=local_x.device, dtype=torch.float32)
+
         if P > 1:
             dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
 
@@ -278,9 +287,10 @@ def distributed_validate_step(
         total_mrr_sum = total_metrics[-1]
 
         topk_acc = {k: count / N for k, count in zip(k_vals, total_correct)}
-        topk_acc['MRR'] = total_mrr_sum / N  # Mean Reciprocal Rank
+        topk_acc['MRR'] = total_mrr_sum / N
 
     return global_loss, topk_acc
+
 
 def trivial_contrastive_step(
     model: torch.nn.Module,
