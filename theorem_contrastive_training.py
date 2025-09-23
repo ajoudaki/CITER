@@ -29,6 +29,8 @@ import wandb
 from distributed_clip import distributed_train_step, trivial_contrastive_step, distributed_validate_step
 
 from numba import njit # Import the Numba JIT compiler
+import torch.utils.checkpoint as checkpoint # <-- ADD THIS IMPORT
+
 
 # ===================================================================
 # Numba-Optimized Helper Function for Pair Generation
@@ -186,29 +188,47 @@ class StratifiedTheoremDataset(Dataset):
         }
 
 # ===================================================================
-# Model Architectures (Unchanged)
+# Model Architectures 
 # ===================================================================
 class CLSPoolingEncoder(nn.Module):
-    """Encoder that uses the [CLS] token embedding."""
-    def __init__(self, model_name: str, hidden_dim: int, output_dim: int):
+    """Encoder that uses the [CLS] token embedding with optional gradient checkpointing."""
+    def __init__(self, model_name: str, hidden_dim: int, output_dim: int, use_gradient_checkpointing: bool = False):
         super().__init__()
         self.base_model = AutoModel.from_pretrained(model_name)
         self.projection = nn.Linear(hidden_dim, output_dim)
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
     def forward(self, input_ids, attention_mask):
-        outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
+        if self.use_gradient_checkpointing:
+            outputs = checkpoint.checkpoint(
+                self.base_model,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_reentrant=False
+            )
+        else:
+            outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
         cls_embedding = outputs.last_hidden_state[:, 0, :]
         return F.normalize(self.projection(cls_embedding), p=2, dim=-1)
 
 class LastTokenEncoder(nn.Module):
-    """Encoder that uses the last non-padding token's hidden state."""
-    def __init__(self, model_name: str, hidden_dim: int, output_dim: int):
+    """Encoder that uses the last non-padding token's hidden state with optional gradient checkpointing."""
+    def __init__(self, model_name: str, hidden_dim: int, output_dim: int, use_gradient_checkpointing: bool = False):
         super().__init__()
         self.base_model = AutoModel.from_pretrained(model_name)
         self.projection = nn.Linear(hidden_dim, output_dim)
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
     def forward(self, input_ids, attention_mask):
-        outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
+        if self.use_gradient_checkpointing:
+            outputs = checkpoint.checkpoint(
+                self.base_model,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_reentrant=False
+            )
+        else:
+            outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
         last_hidden_state = outputs.last_hidden_state
         sequence_lengths = attention_mask.sum(dim=1) - 1
         batch_indices = torch.arange(len(sequence_lengths), device=sequence_lengths.device)
@@ -219,6 +239,8 @@ ENCODER_REGISTRY = {
     'cls_pooling': CLSPoolingEncoder,
     'last_token_pooling': LastTokenEncoder,
 }
+
+
 
 class EncoderWrapper(nn.Module):
     def __init__(self, base_encoder, max_length):
@@ -289,14 +311,16 @@ def print_trainable_parameters(model):
         })
 
 def setup_model(cfg: DictConfig, device):
-    """Setup model with optional LoRA."""
+    """Setup model with optional LoRA and gradient checkpointing."""
     encoder_class = ENCODER_REGISTRY.get(cfg.model.model_type)
     if encoder_class is None:
         raise ValueError(f"Unknown model type: {cfg.model.model_type}")
+    use_gradient_checkpointing = cfg.training.get('gradient_checkpointing', False)
     base_encoder = encoder_class(
         model_name=cfg.model.model_name,
         hidden_dim=cfg.model.hidden_dim,
-        output_dim=cfg.training.output_dim
+        output_dim=cfg.training.output_dim,
+        use_gradient_checkpointing=use_gradient_checkpointing
     )
     if cfg.training.lora.enabled:
         for param in base_encoder.base_model.parameters():
@@ -366,6 +390,10 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
         print(f"Using model: {cfg.model.model_name} with {cfg.model.model_type} strategy.")
         if cfg.training.lora.enabled:
             print("LoRA is ENABLED.")
+        if cfg.training.get('gradient_checkpointing', False):
+            print("Gradient checkpointing is ENABLED (saves memory, slower training).")
+        else:
+            print("Gradient checkpointing is DISABLED (uses more memory, faster training).")
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.model.model_name)
     if tokenizer.pad_token is None:

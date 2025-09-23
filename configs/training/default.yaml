@@ -9,6 +9,7 @@ max_length: 256
 output_dim: 2048
 drop_last: true # drop last batch if its sizee is < global_batch_size
 use_amp: true  # Enable automatic mixed precision for memory efficiency
+gradient_checkpointing: true  # Enable gradient checkpointing to save memory
 warmup_steps: 100
 validation_interval: 0  # Run validation every N training steps (set to 0 to validate only at epoch end)
 
