@@ -188,7 +188,6 @@ def distributed_train_step(
         optimizer.step()
     return global_loss
 
-
 def distributed_validate_step(
     model: torch.nn.Module,
     local_x: torch.Tensor,
@@ -196,10 +195,11 @@ def distributed_validate_step(
     config: Dict
 ) -> Tuple[float, Dict[str, float]]:
     """
-    Performs a distributed, memory-efficient validation step with a progress bar.
+    Performs a distributed, memory-efficient validation step with progress bars
+    for both embedding calculation and metric computation.
     """
     model.eval()
-
+    
     if dist.is_initialized():
         P, rank = dist.get_world_size(), dist.get_rank()
     else:
@@ -215,31 +215,38 @@ def distributed_validate_step(
         module = model.module if hasattr(model, 'module') else model
         if not hasattr(module, 'encoder_x') or not hasattr(module, 'encoder_y'):
             raise AttributeError("Model must expose 'encoder_x' and 'encoder_y'.")
-
-        # Phase A: Compute local embeddings
+        
+        # --- Phase A: Compute local embeddings with a progress bar ---
         local_Z_x, local_Z_y = [], []
-        for i in range(0, C, B):
+        
+        # --- NEW PROGRESS BAR START ---
+        # This wrapper will show progress for the embedding calculation loop.
+        embedding_pbar = tqdm(range(0, C, B), desc="Val Embeddings", disable=(rank != 0))
+        # --- NEW PROGRESS BAR END ---
+
+        for i in embedding_pbar:
             z_x = module.encoder_x(local_x[i:i+B])
             z_y = module.encoder_y(local_y[i:i+B])
             local_Z_x.append(z_x)
             local_Z_y.append(z_y)
+        
         local_Z_x = torch.cat(local_Z_x, dim=0)
         local_Z_y = torch.cat(local_Z_y, dim=0)
 
-        # Sync Point 1: All-gather to get global embeddings
+        # --- Sync Point 1: All-gather to get global embeddings ---
         Z_x = all_gather_embeddings(local_Z_x)
         Z_y = all_gather_embeddings(local_Z_y)
 
-        # Phase B: Compute global loss
+        # --- Phase B: Compute global loss (this part is fast enough not to need a progress bar) ---
         a, b = compute_streaming_log_normalizers(Z_x, Z_y, TAU, M_stream)
         global_loss = calculate_global_loss(Z_x, Z_y, a, b, TAU, N)
-
-        # Streamed Top-K Accuracy and MRR Calculation
+        
+        # --- Streamed Top-K Accuracy and MRR Calculation ---
         start_idx_global = rank * C
         labels = torch.arange(start_idx_global, start_idx_global + C, device=local_x.device)
         k_vals = [1, 5, 10]
         max_k = min(max(k_vals), N)
-        topk_for_mrr = min(N, Z_y.shape[0])
+        topk_for_mrr = min(N, Z_y.shape[0]) 
 
         val_micro_batch_size = config.get('MICRO_BATCH_SIZE', 128)
         num_local_chunks = math.ceil(C / val_micro_batch_size)
@@ -247,11 +254,9 @@ def distributed_validate_step(
         all_reciprocal_ranks = []
         all_correct_counts = {k: 0 for k in k_vals}
 
-        # --- PROGRESS BAR ADDITION START ---
-        pbar = tqdm(range(num_local_chunks), desc="Validation", disable=(rank != 0))
-        # --- PROGRESS BAR ADDITION END ---
+        metric_pbar = tqdm(range(num_local_chunks), desc="Validation", disable=(rank != 0))
 
-        for i in pbar: # <-- Use the pbar object here
+        for i in metric_pbar:
             start = i * val_micro_batch_size
             end = min((i + 1) * val_micro_batch_size, C)
             if start >= end: continue
@@ -273,12 +278,12 @@ def distributed_validate_step(
                     all_reciprocal_ranks.append(1.0 / rank_val)
                 else:
                     all_reciprocal_ranks.append(0.0)
-
-        # Sync Point 2: Aggregate metrics from all GPUs
+        
+        # --- Sync Point 2: Aggregate metrics from all GPUs ---
         correct_counts = [all_correct_counts[k] for k in k_vals]
         local_mrr_sum = sum(all_reciprocal_ranks)
         metrics_tensor = torch.tensor(correct_counts + [local_mrr_sum], device=local_x.device, dtype=torch.float32)
-
+        
         if P > 1:
             dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
 
