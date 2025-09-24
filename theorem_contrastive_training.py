@@ -12,6 +12,7 @@ from torch.cuda.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import LambdaLR
 import numpy as np  # Import numpy for the new implementation
 
+
 # Set TOKENIZERS_PARALLELISM before any other imports to prevent warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -21,8 +22,10 @@ from omegaconf import DictConfig, OmegaConf
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig
 from peft import get_peft_model, LoraConfig, TaskType
+import bitsandbytes.optim as bnb_optim
+
 import wandb
 
 # Import distributed functions
@@ -192,9 +195,16 @@ class StratifiedTheoremDataset(Dataset):
 # ===================================================================
 class CLSPoolingEncoder(nn.Module):
     """Encoder that uses the [CLS] token embedding with optional gradient checkpointing."""
-    def __init__(self, model_name: str, hidden_dim: int, output_dim: int, use_gradient_checkpointing: bool = False):
+    def __init__(self, model_name: str, hidden_dim: int, output_dim: int, use_gradient_checkpointing: bool = False, quantization_config=None):
         super().__init__()
-        self.base_model = AutoModel.from_pretrained(model_name)
+        # Pass quantization_config if it exists, and set device_map only when quantizing
+        model_kwargs = {
+            "quantization_config": quantization_config,
+            "device_map": "auto" if quantization_config else None,
+        }
+        # Filter out None values to keep the from_pretrained call clean
+        model_kwargs = {k: v for k, v in model_kwargs.items() if v is not None}
+        self.base_model = AutoModel.from_pretrained(model_name, **model_kwargs)
         self.projection = nn.Linear(hidden_dim, output_dim)
         self.use_gradient_checkpointing = use_gradient_checkpointing
 
@@ -213,9 +223,16 @@ class CLSPoolingEncoder(nn.Module):
 
 class LastTokenEncoder(nn.Module):
     """Encoder that uses the last non-padding token's hidden state with optional gradient checkpointing."""
-    def __init__(self, model_name: str, hidden_dim: int, output_dim: int, use_gradient_checkpointing: bool = False):
+    def __init__(self, model_name: str, hidden_dim: int, output_dim: int, use_gradient_checkpointing: bool = False, quantization_config=None):
         super().__init__()
-        self.base_model = AutoModel.from_pretrained(model_name)
+        # Pass quantization_config if it exists, and set device_map only when quantizing
+        model_kwargs = {
+            "quantization_config": quantization_config,
+            # "device_map": "auto", #if quantization_config else None,
+        }
+        # Filter out None values to keep the from_pretrained call clean
+        model_kwargs = {k: v for k, v in model_kwargs.items() if v is not None}
+        self.base_model = AutoModel.from_pretrained(model_name, **model_kwargs)
         self.projection = nn.Linear(hidden_dim, output_dim)
         self.use_gradient_checkpointing = use_gradient_checkpointing
 
@@ -234,6 +251,7 @@ class LastTokenEncoder(nn.Module):
         batch_indices = torch.arange(len(sequence_lengths), device=sequence_lengths.device)
         last_token_embedding = last_hidden_state[batch_indices, sequence_lengths, :]
         return F.normalize(self.projection(last_token_embedding), p=2, dim=-1)
+
 
 ENCODER_REGISTRY = {
     'cls_pooling': CLSPoolingEncoder,
@@ -311,20 +329,45 @@ def print_trainable_parameters(model):
         })
 
 def setup_model(cfg: DictConfig, device):
-    """Setup model with optional LoRA and gradient checkpointing."""
+    """Setup model with optional LoRA, quantization, and gradient checkpointing."""
+    quantization_config = None
+    # Check if the quantization config exists and is enabled
+    if cfg.training.get("quantization") and cfg.training.quantization.get("enabled"):
+        if global_rank == 0:
+            print("Quantization is ENABLED.")
+        
+        # Get compute dtype from config string
+        compute_dtype_str = cfg.training.quantization.get("bnb_4bit_compute_dtype", "bfloat16")
+        compute_dtype = getattr(torch, compute_dtype_str)
+
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type=cfg.training.quantization.get("bnb_4bit_quant_type", "nf4"),
+            bnb_4bit_use_double_quant=cfg.training.quantization.get("bnb_4bit_use_double_quant", True),
+            bnb_4bit_compute_dtype=compute_dtype,
+        )
+    elif global_rank == 0:
+        print("Quantization is DISABLED.")
+        
     encoder_class = ENCODER_REGISTRY.get(cfg.model.model_type)
     if encoder_class is None:
         raise ValueError(f"Unknown model type: {cfg.model.model_type}")
+    
     use_gradient_checkpointing = cfg.training.get('gradient_checkpointing', False)
+    
     base_encoder = encoder_class(
         model_name=cfg.model.model_name,
         hidden_dim=cfg.model.hidden_dim,
         output_dim=cfg.training.output_dim,
-        use_gradient_checkpointing=use_gradient_checkpointing
+        use_gradient_checkpointing=use_gradient_checkpointing,
+        quantization_config=quantization_config  # Pass the config (or None)
     )
+
     if cfg.training.lora.enabled:
+        # Prepare for LoRA. This works correctly whether the model is quantized or not.
         for param in base_encoder.base_model.parameters():
             param.requires_grad = False
+            
         target_modules = list(cfg.model.lora_target_modules)
         peft_config = LoraConfig(
             task_type=TaskType.FEATURE_EXTRACTION, r=cfg.training.lora.r,
@@ -332,9 +375,12 @@ def setup_model(cfg: DictConfig, device):
             target_modules=target_modules,
         )
         base_encoder.base_model = get_peft_model(base_encoder.base_model, peft_config)
+
     for param in base_encoder.projection.parameters():
         param.requires_grad = True
+        
     model = TheoremContrastiveModel(base_encoder, max_length=cfg.training.max_length)
+    
     return model.to(device)
 
 def prepare_validation_data(val_dataset, device, distributed, rank):
@@ -382,6 +428,8 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
              torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if distributed:
         torch.cuda.set_device(rank)
+    global global_rank
+    global_rank = rank
 
     wandb_run = init_wandb(cfg, rank)
 
@@ -429,12 +477,27 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
     if rank == 0:
         print_trainable_parameters(model)
     if distributed:
-        model = DDP(model, device_ids=[rank])
+        model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=cfg.training.lr, weight_decay=cfg.training.get('weight_decay', 0.01)
-    )
+    use_quantized_optim = cfg.training.get("quantization") and cfg.training.quantization.get("enabled")
+    
+    if use_quantized_optim:
+        if rank == 0:
+            print("Using 8-bit AdamW optimizer.")
+        optimizer = bnb_optim.AdamW8bit(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=cfg.training.lr, 
+            weight_decay=cfg.training.get('weight_decay', 0.01)
+        )
+    else:
+        if rank == 0:
+            print("Using standard AdamW optimizer.")
+        optimizer = torch.optim.AdamW(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=cfg.training.lr, 
+            weight_decay=cfg.training.get('weight_decay', 0.01)
+        )
+
     
     num_training_steps = len(train_loader) * cfg.training.num_epochs
     warmup_steps = cfg.training.get('warmup_steps', 2000)
