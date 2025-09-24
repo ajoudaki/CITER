@@ -1,0 +1,6 @@
+# Qwen 1.5B model configuration
+name: deepscaler-1.5b
+model_name: agentica-org/DeepScaleR-1.5B-Preview
+model_type: last_token_pooling
+hidden_dim: 1536
+lora_target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
