@@ -1,0 +1,6 @@
+name: bm25-baseline
+model_name: bert-base-uncased
+model_type: bm25
+output_dim: 2048
+use_gradient_checkpointing: false
+quantization_config: null

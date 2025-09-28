@@ -293,10 +293,56 @@ class JaccardEncoder(nn.Module):
         return bow_vectors
 
 
+class BM25Encoder(nn.Module):
+    """BM25 scoring encoder (no training needed)."""
+    def __init__(self, model_name: str = "bert-base-uncased", output_dim: int = 768, **kwargs):
+        super().__init__()
+        self.vocab_size = min(30000, 50000)
+        self.output_dim = output_dim
+        # BM25 parameters
+        self.k1 = 1.2  # Term frequency saturation
+        self.b = 0.75  # Length normalization
+
+    def forward(self, input_ids, attention_mask):
+        batch_size, device = input_ids.shape[0], input_ids.device
+
+        # Create BM25 weighted vectors
+        bm25_vectors = torch.zeros(batch_size, self.vocab_size, device=device)
+
+        for i in range(batch_size):
+            valid_tokens = input_ids[i][attention_mask[i] == 1]
+            valid_tokens = valid_tokens[(valid_tokens > 100) & (valid_tokens < self.vocab_size)]
+
+            if len(valid_tokens) > 0:
+                doc_len = len(valid_tokens)
+                # Vectorized BM25 scoring
+                unique_tokens, counts = torch.unique(valid_tokens, return_counts=True)
+                tf = counts.float()
+                # BM25 scoring: (tf * (k1 + 1)) / (tf + k1 * norm)
+                length_norm = 1.0 + self.b * (doc_len / 100.0 - 1.0)
+                bm25_scores = (tf * (self.k1 + 1)) / (tf + self.k1 * max(length_norm, 0.5))
+                bm25_vectors[i, unique_tokens] = bm25_scores
+
+        # L2 normalize for cosine similarity
+        bm25_vectors = F.normalize(bm25_vectors + 1e-10, p=2, dim=-1)
+
+        # Project to output dimension if needed
+        if self.vocab_size != self.output_dim:
+            if not hasattr(self, 'projection'):
+                self.projection = nn.Linear(self.vocab_size, self.output_dim, bias=False).to(device)
+                nn.init.orthogonal_(self.projection.weight)
+                self.projection.requires_grad_(False)
+            bm25_vectors = self.projection(bm25_vectors)
+            bm25_vectors = F.normalize(bm25_vectors, p=2, dim=-1)
+
+        return bm25_vectors
+
+
 ENCODER_REGISTRY = {
     'cls_pooling': CLSPoolingEncoder,
     'last_token_pooling': LastTokenEncoder,
     'jaccard': JaccardEncoder,
+    'bm25': BM25Encoder,
 }
 
 
