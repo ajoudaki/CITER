@@ -1,11 +1,6 @@
-name: bert-base
+name: jaccard-baseline
 model_name: bert-base-uncased
-model_type: cls_pooling
-hidden_dim: 768
+model_type: jaccard
 output_dim: 2048
 use_gradient_checkpointing: false
-lora_target_modules:
-- query
-- key
-- value
 quantization_config: null

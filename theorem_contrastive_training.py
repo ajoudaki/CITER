@@ -253,9 +253,50 @@ class LastTokenEncoder(nn.Module):
         return F.normalize(self.projection(last_token_embedding), p=2, dim=-1)
 
 
+class JaccardEncoder(nn.Module):
+    """Bag-of-tokens encoder using Jaccard similarity (no training needed)."""
+    def __init__(self, model_name: str = "bert-base-uncased", output_dim: int = 768, **kwargs):
+        super().__init__()
+        # Just use a fixed vocab size instead of loading tokenizer
+        self.vocab_size = min(30000, 50000)  # Cap at 30k for memory
+        self.output_dim = output_dim
+
+    def forward(self, input_ids, attention_mask):
+        batch_size, device = input_ids.shape[0], input_ids.device
+
+        # Create binary bag-of-words vectors
+        bow_vectors = torch.zeros(batch_size, self.vocab_size, device=device)
+
+        for i in range(batch_size):
+            # Get valid tokens (non-padding)
+            valid_tokens = input_ids[i][attention_mask[i] == 1]
+            # Filter special tokens (typically < 1000) and cap at vocab_size
+            valid_tokens = valid_tokens[(valid_tokens > 100) & (valid_tokens < self.vocab_size)]
+            if len(valid_tokens) > 0:
+                # Set 1 for present tokens (bag-of-words)
+                bow_vectors[i].scatter_(0, valid_tokens, 1.0)
+
+        # L2 normalize for cosine similarity (equivalent to Jaccard for binary vectors)
+        bow_vectors = F.normalize(bow_vectors, p=2, dim=-1)
+
+        # Project to output dimension if needed
+        if self.vocab_size != self.output_dim:
+            # Simple random projection for dimension matching
+            if not hasattr(self, 'projection'):
+                self.projection = nn.Linear(self.vocab_size, self.output_dim, bias=False).to(device)
+                # Initialize with random orthogonal matrix
+                nn.init.orthogonal_(self.projection.weight)
+                self.projection.requires_grad_(False)
+            bow_vectors = self.projection(bow_vectors)
+            bow_vectors = F.normalize(bow_vectors, p=2, dim=-1)
+
+        return bow_vectors
+
+
 ENCODER_REGISTRY = {
     'cls_pooling': CLSPoolingEncoder,
     'last_token_pooling': LastTokenEncoder,
+    'jaccard': JaccardEncoder,
 }
 
 
@@ -320,27 +361,35 @@ def print_trainable_parameters(model):
     """Prints the number of trainable parameters in the model."""
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     all_param = sum(p.numel() for p in model.parameters())
-    print(f"trainable params: {trainable_params:,} || all params: {all_param:,} || "
-          f"trainable%: {100 * trainable_params / all_param:.2f}")
+    if all_param > 0:
+        print(f"trainable params: {trainable_params:,} || all params: {all_param:,} || "
+              f"trainable%: {100 * trainable_params / all_param:.2f}")
+    else:
+        print(f"Model has no parameters (baseline model)")
     if wandb.run is not None:
         wandb.config.update({
             "trainable_params": trainable_params, "total_params": all_param,
-            "trainable_percent": 100 * trainable_params / all_param
+            "trainable_percent": 100 * trainable_params / all_param if all_param > 0 else 0
         })
 
 def setup_model(cfg: DictConfig, device):
     """Setup model with optional LoRA, quantization, and gradient checkpointing."""
-    quantization_config = None
-    # Check if the quantization config exists and is enabled
+    encoder_class = ENCODER_REGISTRY.get(cfg.model.model_type)
+    if encoder_class is None:
+        raise ValueError(f"Unknown model type: {cfg.model.model_type}")
+
+    # Convert model config to dict
+    model_kwargs = OmegaConf.to_container(cfg.model, resolve=True)
+
+    # Handle quantization if enabled in training config
     if cfg.training.get("quantization") and cfg.training.quantization.get("enabled"):
         if global_rank == 0:
             print("Quantization is ENABLED.")
-        
-        # Get compute dtype from config string
+
         compute_dtype_str = cfg.training.quantization.get("bnb_4bit_compute_dtype", "bfloat16")
         compute_dtype = getattr(torch, compute_dtype_str)
 
-        quantization_config = BitsAndBytesConfig(
+        model_kwargs['quantization_config'] = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type=cfg.training.quantization.get("bnb_4bit_quant_type", "nf4"),
             bnb_4bit_use_double_quant=cfg.training.quantization.get("bnb_4bit_use_double_quant", True),
@@ -348,26 +397,15 @@ def setup_model(cfg: DictConfig, device):
         )
     elif global_rank == 0:
         print("Quantization is DISABLED.")
-        
-    encoder_class = ENCODER_REGISTRY.get(cfg.model.model_type)
-    if encoder_class is None:
-        raise ValueError(f"Unknown model type: {cfg.model.model_type}")
-    
-    use_gradient_checkpointing = cfg.training.get('gradient_checkpointing', False)
-    
-    base_encoder = encoder_class(
-        model_name=cfg.model.model_name,
-        hidden_dim=cfg.model.hidden_dim,
-        output_dim=cfg.training.output_dim,
-        use_gradient_checkpointing=use_gradient_checkpointing,
-        quantization_config=quantization_config  # Pass the config (or None)
-    )
+
+    # Create encoder with unpacked model config
+    base_encoder = encoder_class(**model_kwargs)
 
     if cfg.training.lora.enabled:
         # Prepare for LoRA. This works correctly whether the model is quantized or not.
         for param in base_encoder.base_model.parameters():
             param.requires_grad = False
-            
+
         target_modules = list(cfg.model.lora_target_modules)
         peft_config = LoraConfig(
             task_type=TaskType.FEATURE_EXTRACTION, r=cfg.training.lora.r,
@@ -376,8 +414,10 @@ def setup_model(cfg: DictConfig, device):
         )
         base_encoder.base_model = get_peft_model(base_encoder.base_model, peft_config)
 
-    for param in base_encoder.projection.parameters():
-        param.requires_grad = True
+    # Only set projection parameters if encoder has projection layer
+    if hasattr(base_encoder, 'projection'):
+        for param in base_encoder.projection.parameters():
+            param.requires_grad = True
         
     model = TheoremContrastiveModel(base_encoder, max_length=cfg.training.max_length)
     
@@ -479,38 +519,49 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
     if distributed:
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
-    use_quantized_optim = cfg.training.get("quantization") and cfg.training.quantization.get("enabled")
-    
-    if use_quantized_optim:
+    # Check if model has trainable parameters
+    trainable_params = list(filter(lambda p: p.requires_grad, model.parameters()))
+
+    # Only create optimizer if we have trainable parameters
+    if len(trainable_params) > 0:
+        use_quantized_optim = cfg.training.get("quantization") and cfg.training.quantization.get("enabled")
+
+        if use_quantized_optim:
+            if rank == 0:
+                print("Using 8-bit AdamW optimizer.")
+            optimizer = bnb_optim.AdamW8bit(
+                trainable_params,
+                lr=cfg.training.lr,
+                weight_decay=cfg.training.get('weight_decay', 0.01)
+            )
+        else:
+            if rank == 0:
+                print("Using standard AdamW optimizer.")
+            optimizer = torch.optim.AdamW(
+                trainable_params,
+                lr=cfg.training.lr,
+                weight_decay=cfg.training.get('weight_decay', 0.01)
+            )
+    else:
+        optimizer = None  # No optimizer needed for baseline models
+
+    # Only setup scheduler if we have an optimizer
+    if optimizer is not None:
+        num_training_steps = len(train_loader) * cfg.training.num_epochs
+        warmup_steps = cfg.training.get('warmup_steps', 2000)
+        validation_interval = cfg.training.get('validation_interval', 0)
         if rank == 0:
-            print("Using 8-bit AdamW optimizer.")
-        optimizer = bnb_optim.AdamW8bit(
-            filter(lambda p: p.requires_grad, model.parameters()),
-            lr=cfg.training.lr, 
-            weight_decay=cfg.training.get('weight_decay', 0.01)
+            print(f"Scheduler: Cosine decay with {warmup_steps} warmup steps over {num_training_steps} total steps.")
+            if validation_interval > 0:
+                print(f"Validation: Will run every {validation_interval} steps + at epoch end")
+            else:
+                print(f"Validation: Will run only at epoch end")
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer, num_warmup_steps=warmup_steps, num_training_steps=num_training_steps
         )
     else:
-        if rank == 0:
-            print("Using standard AdamW optimizer.")
-        optimizer = torch.optim.AdamW(
-            filter(lambda p: p.requires_grad, model.parameters()),
-            lr=cfg.training.lr, 
-            weight_decay=cfg.training.get('weight_decay', 0.01)
-        )
-
-    
-    num_training_steps = len(train_loader) * cfg.training.num_epochs
-    warmup_steps = cfg.training.get('warmup_steps', 2000)
-    validation_interval = cfg.training.get('validation_interval', 0)
-    if rank == 0:
-        print(f"Scheduler: Cosine decay with {warmup_steps} warmup steps over {num_training_steps} total steps.")
-        if validation_interval > 0:
-            print(f"Validation: Will run every {validation_interval} steps + at epoch end")
-        else:
-            print(f"Validation: Will run only at epoch end")
-    scheduler = get_cosine_schedule_with_warmup(
-        optimizer, num_warmup_steps=warmup_steps, num_training_steps=num_training_steps
-    )
+        scheduler = None
+        validation_interval = 0
 
     use_amp = cfg.training.get('use_amp', True) and torch.cuda.is_available()
     scaler = GradScaler() if use_amp else None
@@ -518,6 +569,42 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
         print(f"Mixed precision training {'ENABLED' if use_amp else 'DISABLED'}")
 
     val_x_packed, val_y_packed = prepare_validation_data(val_dataset, device, distributed, rank)
+
+    # For baseline models with no parameters, run validation only
+    if len(trainable_params) == 0:
+        if rank == 0:
+            print("No trainable parameters - running validation only.")
+
+        model.eval()
+        N_val = val_x_packed.shape[0]
+        val_world_size = world_size if distributed else 1
+        C_val = N_val // val_world_size
+
+        start, end = rank * C_val, (rank + 1) * C_val
+        local_val_x_packed = val_x_packed[start:end].to(device)
+        local_val_y_packed = val_y_packed[start:end].to(device)
+
+        val_config = {
+            'GLOBAL_BATCH_SIZE': N_val,
+            'MICRO_BATCH_SIZE': cfg.training.micro_batch_size,
+            'STREAM_CHUNK_SIZE': cfg.training.stream_chunk_size,
+            'TAU': cfg.training.tau
+        }
+
+        val_loss, val_metrics = distributed_validate_step(
+            model, local_val_x_packed, local_val_y_packed, val_config
+        )
+
+        if rank == 0:
+            print(f"\nValidation Results:")
+            print(f"Val Loss: {val_loss:.4f}")
+            for k, v in val_metrics.items():
+                if k == 'MRR':
+                    print(f"MRR: {v:.4f}")
+                else:
+                    print(f"top-{k}: {v:.4f}")
+        return  # Exit early for baseline models
+
     global_step = 0
 
     # Helper function for validation

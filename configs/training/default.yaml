@@ -14,7 +14,7 @@ warmup_steps: 100
 validation_interval: 0  # Run validation every N training steps (set to 0 to validate only at epoch end)
 
 quantization:
-  enabled: false        # Master switch to turn quantization on/off
+  enabled: true        # Master switch to turn quantization on/off
   bnb_4bit_quant_type: "nf4"
   bnb_4bit_use_double_quant: true
   bnb_4bit_compute_dtype: "bfloat16" # Use a string for YAML compatibility

@@ -1,6 +1,12 @@
-# Qwen 1.5B model configuration
 name: fastcurl-1.5b
 model_name: Nickyang/FastCuRL-1.5B-V3
 model_type: last_token_pooling
 hidden_dim: 1536
-lora_target_modules: ["q_proj", "v_proj", "k_proj", "o_proj"]
+lora_target_modules:
+- q_proj
+- v_proj
+- k_proj
+- o_proj
+output_dim: 2048
+use_gradient_checkpointing: false
+quantization_config: null
