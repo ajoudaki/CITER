@@ -293,6 +293,79 @@ class JaccardEncoder(nn.Module):
         return bow_vectors
 
 
+class MinHashEncoder(nn.Module):
+    """MinHash encoder using Hamming distance (no training needed)."""
+    def __init__(self, model_name: str = "bert-base-uncased", output_dim: int = 768, **kwargs):
+        super().__init__()
+        self.vocab_size = min(30000, 50000)
+        self.num_hashes = output_dim  # Use output_dim as number of hash functions
+
+        # Find prime for hash functions
+        self.prime = self._find_next_prime(self.vocab_size)
+
+        # Initialize hash parameters (will be set on first forward pass to get device)
+        self.a = None
+        self.b = None
+        self.hashed_vocab = None
+
+    def _find_next_prime(self, n: int) -> int:
+        """Find next prime >= n."""
+        def is_prime(num):
+            if num <= 1: return False
+            for i in range(2, int(num**0.5) + 1):
+                if num % i == 0: return False
+            return True
+        candidate = n
+        while not is_prime(candidate):
+            candidate += 1
+        return candidate
+
+    def _init_hash_functions(self, device):
+        """Initialize hash functions on the correct device."""
+        if self.a is None:
+            rand_max = self.prime - 1
+            self.a = torch.randint(1, rand_max, (self.num_hashes, 1), device=device, dtype=torch.int64)
+            self.b = torch.randint(0, rand_max, (self.num_hashes, 1), device=device, dtype=torch.int64)
+
+            # Pre-compute hash values for all vocabulary tokens
+            vocab_indices = torch.arange(self.vocab_size, device=device, dtype=torch.int64).unsqueeze(0)
+            self.hashed_vocab = (self.a * vocab_indices + self.b) % self.prime
+
+    def forward(self, input_ids, attention_mask):
+        batch_size, device = input_ids.shape[0], input_ids.device
+
+        # Initialize hash functions on first call
+        self._init_hash_functions(device)
+
+        # Create binary bag-of-words vectors
+        bow_vectors = torch.zeros(batch_size, self.vocab_size, device=device)
+        for i in range(batch_size):
+            valid_tokens = input_ids[i][attention_mask[i] == 1]
+            valid_tokens = valid_tokens[(valid_tokens > 100) & (valid_tokens < self.vocab_size)]
+            if len(valid_tokens) > 0:
+                bow_vectors[i].scatter_(0, valid_tokens, 1.0)
+
+        # Compute MinHash signatures
+        # Expand hashed vocab for batch processing
+        hashed_vocab_expanded = self.hashed_vocab.unsqueeze(0).expand(batch_size, -1, -1)
+
+        # Mask non-present tokens with infinity
+        masked_hashes = torch.where(
+            bow_vectors.unsqueeze(1) == 1,
+            hashed_vocab_expanded.float(),
+            float('inf')
+        )
+
+        # Get MinHash signature (minimum hash for each hash function)
+        signatures, _ = torch.min(masked_hashes, dim=2)
+
+        # Normalize to unit vectors for cosine similarity
+        # (This makes cosine similarity approximate Hamming distance ranking)
+        signatures = F.normalize(signatures, p=2, dim=-1)
+
+        return signatures
+
+
 class BM25Encoder(nn.Module):
     """BM25 scoring encoder (no training needed)."""
     def __init__(self, model_name: str = "bert-base-uncased", output_dim: int = 768, **kwargs):
@@ -342,6 +415,7 @@ ENCODER_REGISTRY = {
     'cls_pooling': CLSPoolingEncoder,
     'last_token_pooling': LastTokenEncoder,
     'jaccard': JaccardEncoder,
+    'minhash': MinHashEncoder,
     'bm25': BM25Encoder,
 }
 
