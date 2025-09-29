@@ -538,6 +538,7 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
     global_step = 0
     validation_interval = cfg.training.get('validation_interval', 0)
 
+    # In the `train` function, find the `run_validation` helper function
     def run_validation(step_num, epoch_num=None): # Validation helper (unchanged)
         model.eval()
         N_val, val_world_size = val_x_packed.shape[0], (world_size if distributed else 1)
@@ -545,14 +546,17 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
         start, end = rank * C_val, (rank + 1) * C_val
         val_config = {'GLOBAL_BATCH_SIZE': C_val * val_world_size, 'MICRO_BATCH_SIZE': cfg.training.micro_batch_size,
                       'STREAM_CHUNK_SIZE': cfg.training.stream_chunk_size, 'TAU': cfg.training.tau}
-        with torch.no_grad():
+        
+        # FIX: Add the `autocast` context manager here
+        with torch.no_grad(), autocast(enabled=use_amp):
             val_loss, topk_acc = distributed_validate_step(model, val_x_packed[start:end].to(device),
-                                                          val_y_packed[start:end].to(device), val_config)
+                                                           val_y_packed[start:end].to(device), val_config)
+        
         if rank == 0:
             prefix = f"\n[Epoch {epoch_num+1}] Validation" if epoch_num is not None else "\nValidation"
             print(f"{prefix} at step {step_num}:")
-            print(f"  Val Loss:   {val_loss:.4f}\n  MRR:        {topk_acc.get('MRR', 0):.4f}")
-            print(f"  Top@1 Acc:  {topk_acc.get(1, 0)*100:.2f}%\n  Top@5 Acc:  {topk_acc.get(5, 0)*100:.2f}%\n  Top@10 Acc: {topk_acc.get(10, 0)*100:.2f}%\n")
+            print(f"  Val Loss:    {val_loss:.4f}\n  MRR:         {topk_acc.get('MRR', 0):.4f}")
+            print(f"  Top@1 Acc:   {topk_acc.get(1, 0)*100:.2f}%\n  Top@5 Acc:   {topk_acc.get(5, 0)*100:.2f}%\n  Top@10 Acc: {topk_acc.get(10, 0)*100:.2f}%\n")
             log_metrics({'loss': val_loss, 'mrr': topk_acc.get('MRR', 0), 'top1_acc': topk_acc.get(1, 0)},
                         step=step_num, prefix='val')
         model.train()
