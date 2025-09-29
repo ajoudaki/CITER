@@ -1,6 +1,4 @@
+_target_: theorem_contrastive_training.JaccardEncoder
 name: jaccard-baseline
-model_name: bert-base-uncased
-model_type: jaccard
+model_name: bert-base-uncased # Placeholder, not used
 output_dim: 2048
-use_gradient_checkpointing: false
-quantization_config: null

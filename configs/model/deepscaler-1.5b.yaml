@@ -1,12 +1,14 @@
+_target_: theorem_contrastive_training.LastTokenEncoder
 name: deepscaler-1.5b
 model_name: agentica-org/DeepScaleR-1.5B-Preview
-model_type: last_token_pooling
 hidden_dim: 1536
+output_dim: 2048
+
 lora_target_modules:
 - q_proj
 - v_proj
 - k_proj
 - o_proj
-output_dim: 2048
-use_gradient_checkpointing: false
-quantization_config: null
+
+lora:
+  enabled: true

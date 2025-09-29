@@ -1,6 +1,4 @@
+_target_: theorem_contrastive_training.BM25Encoder
 name: bm25-baseline
-model_name: bert-base-uncased
-model_type: bm25
+model_name: bert-base-uncased # Placeholder, not used
 output_dim: 2048
-use_gradient_checkpointing: false
-quantization_config: null

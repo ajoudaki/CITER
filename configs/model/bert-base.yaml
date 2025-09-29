@@ -1,11 +1,13 @@
+_target_: theorem_contrastive_training.CLSPoolingEncoder
 name: bert-base
 model_name: bert-base-uncased
-model_type: cls_pooling
 hidden_dim: 768
 output_dim: 2048
-use_gradient_checkpointing: false
+
 lora_target_modules:
 - query
 - key
 - value
-quantization_config: null
+
+lora:
+  enabled: false

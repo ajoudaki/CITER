@@ -1,0 +1,12 @@
+# Addon to enable LoRA fine-tuning.
+# Usage: python train.py model=qwen-1.5b model/addons=lora
+
+lora:
+  _target_: peft.LoraConfig
+  task_type: "FEATURE_EXTRACTION"
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  # target_modules are inherited from the base model config
+
+lora_enabled: true

@@ -1,12 +1,14 @@
+_target_: theorem_contrastive_training.LastTokenEncoder
 name: qwen-2.5-math-7b
 model_name: Qwen/Qwen2.5-Math-7B-Instruct
-model_type: last_token_pooling
 hidden_dim: 3584
+output_dim: 2048
+
 lora_target_modules:
 - q_proj
 - v_proj
 - k_proj
 - o_proj
-output_dim: 2048
-use_gradient_checkpointing: false
-quantization_config: null
+
+lora:
+  enabled: true

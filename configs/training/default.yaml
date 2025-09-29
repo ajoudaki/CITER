@@ -1,27 +1,26 @@
-global_batch_size: 1024  # Main batch size after warmup
+# Parameters controlling the training loop and execution
+
+# Batching & Data
+global_batch_size: 1024
 micro_batch_size: 8
 stream_chunk_size: 256
-tau: 0.07
-lr: 1e-3
-weight_decay: 0.01  # L2 regularization for AdamW
-num_epochs: 10
 max_length: 256
-output_dim: 2048
-drop_last: true # drop last batch if its sizee is < global_batch_size
-use_amp: true  # Enable automatic mixed precision for memory efficiency
-gradient_checkpointing: false  # Enable gradient checkpointing to save memory
-warmup_steps: 100
-validation_interval: 0  # Run validation every N training steps (set to 0 to validate only at epoch end)
 
-quantization:
-  enabled: true        # Master switch to turn quantization on/off
-  bnb_4bit_quant_type: "nf4"
-  bnb_4bit_use_double_quant: true
-  bnb_4bit_compute_dtype: "bfloat16" # Use a string for YAML compatibility
+# Training schedule
+num_epochs: 10
 
-# LoRA configuration
-lora:
-  enabled: true
-  r: 8
-  lora_alpha: 16
-  lora_dropout: 0.05
+# Model & Loss
+tau: 0.07 # Temperature for contrastive loss
+
+# Performance & Memory
+use_amp: true               # Mixed precision
+gradient_checkpointing: false # Set to true to trade compute for memory
+
+# Validation
+validation_interval: 0  # 0 means validate only at epoch end
+
+# Scheduler Configuration
+scheduler:
+  _target_: theorem_contrastive_training.get_cosine_schedule_with_warmup
+  num_warmup_steps: 100
+  # num_training_steps is passed programmatically

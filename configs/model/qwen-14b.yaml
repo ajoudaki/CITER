@@ -1,7 +1,9 @@
+_target_: theorem_contrastive_training.LastTokenEncoder
 name: qwen-14b
 model_name: Qwen/Qwen3-14B
 hidden_dim: 5120
-model_type: last_token_pooling
+output_dim: 2048
+
 lora_target_modules:
 - q_proj
 - k_proj
@@ -10,6 +12,6 @@ lora_target_modules:
 - gate_proj
 - up_proj
 - down_proj
-output_dim: 2048
-use_gradient_checkpointing: false
-quantization_config: null
+
+lora:
+  enabled: true

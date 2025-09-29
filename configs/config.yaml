@@ -1,45 +1,41 @@
 defaults:
-  - model: qwen-1.5b  # default model choice
+  - model: qwen-1.5b
   - training: default
+  - optimizer: adamw
   - dataset: lemmas_theorems
   - _self_
 
-# Dataset configuration overrides (if needed)
-dataset:
-  size: small  # Options: toy, tiny, small, medium, full
-  train_ratio: 0.8
-  seed: 42
 
 # Weights & Biases configuration
 wandb:
   enabled: true
-  project: theorem-contrastive
-  entity: null  # Set to your wandb entity/username
-  name: null  # Run name (auto-generated if null)
+  project: "theorem-contrastive"
+  entity: null # Set to your wandb entity/username
+  name: null # Auto-generated: ${model.name}_${dataset.size}
   tags:
     - contrastive
     - ${model.name}
     - ${dataset.size}
-  group: null  # Group runs together
-  notes: null  # Additional notes for the run
-  mode: online  # Options: online, offline, disabled
+  group: null
+  notes: null
+  mode: "online" # online, offline, or disabled
 
 # Output configuration
 output:
-  save_dir: ./outputs
+  save_dir: "./outputs/checkpoints"
   save_lora: true
 
 # Runtime configuration
 runtime:
-  distributed: false  # Will be set automatically if using torchrun
+  distributed: false
   num_workers: 4
 
 # Hydra configuration
 hydra:
   run:
-    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: outputs/runs/${now:%Y-%m-%d}/${now:%H-%M-%S}
   sweep:
-    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: outputs/multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
     subdir: ${hydra.job.num}
   job:
-    chdir: false  # Don't change working directory
+    chdir: false
