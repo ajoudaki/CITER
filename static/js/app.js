@@ -1,10 +1,31 @@
 // Global variables
 let currentDataset = null;
 let papers = [];
+let currentPaperData = null;
+let isSourceView = false;
 
 // Load available datasets on page load
 document.addEventListener('DOMContentLoaded', function() {
     loadDatasets();
+
+    // Setup view toggle listeners
+    document.getElementById('renderedView').addEventListener('change', function() {
+        if (this.checked) {
+            isSourceView = false;
+            if (currentPaperData) {
+                displayPaperContent(currentPaperData, currentPaperData.idx);
+            }
+        }
+    });
+
+    document.getElementById('sourceView').addEventListener('change', function() {
+        if (this.checked) {
+            isSourceView = true;
+            if (currentPaperData) {
+                displayPaperContent(currentPaperData, currentPaperData.idx);
+            }
+        }
+    });
 });
 
 async function loadDatasets() {
@@ -112,6 +133,13 @@ async function loadPaper(paperIdx) {
 }
 
 function displayPaperContent(paper, paperIdx) {
+    // Store the current paper data for view toggling
+    currentPaperData = paper;
+    currentPaperData.idx = paperIdx;
+
+    // Show the view toggle
+    document.getElementById('viewToggleContainer').classList.remove('d-none');
+
     const content = document.getElementById('paperContent');
 
     let html = `
@@ -138,7 +166,7 @@ function displayPaperContent(paper, paperIdx) {
                         <span class="badge bg-primary">Theorem ${idx + 1}</span>
                     </div>
                     <div class="statement-content">
-                        ${escapeHtml(theorem.text)}
+                        ${isSourceView ? `<pre class="source-code">${escapeHtml(theorem.text)}</pre>` : theorem.text}
                     </div>
                 </div>
             `;
@@ -165,7 +193,7 @@ function displayPaperContent(paper, paperIdx) {
                         <span class="badge bg-success">Lemma ${idx + 1}</span>
                     </div>
                     <div class="statement-content">
-                        ${escapeHtml(lemma.text)}
+                        ${isSourceView ? `<pre class="source-code">${escapeHtml(lemma.text)}</pre>` : lemma.text}
                     </div>
                 </div>
             `;
@@ -192,7 +220,7 @@ function displayPaperContent(paper, paperIdx) {
                         <span class="badge bg-secondary">${stmt.type} ${idx + 1}</span>
                     </div>
                     <div class="statement-content">
-                        ${escapeHtml(stmt.text)}
+                        ${isSourceView ? `<pre class="source-code">${escapeHtml(stmt.text)}</pre>` : stmt.text}
                     </div>
                 </div>
             `;
@@ -206,8 +234,8 @@ function displayPaperContent(paper, paperIdx) {
 
     content.innerHTML = html;
 
-    // Re-render MathJax for LaTeX
-    if (window.MathJax) {
+    // Re-render MathJax for LaTeX only in rendered view
+    if (!isSourceView && window.MathJax) {
         MathJax.typesetPromise([content]).then(() => {
             // Math rendering complete
         }).catch((e) => console.error('MathJax error:', e));
