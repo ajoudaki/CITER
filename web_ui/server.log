@@ -1,0 +1,480 @@
+ * Serving Flask app 'app'
+ * Debug mode: on
+[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5000
+ * Running on http://192.168.1.130:5000
+[33mPress CTRL+C to quit[0m
+ * Restarting with stat
+ * Debugger is active!
+ * Debugger PIN: 975-587-520
+127.0.0.1 - - [29/Sep/2025 12:02:39] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:02:39] "[36mGET /static/css/style.css HTTP/1.1[0m" 304 -
+127.0.0.1 - - [29/Sep/2025 12:02:39] "[36mGET /static/js/app.js HTTP/1.1[0m" 304 -
+127.0.0.1 - - [29/Sep/2025 12:02:39] "GET /api/datasets HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:02:41] "GET /api/load_dataset/toy HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:02:41] "GET /api/models HTTP/1.1" 200 -
+/home/amir/Codes/paperGPT/app.py:204: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  projection.load_state_dict(torch.load(projection_path, map_location='cpu'))
+127.0.0.1 - - [29/Sep/2025 12:03:00] "GET /api/load_model/bert-base HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:03:06] "GET /api/paper/0 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:03:12] "POST /api/find_similar HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:06:24] "GET /api/paper/1 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:06:30] "GET /api/paper/7 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:06:32] "GET /api/paper/8 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:06:48] "GET /api/paper/9 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:06:49] "GET /api/paper/10 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:06:50] "GET /api/paper/11 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:06:51] "GET /api/paper/12 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:06:53] "GET /api/paper/13 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:06:53] "GET /api/paper/14 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:06:55] "GET /api/paper/15 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:06:56] "GET /api/paper/16 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:06:57] "GET /api/paper/17 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:06:58] "GET /api/paper/18 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:07:00] "GET /api/paper/20 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:07:12] "GET /api/paper/19 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:07:15] "GET /api/paper/12 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:07:28] "GET /api/load_model/qwen-1.5b HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:08:13] "POST /api/find_similar HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:09:24] "GET /api/load_dataset/tiny HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:09:24] "GET /api/models HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:09:31] "GET /api/paper/0 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:10:07] "POST /api/find_similar HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:14:11] "[33mGET /.well-known/appspecific/com.chrome.devtools.json HTTP/1.1[0m" 404 -
+127.0.0.1 - - [29/Sep/2025 12:14:11] "[36mGET /static/css/style.css HTTP/1.1[0m" 304 -
+127.0.0.1 - - [29/Sep/2025 12:14:29] "[35m[1mPOST /api/find_similar HTTP/1.1[0m" 500 -
+Traceback (most recent call last):
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 1498, in __call__
+    return self.wsgi_app(environ, start_response)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 1476, in wsgi_app
+    response = self.handle_exception(e)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 1473, in wsgi_app
+    response = self.full_dispatch_request()
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 882, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 880, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 865, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)  # type: ignore[no-any-return]
+  File "/home/amir/Codes/paperGPT/app.py", line 340, in find_similar
+    cache_data = compute_embeddings_for_dataset()
+  File "/home/amir/Codes/paperGPT/app.py", line 281, in compute_embeddings_for_dataset
+    embeddings = encoder(input_ids, attention_mask)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/Codes/paperGPT/app.py", line 174, in forward
+    outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/peft/peft_model.py", line 2568, in forward
+    return self.base_model(
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/peft/tuners/tuners_utils.py", line 197, in forward
+    return self.model.forward(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/utils/generic.py", line 1064, in wrapper
+    outputs = func(self, *args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/models/qwen2/modeling_qwen2.py", line 384, in forward
+    hidden_states = decoder_layer(
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/modeling_layers.py", line 94, in __call__
+    return super().__call__(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/utils/deprecation.py", line 172, in wrapped_func
+    return func(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/models/qwen2/modeling_qwen2.py", line 249, in forward
+    hidden_states = self.mlp(hidden_states)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/models/qwen2/modeling_qwen2.py", line 46, in forward
+    down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 560.00 MiB. GPU 0 has a total capacity of 23.56 GiB of which 74.12 MiB is free. Process 1461105 has 6.84 GiB memory in use. Including non-PyTorch memory, this process has 16.62 GiB memory in use. Of the allocated memory 14.80 GiB is allocated by PyTorch, and 1.48 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+127.0.0.1 - - [29/Sep/2025 12:15:37] "[35m[1mPOST /api/find_similar HTTP/1.1[0m" 500 -
+Traceback (most recent call last):
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 1498, in __call__
+    return self.wsgi_app(environ, start_response)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 1476, in wsgi_app
+    response = self.handle_exception(e)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 1473, in wsgi_app
+    response = self.full_dispatch_request()
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 882, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 880, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 865, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)  # type: ignore[no-any-return]
+  File "/home/amir/Codes/paperGPT/app.py", line 340, in find_similar
+    cache_data = compute_embeddings_for_dataset()
+  File "/home/amir/Codes/paperGPT/app.py", line 281, in compute_embeddings_for_dataset
+    embeddings = encoder(input_ids, attention_mask)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/Codes/paperGPT/app.py", line 174, in forward
+    outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/peft/peft_model.py", line 2568, in forward
+    return self.base_model(
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/peft/tuners/tuners_utils.py", line 197, in forward
+    return self.model.forward(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/utils/generic.py", line 1064, in wrapper
+    outputs = func(self, *args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/models/qwen2/modeling_qwen2.py", line 384, in forward
+    hidden_states = decoder_layer(
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/modeling_layers.py", line 94, in __call__
+    return super().__call__(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/utils/deprecation.py", line 172, in wrapped_func
+    return func(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/models/qwen2/modeling_qwen2.py", line 249, in forward
+    hidden_states = self.mlp(hidden_states)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/models/qwen2/modeling_qwen2.py", line 46, in forward
+    down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 560.00 MiB. GPU 0 has a total capacity of 23.56 GiB of which 168.12 MiB is free. Process 1461105 has 6.84 GiB memory in use. Including non-PyTorch memory, this process has 16.53 GiB memory in use. Of the allocated memory 14.02 GiB is allocated by PyTorch, and 2.17 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+127.0.0.1 - - [29/Sep/2025 12:16:05] "GET /api/paper/2 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:16:07] "GET /api/paper/3 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:16:08] "GET /api/paper/2 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:16:17] "GET /api/paper/0 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:16:19] "[35m[1mPOST /api/find_similar HTTP/1.1[0m" 500 -
+Traceback (most recent call last):
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 1498, in __call__
+    return self.wsgi_app(environ, start_response)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 1476, in wsgi_app
+    response = self.handle_exception(e)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 1473, in wsgi_app
+    response = self.full_dispatch_request()
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 882, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 880, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 865, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)  # type: ignore[no-any-return]
+  File "/home/amir/Codes/paperGPT/app.py", line 340, in find_similar
+    cache_data = compute_embeddings_for_dataset()
+  File "/home/amir/Codes/paperGPT/app.py", line 281, in compute_embeddings_for_dataset
+    embeddings = encoder(input_ids, attention_mask)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/Codes/paperGPT/app.py", line 174, in forward
+    outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/peft/peft_model.py", line 2568, in forward
+    return self.base_model(
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/peft/tuners/tuners_utils.py", line 197, in forward
+    return self.model.forward(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/utils/generic.py", line 1064, in wrapper
+    outputs = func(self, *args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/models/qwen2/modeling_qwen2.py", line 384, in forward
+    hidden_states = decoder_layer(
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/modeling_layers.py", line 94, in __call__
+    return super().__call__(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/utils/deprecation.py", line 172, in wrapped_func
+    return func(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/models/qwen2/modeling_qwen2.py", line 249, in forward
+    hidden_states = self.mlp(hidden_states)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/models/qwen2/modeling_qwen2.py", line 46, in forward
+    down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 560.00 MiB. GPU 0 has a total capacity of 23.56 GiB of which 168.12 MiB is free. Process 1461105 has 6.84 GiB memory in use. Including non-PyTorch memory, this process has 16.53 GiB memory in use. Of the allocated memory 15.29 GiB is allocated by PyTorch, and 925.43 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+127.0.0.1 - - [29/Sep/2025 12:16:55] "[35m[1mPOST /api/find_similar HTTP/1.1[0m" 500 -
+Traceback (most recent call last):
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 1498, in __call__
+    return self.wsgi_app(environ, start_response)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 1476, in wsgi_app
+    response = self.handle_exception(e)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 1473, in wsgi_app
+    response = self.full_dispatch_request()
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 882, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 880, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 865, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)  # type: ignore[no-any-return]
+  File "/home/amir/Codes/paperGPT/app.py", line 340, in find_similar
+    cache_data = compute_embeddings_for_dataset()
+  File "/home/amir/Codes/paperGPT/app.py", line 281, in compute_embeddings_for_dataset
+    embeddings = encoder(input_ids, attention_mask)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/Codes/paperGPT/app.py", line 174, in forward
+    outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/peft/peft_model.py", line 2568, in forward
+    return self.base_model(
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/peft/tuners/tuners_utils.py", line 197, in forward
+    return self.model.forward(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/utils/generic.py", line 1064, in wrapper
+    outputs = func(self, *args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/models/qwen2/modeling_qwen2.py", line 384, in forward
+    hidden_states = decoder_layer(
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/modeling_layers.py", line 94, in __call__
+    return super().__call__(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/utils/deprecation.py", line 172, in wrapped_func
+    return func(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/models/qwen2/modeling_qwen2.py", line 249, in forward
+    hidden_states = self.mlp(hidden_states)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/models/qwen2/modeling_qwen2.py", line 46, in forward
+    down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 560.00 MiB. GPU 0 has a total capacity of 23.56 GiB of which 168.12 MiB is free. Process 1461105 has 6.84 GiB memory in use. Including non-PyTorch memory, this process has 16.53 GiB memory in use. Of the allocated memory 14.42 GiB is allocated by PyTorch, and 1.77 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+127.0.0.1 - - [29/Sep/2025 12:17:14] "[35m[1mPOST /api/find_similar HTTP/1.1[0m" 500 -
+Traceback (most recent call last):
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 1498, in __call__
+    return self.wsgi_app(environ, start_response)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 1476, in wsgi_app
+    response = self.handle_exception(e)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 1473, in wsgi_app
+    response = self.full_dispatch_request()
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 882, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 880, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 865, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)  # type: ignore[no-any-return]
+  File "/home/amir/Codes/paperGPT/app.py", line 340, in find_similar
+    cache_data = compute_embeddings_for_dataset()
+  File "/home/amir/Codes/paperGPT/app.py", line 281, in compute_embeddings_for_dataset
+    embeddings = encoder(input_ids, attention_mask)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/Codes/paperGPT/app.py", line 174, in forward
+    outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/peft/peft_model.py", line 2568, in forward
+    return self.base_model(
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/peft/tuners/tuners_utils.py", line 197, in forward
+    return self.model.forward(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/utils/generic.py", line 1064, in wrapper
+    outputs = func(self, *args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/models/qwen2/modeling_qwen2.py", line 384, in forward
+    hidden_states = decoder_layer(
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/modeling_layers.py", line 94, in __call__
+    return super().__call__(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/utils/deprecation.py", line 172, in wrapped_func
+    return func(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/models/qwen2/modeling_qwen2.py", line 249, in forward
+    hidden_states = self.mlp(hidden_states)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/models/qwen2/modeling_qwen2.py", line 46, in forward
+    down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 560.00 MiB. GPU 0 has a total capacity of 23.56 GiB of which 168.12 MiB is free. Process 1461105 has 6.84 GiB memory in use. Including non-PyTorch memory, this process has 16.53 GiB memory in use. Of the allocated memory 13.77 GiB is allocated by PyTorch, and 2.43 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+127.0.0.1 - - [29/Sep/2025 12:18:58] "GET /api/paper/0 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:19:10] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:19:13] "[33mGET /.well-known/appspecific/com.chrome.devtools.json HTTP/1.1[0m" 404 -
+127.0.0.1 - - [29/Sep/2025 12:19:13] "[36mGET /static/js/app.js HTTP/1.1[0m" 304 -
+127.0.0.1 - - [29/Sep/2025 12:19:13] "[36mGET /static/css/style.css HTTP/1.1[0m" 304 -
+127.0.0.1 - - [29/Sep/2025 12:19:13] "GET /api/datasets HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:19:15] "GET /api/load_dataset/toy HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:19:15] "GET /api/models HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:19:17] "GET /api/load_model/bert-base HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:19:20] "GET /api/paper/0 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:19:22] "POST /api/find_similar HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:19:26] "[35m[1mPOST /api/find_similar HTTP/1.1[0m" 500 -
+Traceback (most recent call last):
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 1498, in __call__
+    return self.wsgi_app(environ, start_response)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 1476, in wsgi_app
+    response = self.handle_exception(e)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 1473, in wsgi_app
+    response = self.full_dispatch_request()
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 882, in full_dispatch_request
+    rv = self.handle_user_exception(e)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 880, in full_dispatch_request
+    rv = self.dispatch_request()
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/flask/app.py", line 865, in dispatch_request
+    return self.ensure_sync(self.view_functions[rule.endpoint])(**view_args)  # type: ignore[no-any-return]
+  File "/home/amir/Codes/paperGPT/app.py", line 340, in find_similar
+    cache_data = compute_embeddings_for_dataset()
+  File "/home/amir/Codes/paperGPT/app.py", line 281, in compute_embeddings_for_dataset
+    embeddings = encoder(input_ids, attention_mask)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/Codes/paperGPT/app.py", line 174, in forward
+    outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/peft/peft_model.py", line 2568, in forward
+    return self.base_model(
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/peft/tuners/tuners_utils.py", line 197, in forward
+    return self.model.forward(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/utils/generic.py", line 1064, in wrapper
+    outputs = func(self, *args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/models/qwen2/modeling_qwen2.py", line 384, in forward
+    hidden_states = decoder_layer(
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/modeling_layers.py", line 94, in __call__
+    return super().__call__(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/utils/deprecation.py", line 172, in wrapped_func
+    return func(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/models/qwen2/modeling_qwen2.py", line 249, in forward
+    hidden_states = self.mlp(hidden_states)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1736, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1747, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/amir/miniconda3/lib/python3.10/site-packages/transformers/models/qwen2/modeling_qwen2.py", line 46, in forward
+    down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 560.00 MiB. GPU 0 has a total capacity of 23.56 GiB of which 168.12 MiB is free. Process 1461105 has 6.84 GiB memory in use. Including non-PyTorch memory, this process has 16.53 GiB memory in use. Of the allocated memory 14.12 GiB is allocated by PyTorch, and 2.07 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+127.0.0.1 - - [29/Sep/2025 12:19:33] "GET /api/load_model/qwen-1.5b HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:19:37] "GET /api/paper/4 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:19:39] "GET /api/paper/0 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:19:41] "POST /api/find_similar HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:21:40] "GET /api/paper/0 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:21:42] "GET /api/paper/9 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:21:45] "GET /api/paper/13 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:21:47] "POST /api/find_similar HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:21:59] "GET /api/paper/26 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:22:08] "[33mGET /.well-known/appspecific/com.chrome.devtools.json HTTP/1.1[0m" 404 -
+127.0.0.1 - - [29/Sep/2025 12:22:10] "GET /api/load_dataset/toy HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:22:10] "GET /api/models HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:22:13] "GET /api/load_model/qwen-1.5b HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:23:06] "GET /api/paper/0 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:23:08] "POST /api/find_similar HTTP/1.1" 200 -
+ * Detected change in '/home/amir/Codes/paperGPT/app.py', reloading
+Loading model on cuda
+Loading model on cuda
+ * Restarting with stat
+ * Debugger is active!
+ * Debugger PIN: 975-587-520
+ * Detected change in '/home/amir/Codes/paperGPT/app.py', reloading
+ * Restarting with stat
+ * Debugger is active!
+ * Debugger PIN: 975-587-520
+ * Detected change in '/home/amir/Codes/paperGPT/app.py', reloading
+ * Restarting with stat
+ * Debugger is active!
+ * Debugger PIN: 975-587-520
+ * Detected change in '/home/amir/Codes/paperGPT/app.py', reloading
+ * Restarting with stat
+ * Debugger is active!
+ * Debugger PIN: 975-587-520
+ * Detected change in '/home/amir/Codes/paperGPT/app.py', reloading
+ * Restarting with stat
+ * Debugger is active!
+ * Debugger PIN: 975-587-520
+ * Detected change in '/home/amir/Codes/paperGPT/app.py', reloading
+ * Restarting with stat
+ * Debugger is active!
+ * Debugger PIN: 975-587-520
+127.0.0.1 - - [29/Sep/2025 12:25:21] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:25:22] "[33mGET /.well-known/appspecific/com.chrome.devtools.json HTTP/1.1[0m" 404 -
+127.0.0.1 - - [29/Sep/2025 12:25:22] "[36mGET /static/css/style.css HTTP/1.1[0m" 304 -
+127.0.0.1 - - [29/Sep/2025 12:25:22] "GET /static/js/app.js HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:25:22] "GET /api/datasets HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:25:23] "GET /api/load_dataset/toy HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:25:23] "GET /api/models HTTP/1.1" 200 -
+/home/amir/Codes/paperGPT/app.py:205: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  projection.load_state_dict(torch.load(projection_path, map_location='cpu'))
+Loading model on cuda
+Computing embeddings for 1807 statements...
+Processing batches:   0%|          | 0/226 [00:00<?, ?it/s]Processing batches:   0%|          | 1/226 [00:00<00:48,  4.65it/s]Processing batches:   1%|▏         | 3/226 [00:00<00:23,  9.57it/s]Processing batches:   2%|▏         | 5/226 [00:00<00:18, 11.70it/s]Processing batches:   3%|▎         | 7/226 [00:00<00:16, 13.08it/s]Processing batches:   4%|▍         | 9/226 [00:00<00:15, 13.87it/s]Processing batches:   5%|▍         | 11/226 [00:00<00:15, 14.25it/s]Processing batches:   6%|▌         | 13/226 [00:01<00:14, 14.57it/s]Processing batches:   7%|▋         | 15/226 [00:01<00:14, 14.70it/s]Processing batches:   8%|▊         | 17/226 [00:01<00:14, 14.84it/s]Processing batches:   8%|▊         | 19/226 [00:01<00:13, 14.88it/s]Processing batches:   9%|▉         | 21/226 [00:01<00:13, 14.88it/s]Processing batches:  10%|█         | 23/226 [00:01<00:13, 14.97it/s]Processing batches:  11%|█         | 25/226 [00:01<00:13, 14.95it/s]Processing batches:  12%|█▏        | 27/226 [00:01<00:13, 14.76it/s]Processing batches:  13%|█▎        | 29/226 [00:02<00:13, 14.13it/s]Processing batches:  14%|█▎        | 31/226 [00:02<00:14, 13.81it/s]Processing batches:  15%|█▍        | 33/226 [00:02<00:13, 13.86it/s]Processing batches:  15%|█▌        | 35/226 [00:02<00:13, 14.20it/s]Processing batches:  16%|█▋        | 37/226 [00:02<00:13, 14.45it/s]Processing batches:  17%|█▋        | 39/226 [00:02<00:12, 14.69it/s]Processing batches:  18%|█▊        | 41/226 [00:02<00:12, 14.81it/s]Processing batches:  19%|█▉        | 43/226 [00:03<00:12, 14.62it/s]Processing batches:  20%|█▉        | 45/226 [00:03<00:12, 14.43it/s]Processing batches:  21%|██        | 47/226 [00:03<00:12, 14.38it/s]Processing batches:  22%|██▏       | 49/226 [00:03<00:12, 14.26it/s]Processing batches:  23%|██▎       | 51/226 [00:03<00:12, 14.20it/s]Processing batches:  23%|██▎       | 53/226 [00:03<00:12, 14.26it/s]Processing batches:  24%|██▍       | 55/226 [00:03<00:12, 14.23it/s]Processing batches:  25%|██▌       | 57/226 [00:04<00:11, 14.32it/s]Processing batches:  26%|██▌       | 59/226 [00:04<00:11, 14.36it/s]Processing batches:  27%|██▋       | 61/226 [00:04<00:11, 14.40it/s]Processing batches:  28%|██▊       | 63/226 [00:04<00:11, 14.37it/s]Processing batches:  29%|██▉       | 65/226 [00:04<00:11, 14.39it/s]Processing batches:  30%|██▉       | 67/226 [00:04<00:11, 14.43it/s]Processing batches:  31%|███       | 69/226 [00:04<00:10, 14.49it/s]Processing batches:  31%|███▏      | 71/226 [00:05<00:11, 13.94it/s]Processing batches:  32%|███▏      | 73/226 [00:05<00:12, 12.59it/s]Processing batches:  33%|███▎      | 75/226 [00:05<00:12, 12.02it/s]Processing batches:  34%|███▍      | 77/226 [00:05<00:11, 12.80it/s]Processing batches:  35%|███▍      | 79/226 [00:05<00:10, 13.43it/s]Processing batches:  36%|███▌      | 81/226 [00:05<00:10, 13.91it/s]Processing batches:  37%|███▋      | 83/226 [00:05<00:10, 14.23it/s]Processing batches:  38%|███▊      | 85/226 [00:06<00:09, 14.48it/s]Processing batches:  38%|███▊      | 87/226 [00:06<00:09, 14.17it/s]Processing batches:  39%|███▉      | 89/226 [00:06<00:09, 14.26it/s]Processing batches:  40%|████      | 91/226 [00:06<00:09, 14.36it/s]Processing batches:  41%|████      | 93/226 [00:06<00:09, 14.47it/s]Processing batches:  42%|████▏     | 95/226 [00:06<00:09, 14.53it/s]Processing batches:  43%|████▎     | 97/226 [00:06<00:08, 14.60it/s]Processing batches:  44%|████▍     | 99/226 [00:07<00:08, 14.59it/s]Processing batches:  45%|████▍     | 101/226 [00:07<00:08, 14.47it/s]Processing batches:  46%|████▌     | 103/226 [00:07<00:08, 14.55it/s]Processing batches:  46%|████▋     | 105/226 [00:07<00:08, 14.65it/s]Processing batches:  47%|████▋     | 107/226 [00:07<00:08, 14.66it/s]Processing batches:  48%|████▊     | 109/226 [00:07<00:08, 14.61it/s]Processing batches:  49%|████▉     | 111/226 [00:07<00:07, 14.69it/s]Processing batches:  50%|█████     | 113/226 [00:08<00:07, 14.64it/s]Processing batches:  51%|█████     | 115/226 [00:08<00:07, 14.60it/s]Processing batches:  52%|█████▏    | 117/226 [00:08<00:07, 14.69it/s]Processing batches:  53%|█████▎    | 119/226 [00:08<00:07, 14.30it/s]Processing batches:  54%|█████▎    | 121/226 [00:08<00:07, 14.01it/s]Processing batches:  54%|█████▍    | 123/226 [00:08<00:07, 13.73it/s]Processing batches:  55%|█████▌    | 125/226 [00:08<00:07, 13.67it/s]Processing batches:  56%|█████▌    | 127/226 [00:09<00:07, 13.67it/s]Processing batches:  57%|█████▋    | 129/226 [00:09<00:07, 13.67it/s]Processing batches:  58%|█████▊    | 131/226 [00:09<00:06, 13.72it/s]Processing batches:  59%|█████▉    | 133/226 [00:09<00:06, 13.82it/s]Processing batches:  60%|█████▉    | 135/226 [00:09<00:06, 13.82it/s]Processing batches:  61%|██████    | 137/226 [00:09<00:06, 13.85it/s]Processing batches:  62%|██████▏   | 139/226 [00:09<00:06, 13.95it/s]Processing batches:  62%|██████▏   | 141/226 [00:10<00:06, 14.05it/s]Processing batches:  63%|██████▎   | 143/226 [00:10<00:05, 14.18it/s]Processing batches:  64%|██████▍   | 145/226 [00:10<00:05, 14.29it/s]Processing batches:  65%|██████▌   | 147/226 [00:10<00:05, 14.33it/s]Processing batches:  66%|██████▌   | 149/226 [00:10<00:05, 14.28it/s]Processing batches:  67%|██████▋   | 151/226 [00:10<00:05, 14.31it/s]Processing batches:  68%|██████▊   | 153/226 [00:10<00:05, 14.36it/s]Processing batches:  69%|██████▊   | 155/226 [00:10<00:04, 14.40it/s]Processing batches:  69%|██████▉   | 157/226 [00:11<00:04, 14.45it/s]Processing batches:  70%|███████   | 159/226 [00:11<00:04, 14.44it/s]Processing batches:  71%|███████   | 161/226 [00:11<00:04, 14.31it/s]Processing batches:  72%|███████▏  | 163/226 [00:11<00:04, 14.36it/s]Processing batches:  73%|███████▎  | 165/226 [00:11<00:04, 14.36it/s]Processing batches:  74%|███████▍  | 167/226 [00:11<00:04, 14.37it/s]Processing batches:  75%|███████▍  | 169/226 [00:11<00:03, 14.34it/s]Processing batches:  76%|███████▌  | 171/226 [00:12<00:03, 14.35it/s]Processing batches:  77%|███████▋  | 173/226 [00:12<00:03, 14.40it/s]Processing batches:  77%|███████▋  | 175/226 [00:12<00:03, 14.42it/s]Processing batches:  78%|███████▊  | 177/226 [00:12<00:03, 14.43it/s]Processing batches:  79%|███████▉  | 179/226 [00:12<00:03, 14.42it/s]Processing batches:  80%|████████  | 181/226 [00:12<00:03, 14.37it/s]Processing batches:  81%|████████  | 183/226 [00:12<00:02, 14.43it/s]Processing batches:  82%|████████▏ | 185/226 [00:13<00:02, 14.44it/s]Processing batches:  83%|████████▎ | 187/226 [00:13<00:02, 14.42it/s]Processing batches:  84%|████████▎ | 189/226 [00:13<00:02, 14.27it/s]Processing batches:  85%|████████▍ | 191/226 [00:13<00:02, 14.33it/s]Processing batches:  85%|████████▌ | 193/226 [00:13<00:02, 14.33it/s]Processing batches:  86%|████████▋ | 195/226 [00:13<00:02, 14.36it/s]Processing batches:  87%|████████▋ | 197/226 [00:13<00:02, 14.33it/s]Processing batches:  88%|████████▊ | 199/226 [00:14<00:01, 14.38it/s]Processing batches:  89%|████████▉ | 201/226 [00:14<00:01, 14.42it/s]Processing batches:  90%|████████▉ | 203/226 [00:14<00:01, 14.44it/s]Processing batches:  91%|█████████ | 205/226 [00:14<00:01, 14.44it/s]Processing batches:  92%|█████████▏| 207/226 [00:14<00:01, 14.43it/s]Processing batches:  92%|█████████▏| 209/226 [00:14<00:01, 14.36it/s]Processing batches:  93%|█████████▎| 211/226 [00:14<00:01, 14.37it/s]Processing batches:  94%|█████████▍| 213/226 [00:15<00:00, 14.30it/s]Processing batches:  95%|█████████▌| 215/226 [00:15<00:00, 14.33it/s]Processing batches:  96%|█████████▌| 217/226 [00:15<00:00, 14.36it/s]Processing batches:  97%|█████████▋| 219/226 [00:15<00:00, 14.35it/s]Processing batches:  98%|█████████▊| 221/226 [00:15<00:00, 14.30it/s]Processing batches:  99%|█████████▊| 223/226 [00:15<00:00, 14.36it/s]Processing batches: 100%|█████████▉| 225/226 [00:15<00:00, 14.38it/s]Processing batches: 100%|██████████| 226/226 [00:15<00:00, 14.19it/s]
+127.0.0.1 - - [29/Sep/2025 12:25:42] "GET /api/load_model/bert-base HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:31:19] "GET /api/paper/0 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:31:23] "GET /api/load_dataset/toy HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:31:23] "GET /api/models HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:31:27] "GET /api/load_model/bert-base HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:31:32] "GET /api/paper/0 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:31:34] "GET /api/paper/1 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:31:41] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:31:41] "[33mGET /.well-known/appspecific/com.chrome.devtools.json HTTP/1.1[0m" 404 -
+127.0.0.1 - - [29/Sep/2025 12:31:41] "[36mGET /static/css/style.css HTTP/1.1[0m" 304 -
+127.0.0.1 - - [29/Sep/2025 12:31:41] "[36mGET /static/js/app.js HTTP/1.1[0m" 304 -
+127.0.0.1 - - [29/Sep/2025 12:31:41] "GET /api/datasets HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:31:43] "GET /api/load_dataset/toy HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:31:43] "GET /api/models HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:31:54] "GET /api/paper/1 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:32:00] "GET /api/load_dataset/toy HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:32:00] "GET /api/models HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:32:04] "GET /api/load_model/bert-base HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:32:10] "GET /api/paper/0 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:32:13] "POST /api/find_similar HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:36:09] "GET /api/paper/196 HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:36:57] "POST /api/search HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:37:02] "POST /api/search HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:37:06] "POST /api/search HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 12:37:08] "GET /api/paper/0 HTTP/1.1" 200 -

@@ -39,6 +39,18 @@
                         <small>Papers: <span id="paperCount">0</span></small>
                     </div>
 
+                    <!-- Model Selector -->
+                    <div id="modelSelector" class="mb-3 d-none">
+                        <label for="modelSelect" class="form-label">Select Model for Similarity:</label>
+                        <select class="form-select" id="modelSelect">
+                            <option value="">No model loaded</option>
+                        </select>
+                        <button class="btn btn-success mt-2 w-100" onclick="loadSelectedModel()">Load Model</button>
+                        <div id="modelStatus" class="alert alert-success mt-2 d-none">
+                            <small>Model loaded: <span id="modelName"></span></small>
+                        </div>
+                    </div>
+
                     <!-- Search Box -->
                     <div class="mb-3">
                         <input type="text" class="form-control" id="searchBox" placeholder="Search in statements...">

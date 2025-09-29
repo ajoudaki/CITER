@@ -1,0 +1,31 @@
+ * Serving Flask app 'app'
+ * Debug mode: on
+[31m[1mWARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.[0m
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:5000
+ * Running on http://192.168.1.130:5000
+[33mPress CTRL+C to quit[0m
+ * Restarting with stat
+ * Debugger is active!
+ * Debugger PIN: 975-587-520
+127.0.0.1 - - [29/Sep/2025 11:51:11] "GET /api/load_dataset/toy HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 11:51:11] "GET /api/models HTTP/1.1" 200 -
+/home/amir/Codes/paperGPT/app.py:200: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  projection.load_state_dict(torch.load(projection_path, map_location='cpu'))
+127.0.0.1 - - [29/Sep/2025 11:51:12] "[31m[1mGET /api/load_model/bert-base HTTP/1.1[0m" 400 -
+ * Detected change in '/home/amir/Codes/paperGPT/app.py', reloading
+ * Restarting with stat
+ * Debugger is active!
+ * Debugger PIN: 975-587-520
+127.0.0.1 - - [29/Sep/2025 11:51:28] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 11:51:28] "GET /static/css/style.css HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 11:51:28] "GET /static/js/app.js HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 11:51:29] "GET /api/datasets HTTP/1.1" 200 -
+ * Detected change in '/home/amir/Codes/paperGPT/app.py', reloading
+ * Restarting with stat
+ * Debugger is active!
+ * Debugger PIN: 975-587-520
+127.0.0.1 - - [29/Sep/2025 11:51:34] "GET /api/load_dataset/toy HTTP/1.1" 200 -
+127.0.0.1 - - [29/Sep/2025 11:51:34] "GET /api/models HTTP/1.1" 200 -
+/home/amir/Codes/paperGPT/app.py:200: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  projection.load_state_dict(torch.load(projection_path, map_location='cpu'))

@@ -3,6 +3,7 @@ let currentDataset = null;
 let papers = [];
 let currentPaperData = null;
 let isSourceView = false;
+let currentModel = null;
 
 // Load available datasets on page load
 document.addEventListener('DOMContentLoaded', function() {
@@ -71,9 +72,13 @@ async function loadSelectedDataset() {
             // Update UI
             document.getElementById('paperCount').textContent = data.num_papers;
             document.getElementById('datasetInfo').classList.remove('d-none');
+            document.getElementById('modelSelector').classList.remove('d-none');
 
             // Display paper list
             displayPaperList(papers);
+
+            // Load available models
+            loadModels();
         } else {
             alert('Failed to load dataset: ' + data.error);
         }
@@ -164,6 +169,7 @@ function displayPaperContent(paper, paperIdx) {
                 <div class="statement-card theorem-card">
                     <div class="statement-header">
                         <span class="badge bg-primary">Theorem ${idx + 1}</span>
+                        ${currentModel ? `<button class="btn btn-sm btn-outline-primary float-end" onclick="findSimilar(${paperIdx}, ${idx}, 'theorem')">Find Similar</button>` : ''}
                     </div>
                     <div class="statement-content">
                         ${isSourceView ? `<pre class="source-code">${escapeHtml(theorem.text)}</pre>` : theorem.text}
@@ -191,6 +197,7 @@ function displayPaperContent(paper, paperIdx) {
                 <div class="statement-card lemma-card">
                     <div class="statement-header">
                         <span class="badge bg-success">Lemma ${idx + 1}</span>
+                        ${currentModel ? `<button class="btn btn-sm btn-outline-success float-end" onclick="findSimilar(${paperIdx}, ${idx}, 'lemma')">Find Similar</button>` : ''}
                     </div>
                     <div class="statement-content">
                         ${isSourceView ? `<pre class="source-code">${escapeHtml(lemma.text)}</pre>` : lemma.text}
@@ -332,4 +339,141 @@ function escapeHtml(text) {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+}
+
+async function loadModels() {
+    try {
+        const response = await fetch('/api/models');
+        const models = await response.json();
+
+        const select = document.getElementById('modelSelect');
+        select.innerHTML = '<option value="">Choose a model...</option>';
+
+        models.forEach(model => {
+            const option = document.createElement('option');
+            option.value = model.name;
+            option.textContent = model.display;
+            select.appendChild(option);
+        });
+    } catch (error) {
+        console.error('Error loading models:', error);
+    }
+}
+
+async function loadSelectedModel() {
+    const modelName = document.getElementById('modelSelect').value;
+    if (!modelName) {
+        alert('Please select a model');
+        return;
+    }
+
+    const button = event.target;
+    button.disabled = true;
+    button.textContent = 'Loading...';
+
+    try {
+        const response = await fetch(`/api/load_model/${modelName}`);
+        const data = await response.json();
+
+        if (data.success) {
+            currentModel = modelName;
+            document.getElementById('modelName').textContent = modelName;
+            document.getElementById('modelStatus').classList.remove('d-none');
+            button.textContent = 'Model Loaded!';
+            setTimeout(() => {
+                button.textContent = 'Load Model';
+                button.disabled = false;
+            }, 2000);
+        } else {
+            alert('Failed to load model: ' + data.error);
+            button.textContent = 'Load Model';
+            button.disabled = false;
+        }
+    } catch (error) {
+        console.error('Error loading model:', error);
+        alert('Failed to load model');
+        button.textContent = 'Load Model';
+        button.disabled = false;
+    }
+}
+
+async function findSimilar(paperIdx, stmtIdx, stmtType) {
+    if (!currentModel) {
+        alert('Please load a model first');
+        return;
+    }
+
+    try {
+        const response = await fetch('/api/find_similar', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                paper_idx: paperIdx,
+                stmt_idx: stmtIdx,
+                stmt_type: stmtType
+            })
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            displaySimilarityResults(data);
+        } else {
+            alert('Failed to find similar statements: ' + data.error);
+        }
+    } catch (error) {
+        console.error('Error finding similar:', error);
+        alert('Failed to find similar statements');
+    }
+}
+
+function displaySimilarityResults(data) {
+    const content = document.getElementById('paperContent');
+
+    let html = `
+        <div class="similarity-results">
+            <h3>Similarity Results</h3>
+            <button class="btn btn-sm btn-secondary mb-3" onclick="loadPaper(${data.query.paper_idx})">Back to Paper</button>
+
+            <div class="query-box mb-3">
+                <h5>Query Statement (${data.query.type})</h5>
+                <div class="statement-content">
+                    ${isSourceView ? `<pre class="source-code">${escapeHtml(data.query.text)}</pre>` : data.query.text}
+                </div>
+            </div>
+
+            <h5>Top Similar Statements (${data.results.length})</h5>
+            <div class="results-list">
+    `;
+
+    data.results.forEach((result, idx) => {
+        html += `
+            <div class="similarity-result-card">
+                <div class="result-header">
+                    <span class="badge bg-info">${result.type}</span>
+                    <span class="badge bg-warning">Similarity: ${(result.similarity * 100).toFixed(2)}%</span>
+                    <a href="#" onclick="loadPaper(${result.paper_idx}); return false;">
+                        Paper ${result.paper_idx + 1}: ${escapeHtml(result.paper_title)}
+                    </a>
+                </div>
+                <div class="result-content" style="max-height: 400px; overflow-y: auto;">
+                    ${isSourceView ? `<pre class="source-code">${escapeHtml(result.text)}</pre>` : result.text}
+                </div>
+            </div>
+        `;
+    });
+
+    html += `
+            </div>
+        </div>
+    `;
+
+    content.innerHTML = html;
+
+    // Re-render MathJax if needed
+    if (!isSourceView && window.MathJax) {
+        MathJax.typesetPromise([content]).catch((e) => console.error('MathJax error:', e));
+    }
 }
