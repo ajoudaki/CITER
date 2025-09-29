@@ -529,10 +529,16 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
         val_config = {'GLOBAL_BATCH_SIZE': N_val, 'MICRO_BATCH_SIZE': cfg.training.micro_batch_size,
                       'STREAM_CHUNK_SIZE': cfg.training.stream_chunk_size, 'TAU': cfg.training.tau}
         val_loss, val_metrics = distributed_validate_step(model, val_x_packed[start:end].to(device),
-                                                          val_y_packed[start:end].to(device), val_config)
+                                                          val_y_packed[start:end].to(device), val_config,
+                                                          k_vals=cfg.training.get('k_vals', [1, 5, 10]))
         if rank == 0:
             print(f"\nValidation Results:\nVal Loss: {val_loss:.4f}")
-            for k, v in val_metrics.items(): print(f"{k}: {v:.4f}" if k=='MRR' else f"top-{k}: {v:.4f}")
+            print(f"MRR: {val_metrics.get('MRR', 0):.4f}")
+            # Print all k values in a formatted way
+            k_vals = cfg.training.get('k_vals', [1, 5, 10])
+            for k in k_vals:
+                if k in val_metrics:
+                    print(f"Top@{k}: {val_metrics[k]*100:.2f}%")
         return
 
     global_step = 0
@@ -550,15 +556,23 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
         # FIX: Add the `autocast` context manager here
         with torch.no_grad(), autocast(enabled=use_amp):
             val_loss, topk_acc = distributed_validate_step(model, val_x_packed[start:end].to(device),
-                                                           val_y_packed[start:end].to(device), val_config)
+                                                           val_y_packed[start:end].to(device), val_config,
+                                                           k_vals=cfg.training.get('k_vals', [1, 5, 10]))
         
         if rank == 0:
             prefix = f"\n[Epoch {epoch_num+1}] Validation" if epoch_num is not None else "\nValidation"
             print(f"{prefix} at step {step_num}:")
             print(f"  Val Loss:    {val_loss:.4f}\n  MRR:         {topk_acc.get('MRR', 0):.4f}")
-            print(f"  Top@1 Acc:   {topk_acc.get(1, 0)*100:.2f}%\n  Top@5 Acc:   {topk_acc.get(5, 0)*100:.2f}%\n  Top@10 Acc: {topk_acc.get(10, 0)*100:.2f}%\n")
-            log_metrics({'loss': val_loss, 'mrr': topk_acc.get('MRR', 0), 'top1_acc': topk_acc.get(1, 0)},
-                        step=step_num, prefix='val')
+            # Print all configured k values
+            k_vals_to_report = cfg.training.get('k_vals', [1, 5, 10])
+            acc_str = "  ".join([f"Top@{k}: {topk_acc.get(k, 0)*100:.2f}%" for k in k_vals_to_report if k in topk_acc])
+            print(f"  {acc_str}\n")
+            # Log all k values to wandb
+            metrics = {'loss': val_loss, 'mrr': topk_acc.get('MRR', 0)}
+            for k in k_vals_to_report:
+                if k in topk_acc:
+                    metrics[f'top{k}_acc'] = topk_acc.get(k, 0)
+            log_metrics(metrics, step=step_num, prefix='val')
         model.train()
         return val_loss, topk_acc
 
@@ -590,7 +604,13 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
         val_loss, topk_acc = run_validation(global_step, epoch_num=epoch)
         if rank == 0:
             print(f"\nEpoch [{epoch+1}/{cfg.training.num_epochs}] Summary:\n  Train Loss: {avg_train_loss:.4f}\n  Val Loss:   {val_loss:.4f}")
-            print(f"  MRR:        {topk_acc.get('MRR', 0):.4f}\n  Top@1 Acc:  {topk_acc.get(1, 0)*100:.2f}%\n")
+            print(f"  MRR:        {topk_acc.get('MRR', 0):.4f}")
+            # Print key accuracy metrics
+            k_vals_to_report = cfg.training.get('k_vals', [1, 5, 10])
+            key_ks = [k for k in [1, 5, 10] if k in k_vals_to_report and k in topk_acc]
+            if key_ks:
+                acc_str = "  ".join([f"Top@{k}: {topk_acc.get(k, 0)*100:.2f}%" for k in key_ks])
+                print(f"  {acc_str}\n")
             log_metrics({'epoch': epoch + 1, 'avg_train_loss': avg_train_loss}, step=global_step)
         if distributed: dist.barrier()
 

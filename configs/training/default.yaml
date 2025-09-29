@@ -18,6 +18,7 @@ gradient_checkpointing: false # Set to true to trade compute for memory
 
 # Validation
 validation_interval: 0  # 0 means validate only at epoch end
+k_vals: [1, 5, 10, 50, 100]  # Top-k values for accuracy metrics
 
 # Scheduler Configuration
 scheduler:
