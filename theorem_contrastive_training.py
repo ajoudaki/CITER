@@ -498,8 +498,16 @@ def setup_model(cfg: DictConfig, device):
     if encoder_class is None:
         raise ValueError(f"Unknown model type: {cfg.model.model_type}")
 
-    # Convert model config to dict
-    model_kwargs = OmegaConf.to_container(cfg.model, resolve=True)
+    # Convert model config to dict and filter for encoder parameters
+    model_config_dict = OmegaConf.to_container(cfg.model, resolve=True)
+
+    # Extract only the parameters expected by the encoder class
+    model_kwargs = {
+        'model_name': model_config_dict.get('model_name'),
+        'hidden_dim': model_config_dict.get('hidden_dim'),
+        'output_dim': model_config_dict.get('output_dim', cfg.training.get('output_dim', 2048)),
+        'use_gradient_checkpointing': cfg.training.get('gradient_checkpointing', False),
+    }
 
     # Handle quantization if enabled in training config
     if cfg.training.get("quantization") and cfg.training.quantization.get("enabled"):
