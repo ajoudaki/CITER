@@ -192,7 +192,8 @@ def distributed_validate_step(
     model: torch.nn.Module,
     local_x: torch.Tensor,
     local_y: torch.Tensor,
-    config: Dict
+    config: Dict,
+    k_vals: Optional[list] = None
 ) -> Tuple[float, Dict[str, float]]:
     """
     Performs a distributed, memory-efficient validation step with progress bars
@@ -244,7 +245,8 @@ def distributed_validate_step(
         # --- Streamed Top-K Accuracy and MRR Calculation ---
         start_idx_global = rank * C
         labels = torch.arange(start_idx_global, start_idx_global + C, device=local_x.device)
-        k_vals = [1, 5, 10]
+        if k_vals is None:
+            k_vals = [1, 5, 10]  # Default values
         max_k = min(max(k_vals), N)
         topk_for_mrr = min(N, Z_y.shape[0]) 
 

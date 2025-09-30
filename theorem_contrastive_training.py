@@ -736,41 +736,38 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
     global_step = 0
 
     # Helper function for validation
-    def run_validation(step_num, epoch_num=None):
+    def run_validation(step_num, epoch_num=None): # Validation helper (unchanged)
         model.eval()
-        N_val = val_x_packed.shape[0]
-        val_world_size = world_size if distributed else 1
+        N_val, val_world_size = val_x_packed.shape[0], (world_size if distributed else 1)
         C_val = N_val // val_world_size
-        if N_val % val_world_size != 0 and rank == 0:
-            print(f"Warning: Val set size {N_val} not divisible by world size {val_world_size}")
-
         start, end = rank * C_val, (rank + 1) * C_val
-        local_val_x = val_x_packed[start:end].to(device)
-        local_val_y = val_y_packed[start:end].to(device)
-
         val_config = {
-            'GLOBAL_BATCH_SIZE': C_val * val_world_size,
+            'GLOBAL_BATCH_SIZE': C_val * val_world_size, 
             'MICRO_BATCH_SIZE': cfg.training.micro_batch_size,
-            'STREAM_CHUNK_SIZE': cfg.training.stream_chunk_size,
+            'STREAM_CHUNK_SIZE': cfg.training.stream_chunk_size, 
             'TAU': cfg.training.tau
         }
-
-        with torch.no_grad():
-            val_loss, topk_acc = distributed_validate_step(model, local_val_x, local_val_y, val_config)
-
+        
+        # FIX: Add the `autocast` context manager here
+        with torch.no_grad(), autocast(enabled=use_amp):
+            val_loss, topk_acc = distributed_validate_step(model, val_x_packed[start:end].to(device),
+                                                           val_y_packed[start:end].to(device), val_config,
+                                                           k_vals=cfg.training.get('k_vals', [1, 5, 10]))
+        
         if rank == 0:
-            if epoch_num is not None:
-                print(f"\n[Epoch {epoch_num+1}] Validation at step {step_num}:")
-            else:
-                print(f"\nValidation at step {step_num}:")
-            print(f"  Val Loss:   {val_loss:.4f}")
-            print(f"  MRR:        {topk_acc.get('MRR', 0):.4f}")
-            print(f"  Top@1 Acc:  {topk_acc.get(1, 0)*100:.2f}%")
-            print(f"  Top@5 Acc:  {topk_acc.get(5, 0)*100:.2f}%")
-            print(f"  Top@10 Acc: {topk_acc.get(10, 0)*100:.2f}%\n")
-
-            log_metrics({'loss': val_loss, 'mrr': topk_acc.get('MRR', 0), 'top1_acc': topk_acc.get(1, 0)}, step=step_num, prefix='val')
-
+            prefix = f"\n[Epoch {epoch_num+1}] Validation" if epoch_num is not None else "\nValidation"
+            print(f"{prefix} at step {step_num}:")
+            print(f"  Val Loss:    {val_loss:.4f}\n  MRR:         {topk_acc.get('MRR', 0):.4f}")
+            # Print all configured k values
+            k_vals_to_report = cfg.training.get('k_vals', [1, 5, 10])
+            acc_str = "  ".join([f"Top@{k}: {topk_acc.get(k, 0)*100:.2f}%" for k in k_vals_to_report if k in topk_acc])
+            print(f"  {acc_str}\n")
+            # Log all k values to wandb
+            metrics = {'loss': val_loss, 'mrr': topk_acc.get('MRR', 0)}
+            for k in k_vals_to_report:
+                if k in topk_acc:
+                    metrics[f'top{k}_acc'] = topk_acc.get(k, 0)
+            log_metrics(metrics, step=step_num, prefix='val')
         model.train()
         return val_loss, topk_acc
 

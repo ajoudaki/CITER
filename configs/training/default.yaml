@@ -12,6 +12,8 @@ use_amp: true  # Enable automatic mixed precision for memory efficiency
 gradient_checkpointing: false  # Enable gradient checkpointing to save memory
 warmup_steps: 100
 validation_interval: 0  # Run validation every N training steps (set to 0 to validate only at epoch end)
+k_vals: [1, 5, 10, 50, 100]  # Top-k values for accuracy metrics
+
 
 quantization:
   enabled: true        # Master switch to turn quantization on/off
