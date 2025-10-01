@@ -1,6 +1,6 @@
 name: qwen-30b-a3b
 model_name: Qwen/Qwen3-30B-A3B-Thinking-2507
-hidden_dim: 5120
+hidden_dim: 2048
 model_type: last_token_pooling
 lora_target_modules:
 - q_proj
