@@ -487,7 +487,7 @@ function displaySimilarityResults(data, isSemanticSearch = false) {
                 <h5>Query ${isSemanticSearch ? 'Text' : `Statement (${data.query.type})`}</h5>
                 <div class="statement-content">
                     ${isSemanticSearch ?
-                        `<pre class="source-code">${escapeHtml(data.query)}</pre>` :
+                        (isSourceView ? `<pre class="source-code">${escapeHtml(data.query)}</pre>` : data.query) :
                         (isSourceView ? `<pre class="source-code">${escapeHtml(data.query.text)}</pre>` : data.query.text)
                     }
                 </div>
