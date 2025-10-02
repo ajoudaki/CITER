@@ -20,6 +20,7 @@ app = Flask(__name__)
 # Global storage for loaded dataset
 dataset_cache = {}
 current_dataset = None
+current_dataset_name = None
 
 # Global storage for loaded models
 loaded_models = {}
@@ -28,10 +29,11 @@ model_embeddings_cache = {}
 
 def load_dataset(dataset_name: str = 'toy') -> List[Dict]:
     """Load dataset from JSONL file."""
-    global dataset_cache, current_dataset
+    global dataset_cache, current_dataset, current_dataset_name
 
     if dataset_name in dataset_cache:
         current_dataset = dataset_cache[dataset_name]
+        current_dataset_name = dataset_name
         return current_dataset
 
     dataset_path = Path(f'../data/lemmas_theorems/{dataset_name}.jsonl')
@@ -47,6 +49,7 @@ def load_dataset(dataset_name: str = 'toy') -> List[Dict]:
 
     dataset_cache[dataset_name] = papers
     current_dataset = papers
+    current_dataset_name = dataset_name
     return papers
 
 def get_paper_summary(paper: Dict) -> Dict:
@@ -235,6 +238,29 @@ def load_model(model_name: str):
     current_model = model_name
     return loaded_models[model_name]
 
+def load_precomputed_embeddings(model_name: str, dataset_name: str):
+    """Load pre-computed embeddings if they exist."""
+    # Try demo directory structure first
+    demo_path = Path(f'../outputs/demo/{model_name}/embeddings/{dataset_name}')
+    if demo_path.exists():
+        embeddings_path = demo_path / 'embeddings.pt'
+        metadata_path = demo_path / 'metadata.json'
+
+        if embeddings_path.exists() and metadata_path.exists():
+            print(f"Loading pre-computed embeddings from: {demo_path}")
+            embeddings = torch.load(embeddings_path, map_location='cpu')
+
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+
+            return {
+                'embeddings': embeddings,
+                'metadata': metadata
+            }
+
+    return None
+
+
 def compute_embeddings_for_dataset():
     """Compute embeddings for all statements in the current dataset."""
     global model_embeddings_cache, current_dataset, current_model
@@ -245,6 +271,14 @@ def compute_embeddings_for_dataset():
     cache_key = f"{current_model}_{id(current_dataset)}"
     if cache_key in model_embeddings_cache:
         return model_embeddings_cache[cache_key]
+
+    # Try to load pre-computed embeddings
+    if current_dataset_name:
+        precomputed = load_precomputed_embeddings(current_model, current_dataset_name)
+        if precomputed:
+            model_embeddings_cache[cache_key] = precomputed
+            print(f"Using pre-computed embeddings for {current_model}/{current_dataset_name}")
+            return precomputed
 
     model_data = loaded_models[current_model]
     encoder = model_data['encoder']
