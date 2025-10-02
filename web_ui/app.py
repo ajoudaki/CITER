@@ -164,7 +164,8 @@ def load_model(model_name: str):
     # Check for CUDA availability
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     use_fp16 = torch.cuda.is_available()  # Use fp16 if CUDA is available
-    print(f"Loading model on {device} (fp16: {use_fp16})")
+    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    print(f"Loading model on {device} (fp16: {use_fp16}, GPUs: {num_gpus})")
 
     # Simple encoder class matching training code
     class SimpleEncoder(nn.Module):
@@ -214,6 +215,11 @@ def load_model(model_name: str):
     if use_fp16:
         encoder = encoder.half()
 
+    # Use DataParallel for multi-GPU
+    if num_gpus > 1:
+        print(f"Using DataParallel across {num_gpus} GPUs")
+        encoder = nn.DataParallel(encoder)
+
     encoder.eval()
 
     # Load tokenizer
@@ -223,7 +229,8 @@ def load_model(model_name: str):
         'encoder': encoder,
         'tokenizer': tokenizer,
         'device': device,
-        'use_fp16': use_fp16
+        'use_fp16': use_fp16,
+        'num_gpus': num_gpus
     }
     current_model = model_name
     return loaded_models[model_name]
@@ -244,6 +251,7 @@ def compute_embeddings_for_dataset():
     tokenizer = model_data['tokenizer']
     device = model_data['device']
     use_fp16 = model_data.get('use_fp16', False)
+    num_gpus = model_data.get('num_gpus', 0)
 
     all_embeddings = []
     all_metadata = []
@@ -270,9 +278,10 @@ def compute_embeddings_for_dataset():
                 'text': stmt.get('text', '')
             })
 
-    # Process in batches for efficiency - use larger batch size with fp16
-    batch_size = 32 if use_fp16 else 8  # Larger batch size with fp16
-    print(f"Computing embeddings for {len(all_texts)} statements (batch_size={batch_size}, fp16={use_fp16})...")
+    # Process in batches for efficiency - scale batch size with GPUs
+    base_batch_size = 32 if use_fp16 else 8
+    batch_size = base_batch_size * max(1, num_gpus)  # Scale with number of GPUs
+    print(f"Computing embeddings for {len(all_texts)} statements (batch_size={batch_size}, fp16={use_fp16}, GPUs={num_gpus})...")
     with torch.no_grad():
         for i in tqdm(range(0, len(all_texts), batch_size), desc="Processing batches"):
             batch_texts = all_texts[i:i+batch_size]
