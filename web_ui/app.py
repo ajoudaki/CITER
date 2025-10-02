@@ -10,6 +10,7 @@ from typing import Dict, List, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda.amp import autocast
 from transformers import AutoTokenizer, AutoModel
 from peft import PeftModel
 from tqdm import tqdm
@@ -162,7 +163,8 @@ def load_model(model_name: str):
 
     # Check for CUDA availability
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Loading model on {device}")
+    use_fp16 = torch.cuda.is_available()  # Use fp16 if CUDA is available
+    print(f"Loading model on {device} (fp16: {use_fp16})")
 
     # Simple encoder class matching training code
     class SimpleEncoder(nn.Module):
@@ -207,6 +209,11 @@ def load_model(model_name: str):
     # Create encoder and move to device
     encoder = SimpleEncoder(base_model, projection)
     encoder = encoder.to(device)
+
+    # Convert to fp16 if using CUDA
+    if use_fp16:
+        encoder = encoder.half()
+
     encoder.eval()
 
     # Load tokenizer
@@ -215,7 +222,8 @@ def load_model(model_name: str):
     loaded_models[model_name] = {
         'encoder': encoder,
         'tokenizer': tokenizer,
-        'device': device
+        'device': device,
+        'use_fp16': use_fp16
     }
     current_model = model_name
     return loaded_models[model_name]
@@ -235,6 +243,7 @@ def compute_embeddings_for_dataset():
     encoder = model_data['encoder']
     tokenizer = model_data['tokenizer']
     device = model_data['device']
+    use_fp16 = model_data.get('use_fp16', False)
 
     all_embeddings = []
     all_metadata = []
@@ -261,9 +270,9 @@ def compute_embeddings_for_dataset():
                 'text': stmt.get('text', '')
             })
 
-    # Process in batches for efficiency - reduce batch size to avoid OOM
-    batch_size = 8  # Reduced from 32 to avoid CUDA OOM
-    print(f"Computing embeddings for {len(all_texts)} statements...")
+    # Process in batches for efficiency - use larger batch size with fp16
+    batch_size = 32 if use_fp16 else 8  # Larger batch size with fp16
+    print(f"Computing embeddings for {len(all_texts)} statements (batch_size={batch_size}, fp16={use_fp16})...")
     with torch.no_grad():
         for i in tqdm(range(0, len(all_texts), batch_size), desc="Processing batches"):
             batch_texts = all_texts[i:i+batch_size]
@@ -280,14 +289,18 @@ def compute_embeddings_for_dataset():
             # Move inputs to device and get embeddings
             input_ids = inputs['input_ids'].to(device)
             attention_mask = inputs['attention_mask'].to(device)
-            embeddings = encoder(input_ids, attention_mask)
+
+            # Use autocast for mixed precision
+            with autocast(enabled=use_fp16):
+                embeddings = encoder(input_ids, attention_mask)
 
             # Move embeddings back to CPU for storage
-            all_embeddings.append(embeddings.cpu())
+            all_embeddings.append(embeddings.float().cpu())
 
             # Clear GPU memory after each batch
             del embeddings, input_ids, attention_mask
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     if all_embeddings:
         all_embeddings = torch.cat(all_embeddings, dim=0)
