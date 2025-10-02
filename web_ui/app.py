@@ -188,26 +188,40 @@ def load_model(model_name: str):
                 embedding = outputs.last_hidden_state[batch_indices, sequence_lengths, :]
             return F.normalize(self.projection(embedding), p=2, dim=-1)
 
-    # Load the model
-    if model_name == 'bert-base':
+    # Model directory
+    model_dir = Path(f'../outputs/demo/{model_name}')
+    if not model_dir.exists():
+        raise ValueError(f"Model directory not found: {model_dir}")
+
+    # Detect model type from directory name or files
+    model_name_lower = model_name.lower()
+    if 'bert' in model_name_lower:
         base_model_name = 'bert-base-uncased'
         hidden_dim = 768
-    elif model_name == 'qwen-1.5b':
+    elif 'qwen' in model_name_lower or '1.5b' in model_name_lower:
         base_model_name = 'Qwen/Qwen2.5-1.5B'
         hidden_dim = 1536
     else:
-        raise ValueError(f"Unknown model: {model_name}")
+        # Default to Qwen
+        base_model_name = 'Qwen/Qwen2.5-1.5B'
+        hidden_dim = 1536
 
-    # Load base model and LoRA adapters
+    # Load base model
     base_model = AutoModel.from_pretrained(base_model_name)
-    lora_path = Path(f'../outputs/{model_name}_lora_adapters')
-    if lora_path.exists():
+
+    # Load LoRA adapters from model directory
+    lora_paths = list(model_dir.glob('*lora_adapters'))
+    if lora_paths:
+        lora_path = lora_paths[0]
+        print(f"Loading LoRA adapters from: {lora_path}")
         base_model = PeftModel.from_pretrained(base_model, str(lora_path))
 
-    # Load projection layer - output dim is 2048 based on saved models
-    projection_path = Path(f'../outputs/{model_name}_projection.pt')
-    projection = nn.Linear(hidden_dim, 2048)  # Changed from 768 to 2048
-    if projection_path.exists():
+    # Load projection layer from model directory
+    projection_files = list(model_dir.glob('*projection.pt'))
+    projection = nn.Linear(hidden_dim, 2048)
+    if projection_files:
+        projection_path = projection_files[0]
+        print(f"Loading projection from: {projection_path}")
         projection.load_state_dict(torch.load(projection_path, map_location='cpu'))
 
     # Create encoder and move to device
@@ -240,17 +254,18 @@ def load_model(model_name: str):
 
 def load_precomputed_embeddings(model_name: str, dataset_name: str):
     """Load pre-computed embeddings if they exist."""
-    # Try demo directory structure first
-    demo_path = Path(f'../outputs/demo/{model_name}/embeddings/{dataset_name}')
-    if demo_path.exists():
-        embeddings_path = demo_path / 'embeddings.pt'
-        metadata_path = demo_path / 'metadata.json'
+    # Load from model directory in outputs/demo/
+    embeddings_path = Path(f'../outputs/demo/{model_name}/embeddings/{dataset_name}')
 
-        if embeddings_path.exists() and metadata_path.exists():
-            print(f"Loading pre-computed embeddings from: {demo_path}")
-            embeddings = torch.load(embeddings_path, map_location='cpu')
+    if embeddings_path.exists():
+        emb_file = embeddings_path / 'embeddings.pt'
+        metadata_file = embeddings_path / 'metadata.json'
 
-            with open(metadata_path, 'r') as f:
+        if emb_file.exists() and metadata_file.exists():
+            print(f"Loading pre-computed embeddings from: {embeddings_path}")
+            embeddings = torch.load(emb_file, map_location='cpu')
+
+            with open(metadata_file, 'r') as f:
                 metadata = json.load(f)
 
             return {
@@ -324,7 +339,7 @@ def compute_embeddings_for_dataset():
             inputs = tokenizer(
                 batch_texts,
                 truncation=True,
-                max_length=512,
+                max_length=256,
                 padding='max_length',
                 return_tensors='pt'
             )
@@ -359,17 +374,42 @@ def compute_embeddings_for_dataset():
 
 @app.route('/api/models')
 def list_models():
-    """List available models."""
+    """List available models from outputs/demo/ directory."""
     models = []
-    outputs_dir = Path('../outputs')
+    demo_dir = Path('../outputs/demo')
 
-    # Check for bert model
-    if (outputs_dir / 'bert-base_projection.pt').exists():
-        models.append({'name': 'bert-base', 'display': 'BERT Base'})
+    if not demo_dir.exists():
+        return jsonify(models)
 
-    # Check for qwen model
-    if (outputs_dir / 'qwen-1.5b_projection.pt').exists():
-        models.append({'name': 'qwen-1.5b', 'display': 'Qwen 1.5B'})
+    # Scan for model directories
+    for model_path in demo_dir.iterdir():
+        if not model_path.is_dir():
+            continue
+
+        # Check if this directory contains model files (projection or LoRA adapters)
+        has_projection = False
+        has_lora = False
+
+        # Look for projection file
+        for proj_file in model_path.glob('*projection.pt'):
+            has_projection = True
+            break
+
+        # Look for LoRA adapters directory
+        for lora_dir in model_path.glob('*lora_adapters'):
+            if lora_dir.is_dir():
+                has_lora = True
+                break
+
+        # If we found model files, add to list
+        if has_projection or has_lora:
+            model_name = model_path.name
+            # Create display name (capitalize and format)
+            display_name = model_name.replace('_', ' ').replace('-', ' ').title()
+            models.append({
+                'name': model_name,
+                'display': display_name
+            })
 
     return jsonify(models)
 
@@ -510,7 +550,7 @@ def semantic_search():
         inputs = tokenizer(
             [query_text],
             truncation=True,
-            max_length=512,
+            max_length=256,
             padding='max_length',
             return_tensors='pt'
         )

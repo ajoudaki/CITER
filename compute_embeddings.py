@@ -97,7 +97,7 @@ class SimpleEncoder(nn.Module):
         return F.normalize(self.projection(embedding), p=2, dim=-1)
 
 
-def collate_fn(batch, tokenizer, max_length=512):
+def collate_fn(batch, tokenizer, max_length=256):
     """Collate function for batching statements."""
     texts = [item['text'] for item in batch]
     indices = [item['idx'] for item in batch]
