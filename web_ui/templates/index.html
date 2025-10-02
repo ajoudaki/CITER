@@ -51,8 +51,18 @@
                         </div>
                     </div>
 
-                    <!-- Search Box -->
+                    <!-- Semantic Search Box -->
+                    <div id="semanticSearchBox" class="mb-3 d-none">
+                        <label for="semanticQuery" class="form-label">Semantic Search:</label>
+                        <textarea class="form-control" id="semanticQuery" rows="3" placeholder="Enter a mathematical statement or concept to find similar theorems/lemmas..."></textarea>
+                        <button class="btn btn-primary mt-2 w-100" onclick="semanticSearch()">
+                            <i class="bi bi-search"></i> Find Similar Statements
+                        </button>
+                    </div>
+
+                    <!-- Text Search Box -->
                     <div class="mb-3">
+                        <label for="searchBox" class="form-label">Text Search:</label>
                         <input type="text" class="form-control" id="searchBox" placeholder="Search in statements...">
                         <button class="btn btn-secondary mt-2 w-100" onclick="searchStatements()">Search</button>
                     </div>

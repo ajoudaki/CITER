@@ -441,5 +441,79 @@ def search_statements():
         'results': results[:100]  # Limit to 100 results
     })
 
+@app.route('/api/semantic_search', methods=['POST'])
+def semantic_search():
+    """Search for similar statements using semantic similarity with a custom query."""
+    if not current_model:
+        return jsonify({'success': False, 'error': 'No model loaded'}), 400
+
+    if not current_dataset:
+        return jsonify({'success': False, 'error': 'No dataset loaded'}), 400
+
+    query_text = request.json.get('query', '').strip()
+    if not query_text:
+        return jsonify({'success': False, 'error': 'Empty query'}), 400
+
+    top_k = request.json.get('top_k', 100)  # Default to top 100 results
+
+    # Get embeddings for all statements in dataset
+    cache_data = compute_embeddings_for_dataset()
+    if not cache_data:
+        return jsonify({'success': False, 'error': 'Failed to compute embeddings'}), 400
+
+    embeddings = cache_data['embeddings']
+    metadata = cache_data['metadata']
+
+    # Get model data
+    model_data = loaded_models[current_model]
+    encoder = model_data['encoder']
+    tokenizer = model_data['tokenizer']
+    device = model_data['device']
+    use_fp16 = model_data.get('use_fp16', False)
+
+    # Embed the query
+    with torch.no_grad():
+        inputs = tokenizer(
+            [query_text],
+            truncation=True,
+            max_length=512,
+            padding='max_length',
+            return_tensors='pt'
+        )
+
+        input_ids = inputs['input_ids'].to(device)
+        attention_mask = inputs['attention_mask'].to(device)
+
+        with autocast(enabled=use_fp16):
+            query_embedding = encoder(input_ids, attention_mask)
+
+        query_embedding = query_embedding.float().cpu()
+
+    # Compute similarities
+    similarities = torch.matmul(query_embedding, embeddings.t()).squeeze()
+
+    # Sort and get top results
+    top_k = min(top_k, len(similarities))
+    values, indices = torch.topk(similarities, top_k)
+
+    # Prepare results
+    results = []
+    for i, idx in enumerate(indices):
+        meta = metadata[idx]
+        results.append({
+            'similarity': float(values[i]),
+            'paper_idx': meta['paper_idx'],
+            'paper_title': meta['paper_title'],
+            'type': meta['type'],
+            'text': meta['text']
+        })
+
+    return jsonify({
+        'success': True,
+        'query': query_text,
+        'num_results': len(results),
+        'results': results
+    })
+
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)

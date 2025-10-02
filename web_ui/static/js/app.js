@@ -379,6 +379,7 @@ async function loadSelectedModel() {
             currentModel = modelName;
             document.getElementById('modelName').textContent = modelName;
             document.getElementById('modelStatus').classList.remove('d-none');
+            document.getElementById('semanticSearchBox').classList.remove('d-none');
             button.textContent = 'Model Loaded!';
             setTimeout(() => {
                 button.textContent = 'Load Model';
@@ -429,18 +430,66 @@ async function findSimilar(paperIdx, stmtIdx, stmtType) {
     }
 }
 
-function displaySimilarityResults(data) {
+async function semanticSearch() {
+    const query = document.getElementById('semanticQuery').value.trim();
+    if (!query) {
+        alert('Please enter a query');
+        return;
+    }
+
+    if (!currentModel) {
+        alert('Please load a model first');
+        return;
+    }
+
+    if (!currentDataset) {
+        alert('Please load a dataset first');
+        return;
+    }
+
+    try {
+        const response = await fetch('/api/semantic_search', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                query: query,
+                top_k: 100
+            })
+        });
+
+        const data = await response.json();
+
+        if (data.success) {
+            displaySimilarityResults(data, true);
+        } else {
+            alert('Semantic search failed: ' + data.error);
+        }
+    } catch (error) {
+        console.error('Error in semantic search:', error);
+        alert('Semantic search failed');
+    }
+}
+
+function displaySimilarityResults(data, isSemanticSearch = false) {
     const content = document.getElementById('paperContent');
 
     let html = `
         <div class="similarity-results">
-            <h3>Similarity Results</h3>
-            <button class="btn btn-sm btn-secondary mb-3" onclick="loadPaper(${data.query.paper_idx})">Back to Paper</button>
+            <h3>${isSemanticSearch ? 'Semantic Search Results' : 'Similarity Results'}</h3>
+            ${isSemanticSearch ?
+                '<button class="btn btn-sm btn-secondary mb-3" onclick="clearSearch()">Clear Results</button>' :
+                `<button class="btn btn-sm btn-secondary mb-3" onclick="loadPaper(${data.query.paper_idx})">Back to Paper</button>`
+            }
 
             <div class="query-box mb-3">
-                <h5>Query Statement (${data.query.type})</h5>
+                <h5>Query ${isSemanticSearch ? 'Text' : `Statement (${data.query.type})`}</h5>
                 <div class="statement-content">
-                    ${isSourceView ? `<pre class="source-code">${escapeHtml(data.query.text)}</pre>` : data.query.text}
+                    ${isSemanticSearch ?
+                        `<pre class="source-code">${escapeHtml(data.query)}</pre>` :
+                        (isSourceView ? `<pre class="source-code">${escapeHtml(data.query.text)}</pre>` : data.query.text)
+                    }
                 </div>
             </div>
 
