@@ -471,8 +471,9 @@ def find_similar():
     # Filter out self and prepare results
     results = []
     for i, idx in enumerate(indices):
-        if idx != query_idx:
-            meta = metadata[idx]
+        idx_int = int(idx.item()) if torch.is_tensor(idx) else int(idx)
+        if idx_int != query_idx:
+            meta = metadata[idx_int]
             results.append({
                 'similarity': float(values[i]),
                 'paper_idx': meta['paper_idx'],
@@ -573,7 +574,8 @@ def semantic_search():
     # Prepare results
     results = []
     for i, idx in enumerate(indices):
-        meta = metadata[idx]
+        idx_int = int(idx.item()) if torch.is_tensor(idx) else int(idx)
+        meta = metadata[idx_int]
         results.append({
             'similarity': float(values[i]),
             'paper_idx': meta['paper_idx'],
