@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.cuda.amp import autocast
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig
 from peft import PeftModel
 from tqdm import tqdm
 
@@ -170,17 +170,27 @@ def load_model(model_name: str):
     num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
     print(f"Loading model on {device} (fp16: {use_fp16}, GPUs: {num_gpus})")
 
-    # Simple encoder class matching training code
+    # Clear GPU cache before loading to free up memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    # Simple encoder class matching compute_embeddings.py
     class SimpleEncoder(nn.Module):
-        def __init__(self, base_model, projection):
+        def __init__(self, base_model, projection, model_type: str):
             super().__init__()
             self.base_model = base_model
             self.projection = projection
+            self.model_type = model_type
 
         def forward(self, input_ids, attention_mask):
             outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
+
+            # Pretrained embedding models may return embeddings directly
+            if self.model_type == 'pretrained' and hasattr(outputs, 'embeddings'):
+                return F.normalize(outputs.embeddings, p=2, dim=-1)
+
             # Use CLS token for BERT, last token for Qwen
-            if 'bert' in model_name.lower():
+            if 'bert' in self.model_type.lower():
                 embedding = outputs.last_hidden_state[:, 0, :]
             else:
                 sequence_lengths = attention_mask.sum(dim=1) - 1
@@ -193,21 +203,54 @@ def load_model(model_name: str):
     if not model_dir.exists():
         raise ValueError(f"Model directory not found: {model_dir}")
 
-    # Detect model type from directory name or files
+    # Detect model type from directory name or LoRA adapter name
     model_name_lower = model_name.lower()
+
+    # Check for LoRA adapters to determine exact model
+    lora_dirs = list(model_dir.glob('*lora_adapters'))
+    lora_hint = lora_dirs[0].name.lower() if lora_dirs else ''
+
     if 'bert' in model_name_lower:
         base_model_name = 'bert-base-uncased'
         hidden_dim = 768
-    elif 'qwen' in model_name_lower or '1.5b' in model_name_lower:
+        model_type = 'bert'
+    elif '7b' in model_name_lower or '7b' in lora_hint or 'math-7b' in lora_hint:
+        # Qwen 7B models
+        if 'math' in lora_hint:
+            base_model_name = 'Qwen/Qwen2.5-Math-7B-Instruct'
+        else:
+            base_model_name = 'Qwen/Qwen2.5-7B'
+        hidden_dim = 3584
+        model_type = 'qwen-7b'
+    elif '1.5b' in model_name_lower or '1.5b' in lora_hint or 'qwen' in model_name_lower:
         base_model_name = 'Qwen/Qwen2.5-1.5B'
         hidden_dim = 1536
+        model_type = 'qwen'
     else:
-        # Default to Qwen
+        # Default to Qwen 1.5B
         base_model_name = 'Qwen/Qwen2.5-1.5B'
         hidden_dim = 1536
+        model_type = 'qwen'
 
-    # Load base model
-    base_model = AutoModel.from_pretrained(base_model_name)
+    # Use quantization for large models (7B+)
+    use_quantization = '7b' in model_name_lower or '7b' in lora_hint
+
+    if use_quantization and torch.cuda.is_available():
+        print(f"Loading {base_model_name} with 4-bit quantization...")
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_compute_dtype=torch.bfloat16
+        )
+        base_model = AutoModel.from_pretrained(
+            base_model_name,
+            quantization_config=quantization_config,
+            device_map="auto"
+        )
+    else:
+        # Load base model normally
+        base_model = AutoModel.from_pretrained(base_model_name)
 
     # Load LoRA adapters from model directory
     lora_paths = list(model_dir.glob('*lora_adapters'))
@@ -225,17 +268,22 @@ def load_model(model_name: str):
         projection.load_state_dict(torch.load(projection_path, map_location='cpu'))
 
     # Create encoder and move to device
-    encoder = SimpleEncoder(base_model, projection)
-    encoder = encoder.to(device)
+    encoder = SimpleEncoder(base_model, projection, model_type)
 
-    # Convert to fp16 if using CUDA
-    if use_fp16:
-        encoder = encoder.half()
-
-    # Use DataParallel for multi-GPU
-    if num_gpus > 1:
-        print(f"Using DataParallel across {num_gpus} GPUs")
-        encoder = nn.DataParallel(encoder)
+    # For quantized models, don't move to device (already handled by device_map)
+    # For non-quantized models, move to device and optionally convert to fp16
+    if not use_quantization:
+        encoder = encoder.to(device)
+        if use_fp16:
+            encoder = encoder.half()
+        # Use DataParallel for multi-GPU
+        if num_gpus > 1:
+            print(f"Using DataParallel across {num_gpus} GPUs")
+            encoder = nn.DataParallel(encoder)
+    else:
+        # For quantized models, only convert projection layer to fp16
+        if use_fp16:
+            encoder.projection = encoder.projection.half().to(device)
 
     encoder.eval()
 
@@ -247,7 +295,8 @@ def load_model(model_name: str):
         'tokenizer': tokenizer,
         'device': device,
         'use_fp16': use_fp16,
-        'num_gpus': num_gpus
+        'num_gpus': num_gpus,
+        'use_quantization': use_quantization
     }
     current_model = model_name
     return loaded_models[model_name]
@@ -386,9 +435,10 @@ def list_models():
         if not model_path.is_dir():
             continue
 
-        # Check if this directory contains model files (projection or LoRA adapters)
+        # Check if this directory contains model files (projection or LoRA adapters) or embeddings
         has_projection = False
         has_lora = False
+        has_embeddings = False
 
         # Look for projection file
         for proj_file in model_path.glob('*projection.pt'):
@@ -401,14 +451,21 @@ def list_models():
                 has_lora = True
                 break
 
-        # If we found model files, add to list
-        if has_projection or has_lora:
+        # Look for precomputed embeddings
+        embeddings_dir = model_path / 'embeddings'
+        if embeddings_dir.exists() and embeddings_dir.is_dir():
+            has_embeddings = True
+
+        # If we found model files or embeddings, add to list
+        if has_projection or has_lora or has_embeddings:
             model_name = model_path.name
             # Create display name (capitalize and format)
             display_name = model_name.replace('_', ' ').replace('-', ' ').title()
             models.append({
                 'name': model_name,
-                'display': display_name
+                'display': display_name,
+                'has_weights': has_projection or has_lora,
+                'has_embeddings': has_embeddings
             })
 
     return jsonify(models)
@@ -416,12 +473,25 @@ def list_models():
 @app.route('/api/load_model/<model_name>')
 def load_model_api(model_name: str):
     """Load a specific model."""
+    global current_model
+
     try:
-        load_model(model_name)
-        # Precompute embeddings for current dataset
+        # Check if model has precomputed embeddings only
+        model_dir = Path(f'../outputs/demo/{model_name}')
+        has_weights = any(model_dir.glob('*projection.pt')) or any(model_dir.glob('*lora_adapters'))
+
+        if has_weights:
+            # Load model weights
+            load_model(model_name)
+        else:
+            # Only has precomputed embeddings, just set current model
+            current_model = model_name
+            loaded_models[model_name] = {'embeddings_only': True}
+
+        # Precompute or load embeddings for current dataset
         if current_dataset:
             compute_embeddings_for_dataset()
-        return jsonify({'success': True, 'model': model_name})
+        return jsonify({'success': True, 'model': model_name, 'embeddings_only': not has_weights})
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 400
 
@@ -524,6 +594,10 @@ def semantic_search():
 
     if not current_dataset:
         return jsonify({'success': False, 'error': 'No dataset loaded'}), 400
+
+    # Check if model is embeddings-only
+    if current_model in loaded_models and loaded_models[current_model].get('embeddings_only'):
+        return jsonify({'success': False, 'error': 'Semantic search not available for embeddings-only models. Use similarity search instead.'}), 400
 
     query_text = request.json.get('query', '').strip()
     if not query_text:

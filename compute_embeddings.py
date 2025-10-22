@@ -86,6 +86,10 @@ class SimpleEncoder(nn.Module):
     def forward(self, input_ids, attention_mask):
         outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
 
+        # Pretrained embedding models may return embeddings directly
+        if self.model_type == 'pretrained' and hasattr(outputs, 'embeddings'):
+            return F.normalize(outputs.embeddings, p=2, dim=-1)
+
         # Use CLS token for BERT, last token for Qwen
         if 'bert' in self.model_type.lower():
             embedding = outputs.last_hidden_state[:, 0, :]
@@ -130,56 +134,79 @@ def cleanup_distributed():
     dist.destroy_process_group()
 
 
-def load_model(model_dir: Path, local_rank: int):
+def load_model(model_dir: Path, local_rank: int, pretrained_model: str = None):
     """Load model, LoRA adapters, and projection layer."""
-    # Detect model type from directory name
-    model_dir_name = model_dir.name.lower()
 
-    if 'bert' in model_dir_name:
-        base_model_name = 'bert-base-uncased'
-        hidden_dim = 768
-        model_type = 'bert'
-    elif 'qwen' in model_dir_name or '1.5b' in model_dir_name:
-        base_model_name = 'Qwen/Qwen2.5-1.5B'
-        hidden_dim = 1536
-        model_type = 'qwen'
+    # Use pretrained model directly if specified
+    if pretrained_model:
+        if local_rank == 0:
+            print(f"Loading pretrained model: {pretrained_model}")
+        base_model = AutoModel.from_pretrained(pretrained_model, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(pretrained_model, trust_remote_code=True)
+        hidden_dim = base_model.config.hidden_size
+        projection = nn.Identity()  # No projection for pretrained embedding models
+        model_type = 'pretrained'
     else:
-        raise ValueError(f"Cannot determine model type from directory name: {model_dir_name}")
+        # Detect model type from directory name
+        model_dir_name = model_dir.name.lower()
 
-    # Load base model
-    if local_rank == 0:
-        print(f"Loading base model: {base_model_name}")
-    base_model = AutoModel.from_pretrained(base_model_name)
+        # Check for LoRA adapters to determine exact model
+        lora_dirs = list(model_dir.glob('*lora_adapters'))
+        lora_hint = lora_dirs[0].name.lower() if lora_dirs else ''
 
-    # Load LoRA adapters if they exist
-    lora_paths = [
-        model_dir / 'lora_adapters',
-        model_dir / f'{model_dir.name}_lora_adapters'
-    ]
+        if 'bert' in model_dir_name:
+            base_model_name = 'bert-base-uncased'
+            hidden_dim = 768
+            model_type = 'bert'
+        elif '7b' in model_dir_name or '7b' in lora_hint or 'math-7b' in lora_hint:
+            # Qwen 7B models
+            if 'math' in lora_hint:
+                base_model_name = 'Qwen/Qwen2.5-Math-7B-Instruct'
+            else:
+                base_model_name = 'Qwen/Qwen2.5-7B'
+            hidden_dim = 3584
+            model_type = 'qwen-7b'
+        elif 'qwen' in model_dir_name or '1.5b' in model_dir_name:
+            base_model_name = 'Qwen/Qwen2.5-1.5B'
+            hidden_dim = 1536
+            model_type = 'qwen'
+        else:
+            raise ValueError(f"Cannot determine model type from directory name: {model_dir_name}")
 
-    for lora_path in lora_paths:
-        if lora_path.exists():
-            if local_rank == 0:
-                print(f"Loading LoRA adapters from: {lora_path}")
-            base_model = PeftModel.from_pretrained(base_model, str(lora_path))
-            break
+        # Load base model
+        if local_rank == 0:
+            print(f"Loading base model: {base_model_name}")
+        base_model = AutoModel.from_pretrained(base_model_name)
 
-    # Load projection layer
-    projection_paths = [
-        model_dir / 'projection.pt',
-        model_dir / f'{model_dir.name}_projection.pt'
-    ]
+        # Load LoRA adapters if they exist
+        lora_paths = [
+            model_dir / 'lora_adapters',
+            model_dir / f'{model_dir.name}_lora_adapters'
+        ]
 
-    projection = nn.Linear(hidden_dim, 2048)
-    for proj_path in projection_paths:
-        if proj_path.exists():
-            if local_rank == 0:
-                print(f"Loading projection from: {proj_path}")
-            projection.load_state_dict(torch.load(proj_path, map_location='cpu'))
-            break
+        for lora_path in lora_paths:
+            if lora_path.exists():
+                if local_rank == 0:
+                    print(f"Loading LoRA adapters from: {lora_path}")
+                base_model = PeftModel.from_pretrained(base_model, str(lora_path))
+                break
 
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(base_model_name)
+        # Load projection layer
+        projection_paths = [
+            model_dir / 'projection.pt',
+            model_dir / f'{model_dir.name}_projection.pt'
+        ]
+
+        projection = nn.Linear(hidden_dim, 2048)
+        for proj_path in projection_paths:
+            if proj_path.exists():
+                if local_rank == 0:
+                    print(f"Loading projection from: {proj_path}")
+                projection.load_state_dict(torch.load(proj_path, map_location='cpu'))
+                break
+
+        # Load tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(base_model_name)
 
     # Create encoder
     encoder = SimpleEncoder(base_model, projection, model_type)
@@ -198,7 +225,8 @@ def compute_embeddings(
     dataset_size: str,
     batch_size: int,
     local_rank: int,
-    world_size: int
+    world_size: int,
+    pretrained_model: str = None
 ):
     """Compute embeddings for entire dataset."""
 
@@ -224,7 +252,7 @@ def compute_embeddings(
     )
 
     # Load model
-    encoder, tokenizer = load_model(model_dir, local_rank)
+    encoder, tokenizer = load_model(model_dir, local_rank, pretrained_model)
 
     # Create dataloader with custom collate function
     from functools import partial
@@ -290,7 +318,11 @@ def compute_embeddings(
     # Save embeddings (only on rank 0)
     if local_rank == 0:
         # Create output directory
-        output_dir = model_dir / 'embeddings' / dataset_size
+        if pretrained_model:
+            model_name = pretrained_model.replace('/', '_')
+            output_dir = Path('outputs/demo') / model_name / 'embeddings' / dataset_size
+        else:
+            output_dir = model_dir / 'embeddings' / dataset_size
         output_dir.mkdir(parents=True, exist_ok=True)
 
         # Sort by indices to get original order
@@ -325,8 +357,10 @@ def compute_embeddings(
 
 def main():
     parser = argparse.ArgumentParser(description='Compute embeddings for dataset')
-    parser.add_argument('--model_dir', type=str, required=True,
+    parser.add_argument('--model_dir', type=str,
                         help='Directory containing model weights (e.g., outputs/demo/qwen-1.5b)')
+    parser.add_argument('--pretrained_model', type=str,
+                        help='HuggingFace model name (e.g., Qwen/Qwen3-Embedding-0.6B)')
     parser.add_argument('--dataset_size', type=str, required=True,
                         choices=['toy', 'tiny', 'small', 'medium', 'full'],
                         help='Size of dataset to process')
@@ -335,17 +369,25 @@ def main():
 
     args = parser.parse_args()
 
+    if not args.model_dir and not args.pretrained_model:
+        parser.error('Either --model_dir or --pretrained_model must be specified')
+    if args.model_dir and args.pretrained_model:
+        parser.error('Cannot specify both --model_dir and --pretrained_model')
+
     # Setup distributed
     local_rank = setup_distributed()
     world_size = dist.get_world_size()
 
-    model_dir = Path(args.model_dir)
+    model_dir = Path(args.model_dir) if args.model_dir else Path('.')
 
     if local_rank == 0:
         print(f"=" * 80)
         print(f"Computing Embeddings")
         print(f"=" * 80)
-        print(f"Model directory: {model_dir}")
+        if args.pretrained_model:
+            print(f"Pretrained model: {args.pretrained_model}")
+        else:
+            print(f"Model directory: {model_dir}")
         print(f"Dataset size: {args.dataset_size}")
         print(f"Batch size: {args.batch_size} per GPU")
         print(f"World size: {world_size} GPUs")
@@ -357,7 +399,8 @@ def main():
             dataset_size=args.dataset_size,
             batch_size=args.batch_size,
             local_rank=local_rank,
-            world_size=world_size
+            world_size=world_size,
+            pretrained_model=args.pretrained_model
         )
     finally:
         cleanup_distributed()
