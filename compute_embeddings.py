@@ -28,7 +28,7 @@ from torch.amp import autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModel
+from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig
 from peft import PeftModel
 
 
@@ -173,10 +173,27 @@ def load_model(model_dir: Path, local_rank: int, pretrained_model: str = None):
         else:
             raise ValueError(f"Cannot determine model type from directory name: {model_dir_name}")
 
-        # Load base model
-        if local_rank == 0:
-            print(f"Loading base model: {base_model_name}")
-        base_model = AutoModel.from_pretrained(base_model_name)
+        # Load base model with quantization for 7B models
+        use_quantization = '7b' in model_type.lower()
+
+        if use_quantization:
+            if local_rank == 0:
+                print(f"Loading base model: {base_model_name} with 4-bit quantization")
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=torch.bfloat16
+            )
+            base_model = AutoModel.from_pretrained(
+                base_model_name,
+                quantization_config=quantization_config,
+                device_map={'': local_rank}  # Map to specific GPU for DDP
+            )
+        else:
+            if local_rank == 0:
+                print(f"Loading base model: {base_model_name}")
+            base_model = AutoModel.from_pretrained(base_model_name)
 
         # Load LoRA adapters if they exist
         lora_paths = [
@@ -210,12 +227,19 @@ def load_model(model_dir: Path, local_rank: int, pretrained_model: str = None):
 
     # Create encoder
     encoder = SimpleEncoder(base_model, projection, model_type)
-    encoder = encoder.to(local_rank)
-    encoder = encoder.half()  # fp16
-    encoder.eval()
 
-    # Wrap with DDP
-    encoder = DDP(encoder, device_ids=[local_rank])
+    # For quantized models, only move projection to device
+    # Base model is already on correct device via device_map
+    if 'use_quantization' in locals() and use_quantization:
+        encoder.projection = encoder.projection.to(local_rank).half()
+        # Don't wrap quantized models with DDP - they're already on the right device
+    else:
+        encoder = encoder.to(local_rank)
+        encoder = encoder.half()  # fp16
+        # Wrap with DDP for non-quantized models
+        encoder = DDP(encoder, device_ids=[local_rank])
+
+    encoder.eval()
 
     return encoder, tokenizer
 
