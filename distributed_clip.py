@@ -67,10 +67,10 @@ def compute_and_gather_embeddings(
                 z = module.encoder_x(local_statements_packed[i:i + B_micro])
             local_Z.append(z)
         
-        local_Z = torch.cat(local_Z, dim=0) # [C_local, D]
+        local_Z = torch.cat(local_Z, dim=0).half() # [C_local, D]
 
         # --- Sync Point: All-gather embeddings and paper IDs ---
-        Z_all = all_gather_embeddings(local_Z)
+        Z_all = all_gather_embeddings(local_Z).half() 
         paper_ids_all = all_gather_embeddings(local_paper_ids)
         
         return local_Z, Z_all, paper_ids_all

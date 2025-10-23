@@ -339,8 +339,9 @@ class LastTokenEncoder(nn.Module):
         sequence_lengths = attention_mask.sum(dim=1) - 1
         batch_indices = torch.arange(len(sequence_lengths), device=sequence_lengths.device)
         last_token_embedding = last_hidden_state[batch_indices, sequence_lengths, :]
-        return F.normalize(self.projection(last_token_embedding), p=2, dim=-1)
-
+        projected = self.projection(last_token_embedding.half())
+        normalized = F.normalize(projected, p=2, dim=-1)
+        return normalized.half()
 
 class JaccardEncoder(nn.Module):
     """Bag-of-tokens encoder using Jaccard similarity (no training needed)."""
