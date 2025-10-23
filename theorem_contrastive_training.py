@@ -28,9 +28,16 @@ import bitsandbytes.optim as bnb_optim
 
 import wandb
 
-# Import distributed functions
-from distributed_clip import distributed_train_step, trivial_contrastive_step, distributed_validate_step, validate_metrics
 
+# Import distributed functions
+from distributed_clip import (
+    distributed_train_step, 
+    trivial_contrastive_step, 
+    distributed_validate_step,
+    validate_metrics,
+    compute_and_gather_embeddings,
+    compute_retrieval_metrics  # <-- ADD THIS IMPORT
+)
 from numba import njit # Import the Numba JIT compiler
 import torch.utils.checkpoint as checkpoint # <-- ADD THIS IMPORT
 
@@ -769,121 +776,98 @@ def load_saved_weights(model, load_path: Path, cfg: DictConfig, rank: int = 0):
             print(f"Loading full model from: {model_path}")
         model_to_load.load_state_dict(torch.load(model_path, map_location='cpu', weights_only=False))
 
-def compute_all_embeddings(model, tokenizer, cfg: DictConfig, device, rank: int = 0, world_size: int = 1):
-    """Compute embeddings for entire dataset using the loaded model."""
+# ADD this new one in its place
+def compute_all_embeddings(model, tokenizer, cfg: DictConfig, device, rank: int = 0, world_size: int = 1, distributed: bool = False):
+    """
+    Compute embeddings for all statements in the validation split
+    and save them to the /embeddings directory.
+    """
     import json
     from tqdm import tqdm
 
     model_to_use = model.module if hasattr(model, 'module') else model
     model.eval()
 
-    # Load all statements from the dataset file
-    dataset_path = Path(cfg.dataset.base_path) / f"{cfg.dataset.size}.jsonl"
-    all_statements = []
-    all_metadata = []
-
-    with open(dataset_path, 'r') as f:
-        for paper_idx, line in enumerate(f):
-            paper = json.loads(line)
-            statements = paper.get('lemmas', []) + paper.get('theorems', [])
-            for stmt in statements:
-                all_statements.append(stmt)
-                all_metadata.append({
-                    'paper_idx': paper_idx,
-                    'paper_title': paper.get('title', 'Untitled'),
-                    'arxiv_id': paper.get('arxiv_id', 'Unknown'),
-                    'type': 'theorem' if stmt in paper.get('theorems', []) else 'lemma',
-                    'text': stmt
-                })
-
-    # Split statements among GPUs
-    num_statements = len(all_statements)
-    statements_per_gpu = (num_statements + world_size - 1) // world_size
-    start_idx = rank * statements_per_gpu
-    end_idx = min(start_idx + statements_per_gpu, num_statements)
-
-    my_statements = all_statements[start_idx:end_idx]
-    my_metadata = all_metadata[start_idx:end_idx]
-    my_indices = list(range(start_idx, end_idx))
-
     if rank == 0:
         print(f"\n{'='*80}")
-        print(f"Computing embeddings for {num_statements} statements on {world_size} GPU(s)")
+        print(f"COMPUTE EMBEDDINGS MODE")
         print(f"{'='*80}")
 
-    all_embeddings = []
-    all_indices = []
+    # --- 1. Load Data (Identical to validate_only) ---
+    dataset_path = Path(cfg.dataset.base_path) / f"{cfg.dataset.size}.jsonl"
+    
+    # We use AllStatementsDataset to get all statements from the eval split
+    val_dataset_all = AllStatementsDataset(
+        str(dataset_path), tokenizer,
+        max_length=cfg.training.max_length,
+        split='eval', # By default, we cache the eval split
+        train_ratio=cfg.dataset.get('train_ratio', 0.8),
+        seed=cfg.dataset.get('seed', 42)
+    )
 
-    with torch.no_grad():
-        iterator = tqdm(my_statements, desc=f"Computing embeddings (GPU {rank})") if rank == 0 else my_statements
-        for idx, stmt_text in enumerate(iterator):
-            # Tokenize the statement
-            tokens = tokenizer(stmt_text, padding='max_length', truncation=True,
-                             max_length=cfg.training.max_length, return_tensors='pt')
+    # Prepare and distribute the data
+    all_statements_packed, all_paper_ids = prepare_all_statements_data(
+        val_dataset_all, device, distributed, rank, world_size
+    )
 
-            # Pack the tensor (same format as training: concat along dim=1)
-            input_ids = tokens['input_ids']  # Keep batch dim
-            attention_mask = tokens['attention_mask']  # Keep batch dim
-            packed = torch.cat([input_ids, attention_mask], dim=1).to(device)
+    # Calculate local chunk
+    N_global = all_statements_packed.shape[0]
+    C_local = N_global // world_size
+    start, end = rank * C_local, (rank + 1) * C_local
 
-            # Compute embedding using encoder_x
-            embedding = model_to_use.encoder_x(packed)
-            all_embeddings.append(embedding.cpu())
-            all_indices.append(my_indices[idx])
+    # --- 2. Compute Embeddings (using the new helper) ---
+    use_amp = cfg.training.get('use_amp', True) and torch.cuda.is_available()
+    compute_config = {
+        'MICRO_BATCH_SIZE': cfg.training.micro_batch_size,
+        'USE_AMP': use_amp 
+    }
 
-    # Stack local embeddings
-    local_embeddings = torch.cat(all_embeddings, dim=0)
-    local_indices = torch.tensor(all_indices)
+    # Call the helper
+    # We only need Z_all and paper_ids_all for saving
+    _, Z_all, paper_ids_all = compute_and_gather_embeddings(
+        model,
+        all_statements_packed[start:end].to(device),
+        all_paper_ids[start:end].to(device),
+        compute_config,
+        rank
+    )
 
-    # Gather from all GPUs if distributed
-    if world_size > 1 and dist.is_initialized():
-        # Gather to rank 0
-        gathered_embeddings = [torch.zeros_like(local_embeddings) for _ in range(world_size)] if rank == 0 else None
-        gathered_indices = [torch.zeros_like(local_indices) for _ in range(world_size)] if rank == 0 else None
-
-        dist.gather(local_embeddings, gathered_embeddings, dst=0)
-        dist.gather(local_indices, gathered_indices, dst=0)
-
-        if rank == 0:
-            # Concatenate gathered results
-            all_embeddings_tensor = torch.cat(gathered_embeddings, dim=0)
-            all_indices_tensor = torch.cat(gathered_indices, dim=0)
-
-            # Sort by indices to restore original order
-            sorted_idx = torch.argsort(all_indices_tensor)
-            all_embeddings_tensor = all_embeddings_tensor[sorted_idx]
-    else:
-        if rank == 0:
-            all_embeddings_tensor = local_embeddings
-
+    # --- 3. Save to Disk (Rank 0 only) ---
     if rank == 0:
-        # Save embeddings
+        # Remove any padding that was added
+        num_original_statements = len(val_dataset_all)
+        if N_global > num_original_statements:
+            print(f"Trimming {N_global - num_original_statements} padding statements before saving.")
+            Z_all = Z_all[:num_original_statements]
+            paper_ids_all = paper_ids_all[:num_original_statements]
+        
+        # Define output paths
         output_dir = Path(cfg.output.save_dir) / 'embeddings' / cfg.dataset.size
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        embeddings_path = output_dir / 'embeddings.pt'
-        metadata_path = output_dir / 'metadata.json'
-        info_path = output_dir / 'info.json'
+        embeddings_path = output_dir / 'eval_embeddings.pt'
+        paper_ids_path = output_dir / 'eval_paper_ids.pt'
+        info_path = output_dir / 'eval_info.json'
 
         print(f"Saving embeddings to: {embeddings_path}")
-        torch.save(all_embeddings_tensor, embeddings_path)
+        torch.save(Z_all.cpu(), embeddings_path)
 
-        print(f"Saving metadata to: {metadata_path}")
-        with open(metadata_path, 'w') as f:
-            json.dump(all_metadata, f)
+        print(f"Saving paper IDs to: {paper_ids_path}")
+        torch.save(paper_ids_all.cpu(), paper_ids_path)
 
         # Save info
         info = {
             'dataset_size': cfg.dataset.size,
-            'num_statements': len(all_embeddings_tensor),
-            'embedding_dim': all_embeddings_tensor.shape[1],
-            'model_dir': cfg.output.save_dir,
+            'split': 'eval',
+            'num_statements': len(Z_all),
+            'embedding_dim': Z_all.shape[1],
+            'model_dir': str(cfg.output.save_dir),
             'dataset_path': str(dataset_path)
         }
         with open(info_path, 'w') as f:
             json.dump(info, f, indent=2)
 
-        print(f"✓ Saved {len(all_embeddings_tensor)} embeddings ({all_embeddings_tensor.shape})")
+        print(f"✓ Saved {len(Z_all)} embeddings ({Z_all.shape})")
         print(f"{'='*80}\n")
 
 # ===================================================================
@@ -951,13 +935,95 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
         load_path = Path(cfg.training.get('load_model_path', cfg.output.save_dir))
         load_saved_weights(model, load_path, cfg, rank)
 
-        compute_all_embeddings(model, tokenizer, cfg, device, rank, world_size)
-        return
+        # --- THIS IS THE ONLY LINE NEEDED HERE ---
+        compute_all_embeddings(model, tokenizer, cfg, device, rank, world_size, distributed)
+        
+        return # Exit after computing embeddings
 
     use_amp = cfg.training.get('use_amp', True) and torch.cuda.is_available()
     scaler = GradScaler() if use_amp else None
     if rank == 0:
         print(f"Mixed precision training {'ENABLED' if use_amp else 'DISABLED'}")
+
+    # --- NEW BLOCK: Validate from cached embeddings ---
+    if cfg.training.get('validate_from_embeddings', False):
+        if rank == 0:
+            print(f"\n{'='*80}")
+            print("VALIDATE FROM EMBEDDINGS MODE")
+            print(f"{'='*80}")
+        
+        objects_to_broadcast = [None, None]
+        
+        if rank == 0:
+            # Use load_model_path as the base for finding embeddings
+            load_path = Path(cfg.training.load_model_path)
+            embeddings_path = load_path / 'embeddings' / cfg.dataset.size / 'eval_embeddings.pt'
+            paper_ids_path = load_path / 'embeddings' / cfg.dataset.size / 'eval_paper_ids.pt'
+
+            if not embeddings_path.exists() or not paper_ids_path.exists():
+                raise FileNotFoundError(
+                    f"Could not find cached embeddings. Searched for: \n"
+                    f"- {embeddings_path}\n"
+                    f"- {paper_ids_path}\n"
+                    f"Please run `+training.compute_embeddings_only=true` first."
+                )
+
+            print(f"Loading cached embeddings from: {embeddings_path}")
+            Z_all_cached = torch.load(embeddings_path, map_location='cpu')
+            print(f"Loading cached paper IDs from: {paper_ids_path}")
+            paper_ids_all_cached = torch.load(paper_ids_path, map_location='cpu')
+            
+            if distributed:
+                objects_to_broadcast = [Z_all_cached, paper_ids_all_cached]
+        
+        if distributed:
+            dist.broadcast_object_list(objects_to_broadcast, src=0)
+            
+        Z_all, paper_ids_all = objects_to_broadcast
+
+        # --- Distribute tensors and get local slices ---
+        Z_all = Z_all.to(device)
+        paper_ids_all = paper_ids_all.to(device)
+
+        N_global = Z_all.shape[0]
+        if N_global % world_size != 0:
+            raise ValueError(f"Loaded {N_global} embeddings, which is not divisible by world size {world_size}.")
+
+        C_local = N_global // world_size
+        start, end = rank * C_local, (rank + 1) * C_local
+        
+        local_Z = Z_all[start:end]
+        local_paper_ids = paper_ids_all[start:end]
+
+        # --- Call the metrics helper directly ---
+        val_config = {
+            'GLOBAL_BATCH_SIZE': N_global,
+            'MICRO_BATCH_SIZE': cfg.training.micro_batch_size,
+            'STREAM_CHUNK_SIZE': cfg.training.stream_chunk_size,
+            'TAU': cfg.training.tau,
+            'USE_AMP': use_amp
+        }
+        k_vals = cfg.training.get('k_vals', [1, 5, 10, 50, 100])
+
+        val_loss, val_metrics = compute_retrieval_metrics(
+            local_Z, local_paper_ids, Z_all, paper_ids_all,
+            val_config, rank, k_vals
+        )
+        
+        if rank == 0:
+            print(f"\n{'='*80}")
+            print("Validation Results (from Cached Embeddings)")
+            print(f"{'='*80}")
+            print(f"Val Loss: {val_loss:.4f}") 
+            for k, v in val_metrics.items():
+                if k == 'MRR':
+                    print(f"MRR: {v:.4f}")
+                else:
+                    print(f"{k}: {v*100:.2f}%")
+            print(f"{'='*80}")
+        return
+    # --- END OF NEW BLOCK ---
+    
     # Validate-only mode: load saved weights and run validation
     if cfg.training.get('validate_only', False):
         load_path = Path(cfg.training.get('load_model_path', cfg.output.save_dir))
