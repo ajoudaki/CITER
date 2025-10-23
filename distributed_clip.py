@@ -298,6 +298,182 @@ def distributed_validate_step(
 
     return global_loss, topk_acc
 
+# ===================================================================
+# New Validation Function (All-vs-All Metrics)
+# ===================================================================
+
+def validate_metrics(
+    model: torch.nn.Module,
+    local_statements_packed: torch.Tensor,
+    local_paper_ids: torch.Tensor,
+    config: Dict,
+    k_vals: Optional[list] = None
+) -> Tuple[float, Dict[str, float]]:
+    """
+    Performs a distributed, all-vs-all validation for retrieval metrics (Top@K, MRR).
+
+    This function assumes:
+    1. `local_statements_packed` is the local chunk of all validation statements.
+    2. `local_paper_ids` is a 1D tensor of integer IDs, where
+       `local_paper_ids[i]` is the paper ID for `local_statements_packed[i]`.
+    3. A "positive" match for a query `q` is any key `k` where
+       `paper_id(q) == paper_id(k)` and `q != k`.
+    4. Rank is 1 + (number of negatives ranked higher than the first positive).
+    """
+    model.eval()
+
+    if dist.is_initialized():
+        P, rank = dist.get_world_size(), dist.get_rank()
+    else:
+        P, rank = 1, 0
+
+    # Get config parameters
+    N_global = config['GLOBAL_BATCH_SIZE']
+    B_micro = config['MICRO_BATCH_SIZE']
+    C_local = local_statements_packed.shape[0]  # Num local statements
+    device = local_statements_packed.device
+
+    if N_global != C_local * P:
+        raise ValueError(f"Global batch size N={N_global} must equal C*P ({C_local}*{P}).")
+    
+    if k_vals is None:
+        k_vals = [1, 5, 10]
+    # Ensure max_k is no larger than the total number of items (minus self)
+    max_k = min(max(k_vals), N_global - 1)
+
+    with torch.no_grad():
+        # --- Phase A: Compute local embeddings ---
+        module = model.module if hasattr(model, 'module') else model
+        if not hasattr(module, 'encoder_x'):
+            raise AttributeError("Model must expose 'encoder_x'.")
+
+        local_Z = []
+        embedding_pbar = tqdm(range(0, C_local, B_micro), desc="Val Embeddings", disable=(rank != 0))
+
+        for i in embedding_pbar:
+            z = module.encoder_x(local_statements_packed[i:i + B_micro])
+            local_Z.append(z)
+        
+        local_Z = torch.cat(local_Z, dim=0) # [C_local, D]
+
+        # --- Sync Point 1: All-gather embeddings and paper IDs ---
+        # We can reuse all_gather_embeddings as it's a generic tensor gather
+        Z_all = all_gather_embeddings(local_Z)                 # [N_global, D]
+        paper_ids_all = all_gather_embeddings(local_paper_ids) # [N_global]
+
+        # --- Phase C: Streamed Metric Calculation ---
+        # Each rank `r` calculates metrics for its local_Z (queries)
+        # against Z_all (keys).
+        
+        num_local_chunks = math.ceil(C_local / B_micro)
+        all_reciprocal_ranks = []
+        all_correct_counts = {k: 0 for k in k_vals}
+        
+        metric_pbar = tqdm(range(num_local_chunks), desc="Validation Metrics", disable=(rank != 0))
+        Z_all_T = Z_all.T.contiguous() # [D, N_global]
+
+        for i_chunk in metric_pbar:
+            start = i_chunk * B_micro
+            end = min((i_chunk + 1) * B_micro, C_local)
+            if start >= end: continue
+
+            # Get chunks for queries
+            local_Z_chunk = local_Z[start:end]         # [B_chunk, D]
+            local_ids_chunk = local_paper_ids[start:end] # [B_chunk]
+            
+            # Compute similarity scores (B_chunk, N_global)
+            # No tau needed as ranking is scale-invariant
+            S_chunk = torch.matmul(local_Z_chunk, Z_all_T) 
+
+            # Create the positive-negative label matrix for this chunk
+            # [B_chunk, 1] == [1, N_global] -> [B_chunk, N_global]
+            is_positive = (local_ids_chunk.unsqueeze(1) == paper_ids_all.unsqueeze(0))
+
+            # Exclude self-similarity from being a "positive"
+            # and set its score to -inf so it's not ranked.
+            global_indices_for_chunk = torch.arange(
+                rank * C_local + start, 
+                rank * C_local + end, 
+                device=device
+            )
+            
+            if global_indices_for_chunk.numel() > 0:
+                # Create a [B_chunk, N_global] mask
+                self_mask = torch.zeros_like(S_chunk, dtype=torch.bool)
+                # For each row `r`, set column `c` to True where `c` is its global index
+                self_mask[
+                    torch.arange(end - start, device=device), 
+                    global_indices_for_chunk
+                ] = True
+                
+                # Exclude self from positives
+                is_positive[self_mask] = False 
+                # Set self-score to -inf
+                S_chunk[self_mask] = -torch.inf
+
+            # Get sorted indices (highest score first)
+            _, sorted_indices = S_chunk.sort(dim=1, descending=True) # [B_chunk, N_global]
+
+            # Re-order the `is_positive` labels according to the sorted scores
+            sorted_positives = torch.gather(is_positive, 1, sorted_indices) # [B_chunk, N_global]
+
+            # --- Compute Top@K ---
+            # Checks if *any* positive is in the top-k
+            for k in k_vals:
+                if k <= max_k:
+                    all_correct_counts[k] += sorted_positives[:, :k].any(dim=1).sum().item()
+
+            # --- Compute MRR (using 1 + #negatives logic) ---
+            
+            # Find the *first* positive in the ranked list
+            # `argmax` returns 0 if no True is found, which is fine
+            first_positive_idx = torch.argmax(sorted_positives.int(), dim=1) # [B_chunk]
+            
+            # Count cumulative negatives
+            sorted_negatives = ~sorted_positives
+            cumulative_negatives = torch.cumsum(sorted_negatives.int(), dim=1) # [B_chunk, N_global]
+            
+            # Get the negative count *at* the position of the first positive
+            ranks = 1 + torch.gather(cumulative_negatives, 1, first_positive_idx.unsqueeze(1)).squeeze(1) # [B_chunk]
+            
+            # Check which queries had at least one positive
+            has_positive = sorted_positives.any(dim=1) # [B_chunk]
+            
+            # Calculate reciprocal ranks, set to 0 if no positive
+            reciprocal_ranks = torch.where(
+                has_positive,
+                1.0 / ranks.float(),
+                0.0
+            )
+            
+            all_reciprocal_ranks.extend(reciprocal_ranks.cpu().tolist())
+
+        # --- Sync Point 2: Aggregate metrics from all GPUs ---
+        correct_counts_list = [all_correct_counts[k] for k in k_vals]
+        local_mrr_sum = sum(all_reciprocal_ranks)
+        
+        # We need to sum the counts and the MRR sum from all ranks
+        metrics_tensor = torch.tensor(
+            correct_counts_list + [local_mrr_sum], 
+            device=device, 
+            dtype=torch.float32
+        )
+        
+        if P > 1:
+            dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
+
+        total_metrics = metrics_tensor.cpu().numpy()
+        total_correct = total_metrics[:len(k_vals)]
+        total_mrr_sum = total_metrics[-1]
+
+        # N_global is the total number of queries
+        topk_acc = {k: count / N_global for k, count in zip(k_vals, total_correct)}
+        topk_acc['MRR'] = total_mrr_sum / N_global
+
+        # Return (loss, metrics) to match the old function's signature
+        # We did not compute loss, so we return nan.
+        return float('nan'), topk_acc
+
 
 def trivial_contrastive_step(
     model: torch.nn.Module,

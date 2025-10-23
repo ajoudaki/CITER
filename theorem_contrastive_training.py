@@ -23,13 +23,13 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig
-from peft import get_peft_model, LoraConfig, TaskType
+from peft import get_peft_model, LoraConfig, TaskType, PeftModel
 import bitsandbytes.optim as bnb_optim
 
 import wandb
 
 # Import distributed functions
-from distributed_clip import distributed_train_step, trivial_contrastive_step, distributed_validate_step
+from distributed_clip import distributed_train_step, trivial_contrastive_step, distributed_validate_step, validate_metrics
 
 from numba import njit # Import the Numba JIT compiler
 import torch.utils.checkpoint as checkpoint # <-- ADD THIS IMPORT
@@ -188,6 +188,78 @@ class StratifiedTheoremDataset(Dataset):
             'attention_mask_x': tokens_x['attention_mask'].squeeze(0),
             'input_ids_y': tokens_y['input_ids'].squeeze(0),
             'attention_mask_y': tokens_y['attention_mask'].squeeze(0)
+        }
+
+# ===================================================================
+# New Dataset for All-vs-All Validation
+# ===================================================================
+class AllStatementsDataset(Dataset):
+    """
+    A dataset that loads *all* individual statements (lemmas/theorems)
+    from a given split and returns each statement with its paper_id.
+    
+    This is used for the all-vs-all validation metric computation.
+    """
+    def __init__(self, jsonl_path: str, tokenizer, max_length: int = 512,
+                 split: str = 'eval', train_ratio: float = 0.8, seed: int = 42):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.split = split
+        self.seed = seed
+
+        # Load papers' statements into a list of lists
+        all_papers_statements = []
+        with open(jsonl_path, 'r') as f:
+            for line in f:
+                paper = json.loads(line)
+                statements = paper.get('lemmas', []) + paper.get('theorems', [])
+                if len(statements) >= 1: # Need at least one statement
+                    all_papers_statements.append(statements)
+
+        # Split train/eval using the same reproducible shuffle
+        rng = np.random.default_rng(self.seed)
+        indices = np.arange(len(all_papers_statements))
+        rng.shuffle(indices)
+        n_train = int(len(all_papers_statements) * train_ratio)
+        split_indices = indices[:n_train] if split == 'train' else indices[n_train:]
+        
+        # self.papers contains only the papers for this split
+        self.papers = [all_papers_statements[i] for i in split_indices]
+        
+        # Flatten all statements into a single list and track their paper IDs
+        self.all_statements = []
+        self.all_paper_ids = []
+        
+        # The paper_id will be the index *within this split*
+        for paper_id, statements in enumerate(self.papers):
+            for stmt in statements:
+                self.all_statements.append(stmt)
+                self.all_paper_ids.append(paper_id)
+
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            print(f"[AllStatementsDataset] {self.split.upper()} set: "
+                  f"{len(self.papers)} papers, "
+                  f"{len(self.all_statements)} total statements.")
+
+    def __len__(self):
+        """Return the total number of individual statements."""
+        return len(self.all_statements)
+
+    def __getitem__(self, idx: int):
+        """
+        Retrieves a single statement and its paper_id.
+        """
+        text = self.all_statements[idx]
+        paper_id = self.all_paper_ids[idx]
+
+        # Tokenize the statement text
+        tokens = self.tokenizer(text, padding='max_length', truncation=True,
+                                max_length=self.max_length, return_tensors='pt')
+
+        return {
+            'input_ids': tokens['input_ids'].squeeze(0),
+            'attention_mask': tokens['attention_mask'].squeeze(0),
+            'paper_id': torch.tensor(paper_id, dtype=torch.long)
         }
 
 # ===================================================================
@@ -551,11 +623,16 @@ def setup_model(cfg: DictConfig, device):
     
     return model.to(device)
 
-def prepare_validation_data(val_dataset, device, distributed, rank):
+def prepare_validation_data(val_dataset, device, distributed, rank, reshuffle=False):
     """Prepare and distribute validation data."""
     val_objects = [None, None]
     if rank == 0:
-        print("Preparing and distributing validation dataset...")
+        # Optionally reshuffle validation pairs to randomize which statements are paired
+        if reshuffle:
+            val_dataset.reset_epoch()
+            print("Preparing and distributing validation dataset (with reshuffled pairs)...")
+        else:
+            print("Preparing and distributing validation dataset...")
         val_data = [val_dataset[i] for i in range(len(val_dataset))]
         val_x = torch.stack([d['input_ids_x'] for d in val_data])
         val_mx = torch.stack([d['attention_mask_x'] for d in val_data])
@@ -570,22 +647,244 @@ def prepare_validation_data(val_dataset, device, distributed, rank):
         val_x_packed, val_y_packed = val_objects
     return val_x_packed, val_y_packed
 
-def save_model(cfg: DictConfig, model, rank):
-    """Save model or LoRA adapters."""
+def prepare_all_statements_data(val_dataset, device, distributed, rank, world_size: int = 1):
+    """
+    Prepare and distribute all validation statements and their paper IDs.
+    
+    Pads the dataset with dummy entries if the total number of statements
+    is not divisible by the world size.
+    
+    Args:
+        val_dataset: An instance of AllStatementsDataset.
+        device: The target device.
+        distributed: Boolean flag for distributed mode.
+        rank: The current process rank.
+        world_size: The total number of distributed processes.
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: 
+            - all_statements_packed (N_global, 2 * max_length)
+            - all_paper_ids (N_global)
+    """
+    objects_to_broadcast = [None, None]
+    
+    if rank == 0:
+        print("Preparing and distributing all validation statements for all-vs-all eval...")
+        
+        # Iterate through the dataset to get all items
+        data = [val_dataset[i] for i in range(len(val_dataset))]
+        
+        # Stack the tensors
+        all_input_ids = torch.stack([d['input_ids'] for d in data])
+        all_attention_masks = torch.stack([d['attention_mask'] for d in data])
+        all_paper_ids = torch.stack([d['paper_id'] for d in data])
+        
+        # Pack the statement tensors (input_ids + attention_mask)
+        all_statements_packed = torch.cat([all_input_ids, all_attention_masks], dim=1)
+
+        # --- NEW PADDING LOGIC ---
+        num_statements = all_statements_packed.shape[0]
+        if distributed and num_statements % world_size != 0:
+            remainder = num_statements % world_size
+            num_to_pad = world_size - remainder
+            
+            print(f"Padding validation set with {num_to_pad} dummy statements "
+                  f"to be divisible by world size {world_size}.")
+            
+            # Create padding
+            # We can just repeat the first statement
+            padding_statements = all_statements_packed[0:1].repeat(num_to_pad, 1)
+            # We use -1 as a dummy paper_id that will match nothing
+            padding_ids = torch.full((num_to_pad,), -1, 
+                                     dtype=all_paper_ids.dtype, 
+                                     device=all_paper_ids.device)
+
+            # Append padding
+            all_statements_packed = torch.cat([all_statements_packed, padding_statements], dim=0)
+            all_paper_ids = torch.cat([all_paper_ids, padding_ids], dim=0)
+        # --- END NEW PADDING LOGIC ---
+
+        if distributed:
+            objects_to_broadcast = [all_statements_packed, all_paper_ids]
+    
+    if distributed:
+        dist.broadcast_object_list(objects_to_broadcast, src=0)
+        all_statements_packed, all_paper_ids = objects_to_broadcast
+
+    # Handle non-distributed case
+    if not distributed and rank == 0:
+        pass # The tensors are already correct
+    elif not distributed:
+        return None, None
+
+    return all_statements_packed, all_paper_ids
+def save_model(cfg: DictConfig, model, rank, epoch: Optional[int] = None):
+    """Save model or LoRA adapters. If epoch is provided, save as checkpoint."""
     if rank != 0: return
     output_dir = Path(cfg.output.save_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
     model_to_save = model.module if hasattr(model, 'module') else model
+
+    # Determine naming based on whether this is a checkpoint or final save
+    suffix = f'_epoch{epoch}' if epoch is not None else ''
+
     if cfg.training.lora.enabled and cfg.output.save_lora:
-        adapter_path = output_dir / f'{cfg.model.name}_lora_adapters'
-        projection_path = output_dir / f'{cfg.model.name}_projection.pt'
+        adapter_path = output_dir / f'{cfg.model.name}_lora_adapters{suffix}'
+        projection_path = output_dir / f'{cfg.model.name}_projection{suffix}.pt'
         model_to_save.encoder_x.base_encoder.base_model.save_pretrained(str(adapter_path))
         torch.save(model_to_save.encoder_x.base_encoder.projection.state_dict(), projection_path)
         print(f"LoRA adapters saved to '{adapter_path}' and projection to '{projection_path}'")
     else:
-        model_path = output_dir / f'{cfg.model.name}_contrastive_model.pt'
+        model_path = output_dir / f'{cfg.model.name}_contrastive_model{suffix}.pt'
         torch.save(model_to_save.state_dict(), model_path)
         print(f"Model saved to {model_path}")
+
+def load_saved_weights(model, load_path: Path, cfg: DictConfig, rank: int = 0):
+    """Load saved LoRA adapters and projection weights. Assumes model already has LoRA initialized."""
+    if rank == 0:
+        print(f"Loading saved weights from: {load_path}")
+
+    model_to_load = model.module if hasattr(model, 'module') else model
+
+    if cfg.training.lora.enabled:
+        adapter_path = load_path / f'{cfg.model.name}_lora_adapters'
+        projection_path = load_path / f'{cfg.model.name}_projection.pt'
+
+        # Load LoRA adapter weights into already-initialized LoRA model
+        if rank == 0:
+            print(f"Loading LoRA adapter weights from: {adapter_path}")
+        model_to_load.encoder_x.base_encoder.base_model.load_adapter(str(adapter_path), adapter_name="default")
+
+        if rank == 0:
+            print(f"Loading projection from: {projection_path}")
+        model_to_load.encoder_x.base_encoder.projection.load_state_dict(
+            torch.load(projection_path, map_location='cpu', weights_only=False)
+        )
+        # Convert projection to half precision to match quantized model
+        model_to_load.encoder_x.base_encoder.projection = model_to_load.encoder_x.base_encoder.projection.half()
+    else:
+        model_path = load_path / f'{cfg.model.name}_contrastive_model.pt'
+        if rank == 0:
+            print(f"Loading full model from: {model_path}")
+        model_to_load.load_state_dict(torch.load(model_path, map_location='cpu', weights_only=False))
+
+def compute_all_embeddings(model, tokenizer, cfg: DictConfig, device, rank: int = 0, world_size: int = 1):
+    """Compute embeddings for entire dataset using the loaded model."""
+    import json
+    from tqdm import tqdm
+
+    model_to_use = model.module if hasattr(model, 'module') else model
+    model.eval()
+
+    # Load all statements from the dataset file
+    dataset_path = Path(cfg.dataset.base_path) / f"{cfg.dataset.size}.jsonl"
+    all_statements = []
+    all_metadata = []
+
+    with open(dataset_path, 'r') as f:
+        for paper_idx, line in enumerate(f):
+            paper = json.loads(line)
+            statements = paper.get('lemmas', []) + paper.get('theorems', [])
+            for stmt in statements:
+                all_statements.append(stmt)
+                all_metadata.append({
+                    'paper_idx': paper_idx,
+                    'paper_title': paper.get('title', 'Untitled'),
+                    'arxiv_id': paper.get('arxiv_id', 'Unknown'),
+                    'type': 'theorem' if stmt in paper.get('theorems', []) else 'lemma',
+                    'text': stmt
+                })
+
+    # Split statements among GPUs
+    num_statements = len(all_statements)
+    statements_per_gpu = (num_statements + world_size - 1) // world_size
+    start_idx = rank * statements_per_gpu
+    end_idx = min(start_idx + statements_per_gpu, num_statements)
+
+    my_statements = all_statements[start_idx:end_idx]
+    my_metadata = all_metadata[start_idx:end_idx]
+    my_indices = list(range(start_idx, end_idx))
+
+    if rank == 0:
+        print(f"\n{'='*80}")
+        print(f"Computing embeddings for {num_statements} statements on {world_size} GPU(s)")
+        print(f"{'='*80}")
+
+    all_embeddings = []
+    all_indices = []
+
+    with torch.no_grad():
+        iterator = tqdm(my_statements, desc=f"Computing embeddings (GPU {rank})") if rank == 0 else my_statements
+        for idx, stmt_text in enumerate(iterator):
+            # Tokenize the statement
+            tokens = tokenizer(stmt_text, padding='max_length', truncation=True,
+                             max_length=cfg.training.max_length, return_tensors='pt')
+
+            # Pack the tensor (same format as training: concat along dim=1)
+            input_ids = tokens['input_ids']  # Keep batch dim
+            attention_mask = tokens['attention_mask']  # Keep batch dim
+            packed = torch.cat([input_ids, attention_mask], dim=1).to(device)
+
+            # Compute embedding using encoder_x
+            embedding = model_to_use.encoder_x(packed)
+            all_embeddings.append(embedding.cpu())
+            all_indices.append(my_indices[idx])
+
+    # Stack local embeddings
+    local_embeddings = torch.cat(all_embeddings, dim=0)
+    local_indices = torch.tensor(all_indices)
+
+    # Gather from all GPUs if distributed
+    if world_size > 1 and dist.is_initialized():
+        # Gather to rank 0
+        gathered_embeddings = [torch.zeros_like(local_embeddings) for _ in range(world_size)] if rank == 0 else None
+        gathered_indices = [torch.zeros_like(local_indices) for _ in range(world_size)] if rank == 0 else None
+
+        dist.gather(local_embeddings, gathered_embeddings, dst=0)
+        dist.gather(local_indices, gathered_indices, dst=0)
+
+        if rank == 0:
+            # Concatenate gathered results
+            all_embeddings_tensor = torch.cat(gathered_embeddings, dim=0)
+            all_indices_tensor = torch.cat(gathered_indices, dim=0)
+
+            # Sort by indices to restore original order
+            sorted_idx = torch.argsort(all_indices_tensor)
+            all_embeddings_tensor = all_embeddings_tensor[sorted_idx]
+    else:
+        if rank == 0:
+            all_embeddings_tensor = local_embeddings
+
+    if rank == 0:
+        # Save embeddings
+        output_dir = Path(cfg.output.save_dir) / 'embeddings' / cfg.dataset.size
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        embeddings_path = output_dir / 'embeddings.pt'
+        metadata_path = output_dir / 'metadata.json'
+        info_path = output_dir / 'info.json'
+
+        print(f"Saving embeddings to: {embeddings_path}")
+        torch.save(all_embeddings_tensor, embeddings_path)
+
+        print(f"Saving metadata to: {metadata_path}")
+        with open(metadata_path, 'w') as f:
+            json.dump(all_metadata, f)
+
+        # Save info
+        info = {
+            'dataset_size': cfg.dataset.size,
+            'num_statements': len(all_embeddings_tensor),
+            'embedding_dim': all_embeddings_tensor.shape[1],
+            'model_dir': cfg.output.save_dir,
+            'dataset_path': str(dataset_path)
+        }
+        with open(info_path, 'w') as f:
+            json.dump(info, f, indent=2)
+
+        print(f"✓ Saved {len(all_embeddings_tensor)} embeddings ({all_embeddings_tensor.shape})")
+        print(f"{'='*80}\n")
 
 # ===================================================================
 # Training Function (Unchanged)
@@ -647,6 +946,90 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
     if distributed:
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
+    # Compute embeddings mode: load saved weights and compute embeddings for entire dataset
+    if cfg.training.get('compute_embeddings_only', False):
+        load_path = Path(cfg.training.get('load_model_path', cfg.output.save_dir))
+        load_saved_weights(model, load_path, cfg, rank)
+
+        compute_all_embeddings(model, tokenizer, cfg, device, rank, world_size)
+        return
+
+    use_amp = cfg.training.get('use_amp', True) and torch.cuda.is_available()
+    scaler = GradScaler() if use_amp else None
+    if rank == 0:
+        print(f"Mixed precision training {'ENABLED' if use_amp else 'DISABLED'}")
+    # Validate-only mode: load saved weights and run validation
+    if cfg.training.get('validate_only', False):
+        load_path = Path(cfg.training.get('load_model_path', cfg.output.save_dir))
+        load_saved_weights(model, load_path, cfg, rank)
+
+        # --- NEW VALIDATION LOGIC ---
+        if rank == 0:
+            print("\n[Validate Only Mode] Using AllStatementsDataset for all-vs-all metrics.")
+        
+        # 1. Use the new AllStatementsDataset
+        val_dataset_all = AllStatementsDataset(
+            str(dataset_path), tokenizer, 
+            max_length=cfg.training.max_length, 
+            split='eval',
+            train_ratio=cfg.dataset.get('train_ratio', 0.8),
+            seed=cfg.dataset.get('seed', 42)
+        )
+        
+        # 2. Use the new preparation function
+        val_world_size = world_size if distributed else 1
+        all_statements_packed, all_paper_ids = prepare_all_statements_data(
+            val_dataset_all, device, distributed, rank, val_world_size
+        )
+
+        model.eval()
+        
+        # 3. Calculate slicing
+        N_val_global = all_statements_packed.shape[0]
+        val_world_size = world_size if distributed else 1
+        
+        if N_val_global % val_world_size != 0:
+            raise ValueError(
+                f"Total validation statements ({N_val_global}) must be divisible "
+                f"by world size ({val_world_size})."
+            )
+            
+        C_val_local = N_val_global // val_world_size
+        start, end = rank * C_val_local, (rank + 1) * C_val_local
+
+        # 4. Create config
+        val_config = {
+            'GLOBAL_BATCH_SIZE': N_val_global,
+            'MICRO_BATCH_SIZE': cfg.training.micro_batch_size,
+            'STREAM_CHUNK_SIZE': cfg.training.stream_chunk_size,
+            'TAU': cfg.training.tau # (Not used by validate_metrics, but good to pass)
+        }
+
+        # 5. Call the new validate_metrics function
+        with torch.no_grad(), autocast(enabled=use_amp):
+            val_loss, val_metrics = validate_metrics(
+                model, 
+                all_statements_packed[start:end].to(device), 
+                all_paper_ids[start:end].to(device), 
+                val_config,
+                k_vals=cfg.training.get('k_vals', [1, 5, 10])
+            )
+        # --- END NEW LOGIC ---
+
+        if rank == 0:
+            print(f"\n{'='*80}")
+            print("Validation Results (Loaded Model, All-vs-All Metrics)")
+            print(f"{'='*80}")
+            # val_loss will be 'nan' from validate_metrics, which is correct
+            print(f"Val Loss: {val_loss:.4f}") 
+            for k, v in val_metrics.items():
+                if k == 'MRR':
+                    print(f"MRR: {v:.4f}")
+                else:
+                    print(f"{k}: {v*100:.2f}%") # k is already 'top-k'
+            print(f"{'='*80}")
+        return
+
     # Check if model has trainable parameters
     trainable_params = list(filter(lambda p: p.requires_grad, model.parameters()))
 
@@ -690,11 +1073,6 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
     else:
         scheduler = None
         validation_interval = 0
-
-    use_amp = cfg.training.get('use_amp', True) and torch.cuda.is_available()
-    scaler = GradScaler() if use_amp else None
-    if rank == 0:
-        print(f"Mixed precision training {'ENABLED' if use_amp else 'DISABLED'}")
 
     val_x_packed, val_y_packed = prepare_validation_data(val_dataset, device, distributed, rank)
 
@@ -832,6 +1210,9 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
             print(f"  Top@10 Acc: {topk_acc.get(10, 0)*100:.2f}%\n")
 
             log_metrics({'epoch': epoch + 1, 'avg_train_loss': avg_train_loss}, step=global_step)
+
+        # Save checkpoint after each epoch
+        save_model(cfg, model, rank, epoch=epoch+1)
 
         if distributed:
             dist.barrier()
