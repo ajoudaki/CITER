@@ -200,21 +200,22 @@ class StratifiedTheoremDataset(Dataset):
 # ===================================================================
 # New Dataset for All-vs-All Validation
 # ===================================================================
+# (In theorem_contrastive_training.py)
+
 class AllStatementsDataset(Dataset):
     """
     A dataset that loads *all* individual statements (lemmas/theorems)
-    from a given split and returns each statement with its paper_id.
-    
-    This is used for the all-vs-all validation metric computation.
+    from a given split ('train', 'eval', or 'all') and returns each
+    statement with its paper_id.
     """
     def __init__(self, jsonl_path: str, tokenizer, max_length: int = 512,
                  split: str = 'eval', train_ratio: float = 0.8, seed: int = 42):
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.split = split
+        self.split = split  # <-- This is already here and correct
         self.seed = seed
 
-        # Load papers' statements into a list of lists
+        # ... (loading all_papers_statements logic is unchanged) ...
         all_papers_statements = []
         with open(jsonl_path, 'r') as f:
             for line in f:
@@ -223,27 +224,36 @@ class AllStatementsDataset(Dataset):
                 if len(statements) >= 1: # Need at least one statement
                     all_papers_statements.append(statements)
 
-        # Split train/eval using the same reproducible shuffle
+        # --- MODIFIED BLOCK ---
+        # Split train/eval/all using a reproducible shuffle
         rng = np.random.default_rng(self.seed)
         indices = np.arange(len(all_papers_statements))
         rng.shuffle(indices)
         n_train = int(len(all_papers_statements) * train_ratio)
-        split_indices = indices[:n_train] if split == 'train' else indices[n_train:]
         
+        if split == 'train':
+            split_indices = indices[:n_train]
+        elif split == 'eval':
+            split_indices = indices[n_train:]
+        elif split == 'all':
+            split_indices = indices  # Use all indices
+        else:
+            raise ValueError(f"Unknown split '{split}'. Must be 'train', 'eval', or 'all'.")
+        # --- END MODIFIED BLOCK ---
+
         # self.papers contains only the papers for this split
         self.papers = [all_papers_statements[i] for i in split_indices]
         
-        # Flatten all statements into a single list and track their paper IDs
+        # ... (flattening logic is unchanged) ...
         self.all_statements = []
         self.all_paper_ids = []
-        
-        # The paper_id will be the index *within this split*
         for paper_id, statements in enumerate(self.papers):
             for stmt in statements:
                 self.all_statements.append(stmt)
                 self.all_paper_ids.append(paper_id)
 
         if not dist.is_initialized() or dist.get_rank() == 0:
+            # This print statement will now correctly use self.split.upper()
             print(f"[AllStatementsDataset] {self.split.upper()} set: "
                   f"{len(self.papers)} papers, "
                   f"{len(self.all_statements)} total statements.")
@@ -777,53 +787,53 @@ def load_saved_weights(model, load_path: Path, cfg: DictConfig, rank: int = 0):
         model_to_load.load_state_dict(torch.load(model_path, map_location='cpu', weights_only=False))
 
 # ADD this new one in its place
-def compute_all_embeddings(model, tokenizer, cfg: DictConfig, device, rank: int = 0, world_size: int = 1, distributed: bool = False):
+# (In theorem_contrastive_training.py)
+
+def compute_embeddings(model, tokenizer, cfg: DictConfig, device, rank: int = 0, world_size: int = 1, distributed: bool = False):
     """
-    Compute embeddings for all statements in the validation split
+    Compute embeddings for all statements in the specified split (from config)
     and save them to the /embeddings directory.
     """
     import json
     from tqdm import tqdm
 
-    model_to_use = model.module if hasattr(model, 'module') else model
     model.eval()
+
+    # --- NEW: Read data split from config ---
+    data_split = cfg.dataset.get('split', 'eval')
 
     if rank == 0:
         print(f"\n{'='*80}")
-        print(f"COMPUTE EMBEDDINGS MODE")
+        print(f"COMPUTE EMBEDDINGS MODE (Split: {data_split})")
         print(f"{'='*80}")
 
-    # --- 1. Load Data (Identical to validate_only) ---
+    # --- 1. Load Data (now uses data_split) ---
     dataset_path = Path(cfg.dataset.base_path) / f"{cfg.dataset.size}.jsonl"
     
-    # We use AllStatementsDataset to get all statements from the eval split
-    val_dataset_all = AllStatementsDataset(
+    dataset_all = AllStatementsDataset(
         str(dataset_path), tokenizer,
         max_length=cfg.training.max_length,
-        split='eval', # By default, we cache the eval split
+        split=data_split,  # <-- Use the specified split
         train_ratio=cfg.dataset.get('train_ratio', 0.8),
         seed=cfg.dataset.get('seed', 42)
     )
 
     # Prepare and distribute the data
     all_statements_packed, all_paper_ids = prepare_all_statements_data(
-        val_dataset_all, device, distributed, rank, world_size
+        dataset_all, device, distributed, rank, world_size
     )
 
-    # Calculate local chunk
     N_global = all_statements_packed.shape[0]
     C_local = N_global // world_size
     start, end = rank * C_local, (rank + 1) * C_local
 
-    # --- 2. Compute Embeddings (using the new helper) ---
+    # --- 2. Compute Embeddings ---
     use_amp = cfg.training.get('use_amp', True) and torch.cuda.is_available()
     compute_config = {
         'MICRO_BATCH_SIZE': cfg.training.micro_batch_size,
         'USE_AMP': use_amp 
     }
 
-    # Call the helper
-    # We only need Z_all and paper_ids_all for saving
     _, Z_all, paper_ids_all = compute_and_gather_embeddings(
         model,
         all_statements_packed[start:end].to(device),
@@ -832,22 +842,21 @@ def compute_all_embeddings(model, tokenizer, cfg: DictConfig, device, rank: int 
         rank
     )
 
-    # --- 3. Save to Disk (Rank 0 only) ---
+    # --- 3. Save to Disk (Rank 0 only, with new file names) ---
     if rank == 0:
-        # Remove any padding that was added
-        num_original_statements = len(val_dataset_all)
+        num_original_statements = len(dataset_all)
         if N_global > num_original_statements:
             print(f"Trimming {N_global - num_original_statements} padding statements before saving.")
             Z_all = Z_all[:num_original_statements]
             paper_ids_all = paper_ids_all[:num_original_statements]
         
-        # Define output paths
         output_dir = Path(cfg.output.save_dir) / 'embeddings' / cfg.dataset.size
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        embeddings_path = output_dir / 'eval_embeddings.pt'
-        paper_ids_path = output_dir / 'eval_paper_ids.pt'
-        info_path = output_dir / 'eval_info.json'
+        # --- Parameterized file paths ---
+        embeddings_path = output_dir / f'{data_split}_embeddings.pt'
+        paper_ids_path = output_dir / f'{data_split}_paper_ids.pt'
+        info_path = output_dir / f'{data_split}_info.json'
 
         print(f"Saving embeddings to: {embeddings_path}")
         torch.save(Z_all.cpu(), embeddings_path)
@@ -855,10 +864,9 @@ def compute_all_embeddings(model, tokenizer, cfg: DictConfig, device, rank: int 
         print(f"Saving paper IDs to: {paper_ids_path}")
         torch.save(paper_ids_all.cpu(), paper_ids_path)
 
-        # Save info
         info = {
             'dataset_size': cfg.dataset.size,
-            'split': 'eval',
+            'split': data_split,  # <-- Use the specified split
             'num_statements': len(Z_all),
             'embedding_dim': Z_all.shape[1],
             'model_dir': str(cfg.output.save_dir),
@@ -873,6 +881,10 @@ def compute_all_embeddings(model, tokenizer, cfg: DictConfig, device, rank: int 
 # ===================================================================
 # Training Function (Unchanged)
 # ===================================================================
+# (in theorem_contrastive_training.py)
+
+# (in theorem_contrastive_training.py)
+
 def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool = False):
     """Main training function with learning rate scheduler."""
     device = torch.device(f'cuda:{rank}') if distributed and torch.cuda.is_available() else \
@@ -904,7 +916,8 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
         if not dataset_path.exists():
             raise FileNotFoundError(f"Dataset not found: {dataset_path}")
 
-    DatasetClass = StratifiedTheoremDataset # Hard-coding to the improved class
+    # --- Datasets for TRAINING ---
+    DatasetClass = StratifiedTheoremDataset
     train_dataset = DatasetClass(str(dataset_path), tokenizer, max_length=cfg.training.max_length, split='train')
     val_dataset = DatasetClass(str(dataset_path), tokenizer, max_length=cfg.training.max_length, split='eval')
 
@@ -919,8 +932,7 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
 
     train_loader = DataLoader(
         train_dataset, batch_size=local_batch_size, sampler=train_sampler,
-        # No need for DataLoader shuffle; dataset is pre-shuffled per epoch
-        shuffle=False, 
+        shuffle=False,
         num_workers=cfg.runtime.num_workers, pin_memory=True, drop_last=True
     )
 
@@ -930,58 +942,78 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
     if distributed:
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
-    # Compute embeddings mode: load saved weights and compute embeddings for entire dataset
-    if cfg.training.get('compute_embeddings_only', False):
+    # --- Define the data split to use for compute modes ---
+    data_split = cfg.dataset.get('split_for_compute', 'eval')
+
+
+    # --- BLOCK 1: compute_embeddings ---
+    if cfg.training.get('compute_embeddings', False):
         load_path = Path(cfg.training.get('load_model_path', cfg.output.save_dir))
         load_saved_weights(model, load_path, cfg, rank)
 
-        # --- THIS IS THE ONLY LINE NEEDED HERE ---
-        compute_all_embeddings(model, tokenizer, cfg, device, rank, world_size, distributed)
+        compute_embeddings(model, tokenizer, cfg, device, rank, world_size, distributed)
         
-        return # Exit after computing embeddings
+        return
 
+    # --- AMP/SCALER DEFINITION ---
     use_amp = cfg.training.get('use_amp', True) and torch.cuda.is_available()
-    scaler = GradScaler() if use_amp else None
+    
+    # --- FIX for GradScaler FutureWarning ---
+    if use_amp:
+        scaler = torch.amp.GradScaler('cuda')
+    else:
+        scaler = None
+    # --- END FIX ---
+    
     if rank == 0:
         print(f"Mixed precision training {'ENABLED' if use_amp else 'DISABLED'}")
 
-    # --- NEW BLOCK: Validate from cached embeddings ---
-    if cfg.training.get('validate_from_embeddings', False):
+    
+    # --- BLOCK 2: compute_metrics_from_embeddings ---
+    if cfg.training.get('compute_metrics_from_embeddings', False):
         if rank == 0:
             print(f"\n{'='*80}")
-            print("VALIDATE FROM EMBEDDINGS MODE")
+            print(f"COMPUTE METRICS FROM EMBEDDINGS MODE (Split: {data_split})")
             print(f"{'='*80}")
         
         objects_to_broadcast = [None, None]
+        # --- FIX: Initialize Z_all and paper_ids_all to None ---
+        Z_all, paper_ids_all = None, None
+        # --- END FIX ---
         
         if rank == 0:
-            # Use load_model_path as the base for finding embeddings
             load_path = Path(cfg.training.load_model_path)
-            embeddings_path = load_path / 'embeddings' / cfg.dataset.size / 'eval_embeddings.pt'
-            paper_ids_path = load_path / 'embeddings' / cfg.dataset.size / 'eval_paper_ids.pt'
+            embeddings_path = load_path / 'embeddings' / cfg.dataset.size / f'{data_split}_embeddings.pt'
+            paper_ids_path = load_path / 'embeddings' / cfg.dataset.size / f'{data_split}_paper_ids.pt'
 
             if not embeddings_path.exists() or not paper_ids_path.exists():
                 raise FileNotFoundError(
-                    f"Could not find cached embeddings. Searched for: \n"
+                    f"Could not find cached embeddings for split '{data_split}'. Searched for: \n"
                     f"- {embeddings_path}\n"
                     f"- {paper_ids_path}\n"
-                    f"Please run `+training.compute_embeddings_only=true` first."
+                    f"Please run `+training.compute_embeddings=true dataset.split_for_compute={data_split}` first."
                 )
 
             print(f"Loading cached embeddings from: {embeddings_path}")
-            Z_all_cached = torch.load(embeddings_path, map_location='cpu')
+            # --- FIX for torch.load FutureWarning ---
+            Z_all_cached = torch.load(embeddings_path, map_location='cpu', weights_only=True)
             print(f"Loading cached paper IDs from: {paper_ids_path}")
-            paper_ids_all_cached = torch.load(paper_ids_path, map_location='cpu')
+            paper_ids_all_cached = torch.load(paper_ids_path, map_location='cpu', weights_only=True)
+            # --- END FIX ---
             
             if distributed:
                 objects_to_broadcast = [Z_all_cached, paper_ids_all_cached]
+            else:
+                # --- FIX: Assign tensors directly for single-GPU ---
+                Z_all = Z_all_cached
+                paper_ids_all = paper_ids_all_cached
+                # --- END FIX ---
         
         if distributed:
             dist.broadcast_object_list(objects_to_broadcast, src=0)
-            
-        Z_all, paper_ids_all = objects_to_broadcast
-
-        # --- Distribute tensors and get local slices ---
+            Z_all, paper_ids_all = objects_to_broadcast
+        
+        # This line will now work correctly
         Z_all = Z_all.to(device)
         paper_ids_all = paper_ids_all.to(device)
 
@@ -995,7 +1027,6 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
         local_Z = Z_all[start:end]
         local_paper_ids = paper_ids_all[start:end]
 
-        # --- Call the metrics helper directly ---
         val_config = {
             'GLOBAL_BATCH_SIZE': N_global,
             'MICRO_BATCH_SIZE': cfg.training.micro_batch_size,
@@ -1003,7 +1034,7 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
             'TAU': cfg.training.tau,
             'USE_AMP': use_amp
         }
-        k_vals = cfg.training.get('k_vals', [1, 5, 10, 50, 100])
+        k_vals = cfg.training.get('k_vals', [1, 5, 10])
 
         val_loss, val_metrics = compute_retrieval_metrics(
             local_Z, local_paper_ids, Z_all, paper_ids_all,
@@ -1012,7 +1043,7 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
         
         if rank == 0:
             print(f"\n{'='*80}")
-            print("Validation Results (from Cached Embeddings)")
+            print(f"Metrics Results (Split: {data_split}, from Cached Embeddings)")
             print(f"{'='*80}")
             print(f"Val Loss: {val_loss:.4f}") 
             for k, v in val_metrics.items():
@@ -1022,56 +1053,42 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
                     print(f"{k}: {v*100:.2f}%")
             print(f"{'='*80}")
         return
-    # --- END OF NEW BLOCK ---
     
-    # Validate-only mode: load saved weights and run validation
-    if cfg.training.get('validate_only', False):
+    # --- BLOCK 3: compute_metrics ---
+    if cfg.training.get('compute_metrics', False):
         load_path = Path(cfg.training.get('load_model_path', cfg.output.save_dir))
         load_saved_weights(model, load_path, cfg, rank)
 
-        # --- NEW VALIDATION LOGIC ---
         if rank == 0:
-            print("\n[Validate Only Mode] Using AllStatementsDataset for all-vs-all metrics.")
+            print(f"\n[COMPUTE METRICS MODE] (Split: {data_split})")
         
-        # 1. Use the new AllStatementsDataset
-        val_dataset_all = AllStatementsDataset(
+        dataset_all = AllStatementsDataset(
             str(dataset_path), tokenizer, 
             max_length=cfg.training.max_length, 
-            split='eval',
+            split=data_split,
             train_ratio=cfg.dataset.get('train_ratio', 0.8),
             seed=cfg.dataset.get('seed', 42)
         )
         
-        # 2. Use the new preparation function
         val_world_size = world_size if distributed else 1
         all_statements_packed, all_paper_ids = prepare_all_statements_data(
-            val_dataset_all, device, distributed, rank, val_world_size
+            dataset_all, device, distributed, rank, val_world_size
         )
 
         model.eval()
         
-        # 3. Calculate slicing
         N_val_global = all_statements_packed.shape[0]
-        val_world_size = world_size if distributed else 1
-        
-        if N_val_global % val_world_size != 0:
-            raise ValueError(
-                f"Total validation statements ({N_val_global}) must be divisible "
-                f"by world size ({val_world_size})."
-            )
-            
         C_val_local = N_val_global // val_world_size
         start, end = rank * C_val_local, (rank + 1) * C_val_local
 
-        # 4. Create config
         val_config = {
             'GLOBAL_BATCH_SIZE': N_val_global,
             'MICRO_BATCH_SIZE': cfg.training.micro_batch_size,
             'STREAM_CHUNK_SIZE': cfg.training.stream_chunk_size,
-            'TAU': cfg.training.tau # (Not used by validate_metrics, but good to pass)
+            'TAU': cfg.training.tau,
+            'USE_AMP': use_amp
         }
 
-        # 5. Call the new validate_metrics function
         with torch.no_grad(), autocast(enabled=use_amp):
             val_loss, val_metrics = validate_metrics(
                 model, 
@@ -1080,49 +1097,40 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
                 val_config,
                 k_vals=cfg.training.get('k_vals', [1, 5, 10])
             )
-        # --- END NEW LOGIC ---
 
         if rank == 0:
             print(f"\n{'='*80}")
-            print("Validation Results (Loaded Model, All-vs-All Metrics)")
+            print(f"Metrics Results (Split: {data_split}, Model-Computed)")
             print(f"{'='*80}")
-            # val_loss will be 'nan' from validate_metrics, which is correct
-            print(f"Val Loss: {val_loss:.4f}") 
+            print(f"Val Loss: {val_loss:.4f}")
             for k, v in val_metrics.items():
                 if k == 'MRR':
                     print(f"MRR: {v:.4f}")
                 else:
-                    print(f"{k}: {v*100:.2f}%") # k is already 'top-k'
+                    print(f"{k}: {v*100:.2f}%")
             print(f"{'='*80}")
         return
 
-    # Check if model has trainable parameters
+    # --- Standard Training Setup ---
     trainable_params = list(filter(lambda p: p.requires_grad, model.parameters()))
 
-    # Only create optimizer if we have trainable parameters
     if len(trainable_params) > 0:
         use_quantized_optim = cfg.training.get("quantization") and cfg.training.quantization.get("enabled")
-
         if use_quantized_optim:
-            if rank == 0:
-                print("Using 8-bit AdamW optimizer.")
+            if rank == 0: print("Using 8-bit AdamW optimizer.")
             optimizer = bnb_optim.AdamW8bit(
-                trainable_params,
-                lr=cfg.training.lr,
+                trainable_params, lr=cfg.training.lr,
                 weight_decay=cfg.training.get('weight_decay', 0.01)
             )
         else:
-            if rank == 0:
-                print("Using standard AdamW optimizer.")
+            if rank == 0: print("Using standard AdamW optimizer.")
             optimizer = torch.optim.AdamW(
-                trainable_params,
-                lr=cfg.training.lr,
+                trainable_params, lr=cfg.training.lr,
                 weight_decay=cfg.training.get('weight_decay', 0.01)
             )
     else:
-        optimizer = None  # No optimizer needed for baseline models
+        optimizer = None
 
-    # Only setup scheduler if we have an optimizer
     if optimizer is not None:
         num_training_steps = len(train_loader) * cfg.training.num_epochs
         warmup_steps = cfg.training.get('warmup_steps', 2000)
@@ -1142,16 +1150,14 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
 
     val_x_packed, val_y_packed = prepare_validation_data(val_dataset, device, distributed, rank)
 
-    # For baseline models with no parameters, run validation only
     if len(trainable_params) == 0:
         if rank == 0:
-            print("No trainable parameters - running validation only.")
+            print("No trainable parameters - running in-training-style validation only.")
 
         model.eval()
         N_val = val_x_packed.shape[0]
         val_world_size = world_size if distributed else 1
         C_val = N_val // val_world_size
-
         start, end = rank * C_val, (rank + 1) * C_val
         local_val_x_packed = val_x_packed[start:end].to(device)
         local_val_y_packed = val_y_packed[start:end].to(device)
@@ -1171,16 +1177,13 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
             print(f"\nValidation Results:")
             print(f"Val Loss: {val_loss:.4f}")
             for k, v in val_metrics.items():
-                if k == 'MRR':
-                    print(f"MRR: {v:.4f}")
-                else:
-                    print(f"top-{k}: {v:.4f}")
-        return  # Exit early for baseline models
+                if k == 'MRR': print(f"MRR: {v:.4f}")
+                else: print(f"{k}: {v*100:.2f}%")
+        return
 
     global_step = 0
 
-    # Helper function for validation
-    def run_validation(step_num, epoch_num=None): # Validation helper (unchanged)
+    def run_validation(step_num, epoch_num=None):
         model.eval()
         N_val, val_world_size = val_x_packed.shape[0], (world_size if distributed else 1)
         C_val = N_val // val_world_size
@@ -1189,24 +1192,25 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
             'GLOBAL_BATCH_SIZE': C_val * val_world_size, 
             'MICRO_BATCH_SIZE': cfg.training.micro_batch_size,
             'STREAM_CHUNK_SIZE': cfg.training.stream_chunk_size, 
-            'TAU': cfg.training.tau
+            'TAU': cfg.training.tau,
+            'USE_AMP': use_amp
         }
         
-        # FIX: Add the `autocast` context manager here
         with torch.no_grad(), autocast(enabled=use_amp):
-            val_loss, topk_acc = distributed_validate_step(model, val_x_packed[start:end].to(device),
-                                                           val_y_packed[start:end].to(device), val_config,
-                                                           k_vals=cfg.training.get('k_vals', [1, 5, 10]))
+            val_loss, topk_acc = distributed_validate_step(
+                model, val_x_packed[start:end].to(device),
+                val_y_packed[start:end].to(device), val_config,
+                k_vals=cfg.training.get('k_vals', [1, 5, 10])
+            )
         
         if rank == 0:
             prefix = f"\n[Epoch {epoch_num+1}] Validation" if epoch_num is not None else "\nValidation"
             print(f"{prefix} at step {step_num}:")
             print(f"  Val Loss:    {val_loss:.4f}\n  MRR:         {topk_acc.get('MRR', 0):.4f}")
-            # Print all configured k values
             k_vals_to_report = cfg.training.get('k_vals', [1, 5, 10])
             acc_str = "  ".join([f"Top@{k}: {topk_acc.get(k, 0)*100:.2f}%" for k in k_vals_to_report if k in topk_acc])
             print(f"  {acc_str}\n")
-            # Log all k values to wandb
+            
             metrics = {'loss': val_loss, 'mrr': topk_acc.get('MRR', 0)}
             for k in k_vals_to_report:
                 if k in topk_acc:
@@ -1215,8 +1219,8 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
         model.train()
         return val_loss, topk_acc
 
+    # --- MAIN TRAINING LOOP ---
     for epoch in range(cfg.training.num_epochs):
-        # The dataset's epoch must be synced with the training loop's epoch
         train_dataset.reset_epoch()
         
         model.train()
@@ -1256,13 +1260,11 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
                     'batch_size': cfg.training.global_batch_size,
                 }, step=global_step, prefix='train')
 
-            # Run validation at specified intervals during training
             if validation_interval > 0 and global_step % validation_interval == 0:
                 val_loss, topk_acc = run_validation(global_step, epoch_num=epoch)
                 if distributed:
                     dist.barrier()
 
-        # End of epoch validation (always run)
         avg_train_loss = total_loss / num_batches if num_batches > 0 else 0
         val_loss, topk_acc = run_validation(global_step, epoch_num=epoch)
 
@@ -1271,13 +1273,14 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
             print(f"  Train Loss: {avg_train_loss:.4f}")
             print(f"  Val Loss:   {val_loss:.4f}")
             print(f"  MRR:        {topk_acc.get('MRR', 0):.4f}")
-            print(f"  Top@1 Acc:  {topk_acc.get(1, 0)*100:.2f}%")
-            print(f"  Top@5 Acc:  {topk_acc.get(5, 0)*100:.2f}%")
-            print(f"  Top@10 Acc: {topk_acc.get(10, 0)*100:.2f}%\n")
+            k_vals_to_report = cfg.training.get('k_vals', [1, 5, 10])
+            for k in k_vals_to_report:
+                if k in topk_acc:
+                    print(f"  Top@{k} Acc:  {topk_acc.get(k, 0)*100:.2f}%")
+            print("")
 
             log_metrics({'epoch': epoch + 1, 'avg_train_loss': avg_train_loss}, step=global_step)
 
-        # Save checkpoint after each epoch
         save_model(cfg, model, rank, epoch=epoch+1)
 
         if distributed:
