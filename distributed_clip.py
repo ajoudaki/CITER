@@ -7,6 +7,7 @@ from contextlib import nullcontext
 from typing import Dict, Tuple, Optional
 from torch.cuda.amp import autocast
 from tqdm import tqdm
+import numpy as np
 
 # ===================================================================
 # Distributed Utilities
@@ -19,15 +20,14 @@ def all_gather_embeddings(local_embeddings: torch.Tensor) -> torch.Tensor:
     """
     if not dist.is_initialized() or dist.get_world_size() == 1:
         return local_embeddings.detach()
-        
+
     world_size = dist.get_world_size()
     local_embeddings = local_embeddings.contiguous()
-    gathered = [torch.zeros_like(local_embeddings) for _ in range(world_size)]
-    
-    dist.all_gather(gathered, local_embeddings)
-    
-    return torch.cat(gathered, dim=0).detach()
+    gathered = [torch.empty_like(local_embeddings) for _ in range(world_size)]
 
+    dist.all_gather(gathered, local_embeddings)
+
+    return torch.cat(gathered, dim=0).detach()
 
 def compute_and_gather_embeddings(
     model: torch.nn.Module,
@@ -356,26 +356,31 @@ def compute_retrieval_metrics(
     k_vals: list
 ) -> Tuple[float, Dict[str, float]]:
     """
-    Internal helper that computes retrieval metrics from pre-computed tensors.
-    
-    This is the core logic of Phase C (Metric Calculation).
+    Computes standard retrieval metrics (MRR, MAP, P@K, R@K) 
+    from pre-computed tensors for an all-vs-all retrieval task.
     """
     # --- Config and Setup ---
     C_local = local_Z.shape[0]
     N_global = Z_all.shape[0]
-    B_micro = config['MICRO_BATCH_SIZE']
+    B_micro = config['MICRO_BATCH_SIZE'] # Definition fixed
     device = local_Z.device
     P = dist.get_world_size() if dist.is_initialized() else 1
     
-    max_k = min(max(k_vals), N_global - 1)
     use_amp = config.get('USE_AMP', False)
     amp_context = autocast(enabled=use_amp)
 
+    # --- Initialize metric accumulators ---
+    total_reciprocal_rank_sum = 0.0
+    total_AP_sum = 0.0
+    total_precision_sums = {k: 0.0 for k in k_vals}
+    total_recall_sums = {k: 0.0 for k in k_vals}
+    total_queries = 0 # Counter for all queries processed
+
+    # For debugging |Rel(q)| stats
+    all_local_positive_counts = []
+
     # --- Streamed Metric Calculation ---
     num_local_chunks = math.ceil(C_local / B_micro)
-    all_reciprocal_ranks = []
-    all_correct_counts = {k: 0 for k in k_vals}
-    
     metric_pbar = tqdm(range(num_local_chunks), desc="Validation Metrics", disable=(rank != 0))
     Z_all_T = Z_all.T.contiguous() # [D, N_global]
 
@@ -384,14 +389,18 @@ def compute_retrieval_metrics(
         end = min((i_chunk + 1) * B_micro, C_local)
         if start >= end: continue
 
-        local_Z_chunk = local_Z[start:end]         # [B_chunk, D]
+        local_Z_chunk = local_Z[start:end]           # [B_chunk, D]
         local_ids_chunk = local_paper_ids[start:end] # [B_chunk]
+        B_chunk = local_Z_chunk.shape[0]
         
         with amp_context:
-            S_chunk = torch.matmul(local_Z_chunk, Z_all_T) # [B_chunk, N_global]
+            # [B_chunk, N_global]
+            S_chunk = torch.matmul(local_Z_chunk, Z_all_T) 
 
+        # --- Ground Truth Calculation ---
         is_positive = (local_ids_chunk.unsqueeze(1) == paper_ids_all.unsqueeze(0))
 
+        # --- Self-Masking (Critical!) ---
         global_indices_for_chunk = torch.arange(
             rank * C_local + start, 
             rank * C_local + end, 
@@ -405,35 +414,116 @@ def compute_retrieval_metrics(
                 global_indices_for_chunk
             ] = True
             
-            is_positive[self_mask] = False 
+            is_positive[self_mask] = False  
             S_chunk[self_mask] = -torch.inf
 
+        # |Rel(q)|
+        total_positives_per_query = is_positive.sum(dim=1).float()
+        valid_queries_mask = total_positives_per_query > 0
+
+        # Store for debugging
+        all_local_positive_counts.extend(total_positives_per_query.cpu().tolist())
+
+        # ================== FIX IS HERE ==================
+        # Sorting must happen *before* any metric calculation
         _, sorted_indices = S_chunk.sort(dim=1, descending=True)
         sorted_positives = torch.gather(is_positive, 1, sorted_indices)
+        sorted_positives_float = sorted_positives.float()
+        # ===============================================
 
-        for k in k_vals:
-            if k <= max_k:
-                all_correct_counts[k] += sorted_positives[:, :k].any(dim=1).sum().item()
-
-        first_positive_idx = torch.argmax(sorted_positives.int(), dim=1)
-        sorted_negatives = ~sorted_positives
-        cumulative_negatives = torch.cumsum(sorted_negatives.int(), dim=1)
-        ranks = 1 + torch.gather(cumulative_negatives, 1, first_positive_idx.unsqueeze(1)).squeeze(1)
-        has_positive = sorted_positives.any(dim=1)
-        
+        # --- 1. Mean Reciprocal Rank (MRR) ---
+        has_positive = sorted_positives.any(dim=1) # Now OK
+        first_positive_rank = torch.argmax(sorted_positives.int(), dim=1) + 1 # 1-indexed, Now OK
         reciprocal_ranks = torch.where(
             has_positive,
-            1.0 / ranks.float(),
-            0.0
+            1.0 / first_positive_rank.float(),
+            0.0 
         )
-        all_reciprocal_ranks.extend(reciprocal_ranks.cpu().tolist())
+        total_reciprocal_rank_sum += reciprocal_ranks.sum().item()
+
+        # --- 2. Precision@K and 3. Recall@K ---
+        cumulative_hits = torch.cumsum(sorted_positives_float, dim=1) # Now OK
+        
+        for k in k_vals:
+            if k > N_global: continue
+                
+            num_relevant_at_k = cumulative_hits[:, k-1]
+            
+            precision_at_k_query = num_relevant_at_k / k
+            total_precision_sums[k] += precision_at_k_query.sum().item()
+            
+            safe_total_positives = torch.where(valid_queries_mask, total_positives_per_query, 1.0)
+            recall_at_k_query = num_relevant_at_k / safe_total_positives
+            recall_at_k_query[~valid_queries_mask] = 0.0 
+            total_recall_sums[k] += recall_at_k_query.sum().item()
+            
+        # --- 4. Mean Average Precision (MAP) ---
+        ranks_tensor = torch.arange(1, N_global + 1, device=device, dtype=torch.float32).unsqueeze(0)
+        P_at_all_k = cumulative_hits / ranks_tensor # Now OK
+        sum_term = (P_at_all_k * sorted_positives_float).sum(dim=1) # Now OK
+        
+        safe_total_positives_map = torch.where(valid_queries_mask, total_positives_per_query, 1.0)
+        AP_query = sum_term / safe_total_positives_map
+        AP_query[~valid_queries_mask] = 0.0
+        
+        total_AP_sum += AP_query.sum().item()
+        total_queries += B_chunk
+
+    # ================== START DEBUGGING BLOCK ==================
+    if rank == 0:
+        # --- Debug Check 1: |Rel(q)| stats ---
+        if len(all_local_positive_counts) > 0:
+            counts_np = np.array(all_local_positive_counts)
+            print(f"\n{'='*60}")
+            print(f"DEBUG: Statistics for |Rel(q)| (True Positives per Query)")
+            # Note: This is only for rank 0, not global. But for a non-distributed
+            # run, this is the full dataset.
+            print(f"Processed {len(counts_np)} queries on rank 0 (global total {N_global}).")
+            print(f"  Mean:   {np.mean(counts_np):.2f}")
+            print(f"  Median: {np.median(counts_np):.2f}")
+            print(f"  StdDev: {np.std(counts_np):.2f}")
+            print(f"  Min:    {np.min(counts_np):.0f}")
+            print(f"  Max:    {np.max(counts_np):.0f}")
+            print(f"  Percentiles (50, 75, 90, 95, 99):")
+            print(f"    {np.percentile(counts_np, [50, 75, 90, 95, 99])}")
+            print(f"{'='*60}\n")
+        
+        # --- Debug Check 2: Unique Paper IDs ---
+        print(f"\n{'='*60}")
+        print(f"DEBUG: Paper ID Sanity Check (Global)")
+        
+        # We need the *global* list of paper IDs
+        paper_ids_all_cpu = paper_ids_all.cpu()
+        # Filter out any padding IDs (which are -1)
+        valid_paper_ids = paper_ids_all_cpu[paper_ids_all_cpu >= 0]
+        
+        if valid_paper_ids.numel() > 0:
+            num_unique_papers = torch.unique(valid_paper_ids).numel()
+            max_paper_id = valid_paper_ids.max().item()
+            # Since paper IDs are 0-indexed, num_papers = max_id + 1
+            num_papers_from_max_id = max_paper_id + 1
+            
+            print(f"  Total statements (excl. padding): {valid_paper_ids.numel()}")
+            print(f"  Number of unique paper IDs found: {num_unique_papers}")
+            print(f"  Max paper ID found:               {max_paper_id}")
+            print(f"  Number of papers (from max ID): {num_papers_from_max_id}")
+            
+            if num_unique_papers == num_papers_from_max_id:
+                print("  ✓ SUCCESS: Unique paper count matches max ID count.")
+            else:
+                print(f"  ✗ FAILURE: Unique count ({num_unique_papers}) != max ID count ({num_papers_from_max_id}).")
+        else:
+            print("  No valid paper IDs (>= 0) found to analyze.")
+        print(f"{'='*60}\n")
+    # =================== END DEBUGGING BLOCK ===================
 
     # --- Sync Point 2: Aggregate metrics from all GPUs ---
-    correct_counts_list = [all_correct_counts[k] for k in k_vals]
-    local_mrr_sum = sum(all_reciprocal_ranks)
+    metrics_to_sum = [total_reciprocal_rank_sum, total_AP_sum, total_queries]
+    metrics_to_sum.extend([total_precision_sums[k] for k in k_vals])
+    metrics_to_sum.extend([total_recall_sums[k] for k in k_vals])
     
     metrics_tensor = torch.tensor(
-        correct_counts_list + [local_mrr_sum], 
+        metrics_to_sum, 
         device=device, 
         dtype=torch.float32
     )
@@ -442,15 +532,39 @@ def compute_retrieval_metrics(
         dist.all_reduce(metrics_tensor, op=dist.ReduceOp.SUM)
 
     total_metrics = metrics_tensor.cpu().numpy()
-    total_correct = total_metrics[:len(k_vals)]
-    total_mrr_sum = total_metrics[-1]
+    
+    # Unpack the aggregated metrics
+    offset = 0
+    global_reciprocal_rank_sum = total_metrics[offset]; offset += 1
+    global_AP_sum = total_metrics[offset]; offset += 1
+    global_total_queries = total_metrics[offset]; offset += 1
+    
+    global_precision_sums = {}
+    global_recall_sums = {}
+    
+    for k in k_vals:
+        global_precision_sums[k] = total_metrics[offset]; offset += 1
+    for k in k_vals:
+        global_recall_sums[k] = total_metrics[offset]; offset += 1
 
-    topk_acc = {f"Top@{k}": count / N_global for k, count in zip(k_vals, total_correct)}
-    topk_acc['MRR'] = total_mrr_sum / N_global
+    # --- Calculate final averaged metrics ---
+    metrics_dict = {}
+    
+    if global_total_queries > 0:
+        metrics_dict['MRR'] = global_reciprocal_rank_sum / global_total_queries
+        metrics_dict['MAP'] = global_AP_sum / global_total_queries
+        for k in k_vals:
+            metrics_dict[f'Precision@{k}'] = global_precision_sums[k] / global_total_queries
+            metrics_dict[f'Recall@{k}'] = global_recall_sums[k] / global_total_queries
+    else:
+        metrics_dict['MRR'] = 0.0
+        metrics_dict['MAP'] = 0.0
+        for k in k_vals:
+            metrics_dict[f'Precision@{k}'] = 0.0
+            metrics_dict[f'Recall@{k}'] = 0.0
 
     # Return (loss, metrics)
-    return float('nan'), topk_acc
-
+    return float('nan'), metrics_dict
 
 def validate_metrics(
     model: torch.nn.Module,

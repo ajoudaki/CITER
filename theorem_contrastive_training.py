@@ -36,7 +36,7 @@ from distributed_clip import (
     distributed_validate_step,
     validate_metrics,
     compute_and_gather_embeddings,
-    compute_retrieval_metrics  # <-- ADD THIS IMPORT
+    compute_retrieval_metrics as compute_retrieval_metrics # Use alias to fix name mismatch
 )
 from numba import njit # Import the Numba JIT compiler
 import torch.utils.checkpoint as checkpoint # <-- ADD THIS IMPORT
@@ -49,13 +49,7 @@ import torch.utils.checkpoint as checkpoint # <-- ADD THIS IMPORT
 def _generate_shuffled_pairs_numba(paper_lengths: np.ndarray, seed: int) -> np.ndarray:
     """
     A Numba-JIT compiled function to generate and shuffle theorem pairs efficiently.
-
-    Args:
-        paper_lengths: A 1D NumPy array where each element is the number of statements in a paper.
-        seed: An integer for the random number generator.
-
-    Returns:
-        A 3D NumPy array of shape (total_pairs, 2, 2) containing the shuffled pairs.
+    ... (Numba function content is unchanged) ...
     """
     # Numba requires its own random seed initialization
     np.random.seed(seed)
@@ -113,8 +107,7 @@ def _generate_shuffled_pairs_numba(paper_lengths: np.ndarray, seed: int) -> np.n
 class StratifiedTheoremDataset(Dataset):
     """
     Stratified dataset that ensures each theorem/lemma appears ~once per epoch.
-    This implementation pre-computes an array of all pairs for the epoch using a
-    fast, Numba-compiled helper function.
+    ... (This class is unchanged) ...
     """
     def __init__(self, jsonl_path: str, tokenizer, max_length: int = 512,
                  split: str = 'train', train_ratio: float = 0.8, seed: int = 42):
@@ -207,67 +200,86 @@ class AllStatementsDataset(Dataset):
     A dataset that loads *all* individual statements (lemmas/theorems)
     from a given split ('train', 'eval', or 'all') and returns each
     statement with its paper_id.
+    
+    --- MODIFIED ---
+    Now stores full metadata for retrieval.
     """
     def __init__(self, jsonl_path: str, tokenizer, max_length: int = 512,
                  split: str = 'eval', train_ratio: float = 0.8, seed: int = 42):
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.split = split  # <-- This is already here and correct
+        self.split = split
         self.seed = seed
 
-        # ... (loading all_papers_statements logic is unchanged) ...
-        all_papers_statements = []
+        # --- MODIFIED: Load full paper objects, not just statements ---
+        all_papers_data = [] 
         with open(jsonl_path, 'r') as f:
             for line in f:
                 paper = json.loads(line)
                 statements = paper.get('lemmas', []) + paper.get('theorems', [])
-                if len(statements) >= 1: # Need at least one statement
-                    all_papers_statements.append(statements)
+                if len(statements) >= 1:
+                    all_papers_data.append(paper) # Store the whole paper dict
+        # --- END MODIFIED ---
 
-        # --- MODIFIED BLOCK ---
         # Split train/eval/all using a reproducible shuffle
         rng = np.random.default_rng(self.seed)
-        indices = np.arange(len(all_papers_statements))
+        indices = np.arange(len(all_papers_data)) # Use new list
         rng.shuffle(indices)
-        n_train = int(len(all_papers_statements) * train_ratio)
+        n_train = int(len(all_papers_data) * train_ratio)
         
         if split == 'train':
             split_indices = indices[:n_train]
         elif split == 'eval':
             split_indices = indices[n_train:]
         elif split == 'all':
-            split_indices = indices  # Use all indices
+            split_indices = indices
         else:
             raise ValueError(f"Unknown split '{split}'. Must be 'train', 'eval', or 'all'.")
-        # --- END MODIFIED BLOCK ---
 
-        # self.papers contains only the papers for this split
-        self.papers = [all_papers_statements[i] for i in split_indices]
+        # self.papers is now a list of paper *objects* (dicts)
+        self.papers = [all_papers_data[i] for i in split_indices]
         
-        # ... (flattening logic is unchanged) ...
-        self.all_statements = []
-        self.all_paper_ids = []
-        for paper_id, statements in enumerate(self.papers):
-            for stmt in statements:
-                self.all_statements.append(stmt)
-                self.all_paper_ids.append(paper_id)
+        # --- MODIFIED: Flatten statements and store all metadata ---
+        self.metadata = [] 
+        
+        for paper_id, paper in enumerate(self.papers):
+            paper_title = paper.get('title', 'Untitled')
+            arxiv_id = paper.get('arxiv_id', 'Unknown')
+            
+            for stmt in paper.get('lemmas', []):
+                self.metadata.append({
+                    'text': stmt,
+                    'paper_id': paper_id, # Local split paper_id
+                    'paper_title': paper_title,
+                    'arxiv_id': arxiv_id,
+                    'type': 'lemma'
+                })
+            for stmt in paper.get('theorems', []):
+                self.metadata.append({
+                    'text': stmt,
+                    'paper_id': paper_id,
+                    'paper_title': paper_title,
+                    'arxiv_id': arxiv_id,
+                    'type': 'theorem'
+                })
+        # --- END MODIFIED ---
 
         if not dist.is_initialized() or dist.get_rank() == 0:
-            # This print statement will now correctly use self.split.upper()
             print(f"[AllStatementsDataset] {self.split.upper()} set: "
                   f"{len(self.papers)} papers, "
-                  f"{len(self.all_statements)} total statements.")
+                  f"{len(self.metadata)} total statements.") # Use self.metadata
 
     def __len__(self):
         """Return the total number of individual statements."""
-        return len(self.all_statements)
+        return len(self.metadata) # Use self.metadata
 
     def __getitem__(self, idx: int):
         """
         Retrieves a single statement and its paper_id.
         """
-        text = self.all_statements[idx]
-        paper_id = self.all_paper_ids[idx]
+        item_data = self.metadata[idx] # Get metadata dict
+        text = item_data['text']
+        paper_id = item_data['paper_id']
 
         # Tokenize the statement text
         tokens = self.tokenizer(text, padding='max_length', truncation=True,
@@ -286,12 +298,10 @@ class CLSPoolingEncoder(nn.Module):
     """Encoder that uses the [CLS] token embedding with optional gradient checkpointing."""
     def __init__(self, model_name: str, hidden_dim: int, output_dim: int, use_gradient_checkpointing: bool = False, quantization_config=None):
         super().__init__()
-        # Pass quantization_config if it exists, and set device_map only when quantizing
         model_kwargs = {
             "quantization_config": quantization_config,
             "device_map": "auto" if quantization_config else None,
         }
-        # Filter out None values to keep the from_pretrained call clean
         model_kwargs = {k: v for k, v in model_kwargs.items() if v is not None}
         self.base_model = AutoModel.from_pretrained(model_name, **model_kwargs)
         self.projection = nn.Linear(hidden_dim, output_dim)
@@ -307,19 +317,21 @@ class CLSPoolingEncoder(nn.Module):
             )
         else:
             outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
+        
         cls_embedding = outputs.last_hidden_state[:, 0, :]
-        return F.normalize(self.projection(cls_embedding), p=2, dim=-1)
+        
+        # --- ADDED .half() for fp16 consistency ---
+        projected = self.projection(cls_embedding.half())
+        normalized = F.normalize(projected, p=2, dim=-1)
+        return normalized.half() # Return fp16
 
 class LastTokenEncoder(nn.Module):
     """Encoder that uses the last non-padding token's hidden state with optional gradient checkpointing."""
     def __init__(self, model_name: str, hidden_dim: int, output_dim: int, use_gradient_checkpointing: bool = False, quantization_config=None):
         super().__init__()
-        # Pass quantization_config if it exists, and set device_map only when quantizing
         model_kwargs = {
             "quantization_config": quantization_config,
-            # "device_map": "auto", #if quantization_config else None,
         }
-        # Filter out None values to keep the from_pretrained call clean
         model_kwargs = {k: v for k, v in model_kwargs.items() if v is not None}
         self.base_model = AutoModel.from_pretrained(model_name, **model_kwargs)
         self.projection = nn.Linear(hidden_dim, output_dim)
@@ -335,71 +347,54 @@ class LastTokenEncoder(nn.Module):
             )
         else:
             outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
+        
         last_hidden_state = outputs.last_hidden_state
         sequence_lengths = attention_mask.sum(dim=1) - 1
         batch_indices = torch.arange(len(sequence_lengths), device=sequence_lengths.device)
         last_token_embedding = last_hidden_state[batch_indices, sequence_lengths, :]
+        
+        # This code already contains the fp16 fix
         projected = self.projection(last_token_embedding.half())
         normalized = F.normalize(projected, p=2, dim=-1)
         return normalized.half()
 
+
 class JaccardEncoder(nn.Module):
-    """Bag-of-tokens encoder using Jaccard similarity (no training needed)."""
+    """... (Baseline class unchanged) ..."""
     def __init__(self, model_name: str = "bert-base-uncased", output_dim: int = 768, **kwargs):
         super().__init__()
-        # Just use a fixed vocab size instead of loading tokenizer
-        self.vocab_size = min(30000, 50000)  # Cap at 30k for memory
+        self.vocab_size = min(30000, 50000)
         self.output_dim = output_dim
-
     def forward(self, input_ids, attention_mask):
         batch_size, device = input_ids.shape[0], input_ids.device
-
-        # Create binary bag-of-words vectors
         bow_vectors = torch.zeros(batch_size, self.vocab_size, device=device)
-
         for i in range(batch_size):
-            # Get valid tokens (non-padding)
             valid_tokens = input_ids[i][attention_mask[i] == 1]
-            # Filter special tokens (typically < 1000) and cap at vocab_size
             valid_tokens = valid_tokens[(valid_tokens > 100) & (valid_tokens < self.vocab_size)]
             if len(valid_tokens) > 0:
-                # Set 1 for present tokens (bag-of-words)
                 bow_vectors[i].scatter_(0, valid_tokens, 1.0)
-
-        # L2 normalize for cosine similarity (equivalent to Jaccard for binary vectors)
         bow_vectors = F.normalize(bow_vectors, p=2, dim=-1)
-
-        # Project to output dimension if needed
         if self.vocab_size != self.output_dim:
-            # Simple random projection for dimension matching
             if not hasattr(self, 'projection'):
                 self.projection = nn.Linear(self.vocab_size, self.output_dim, bias=False).to(device)
-                # Initialize with random orthogonal matrix
                 nn.init.orthogonal_(self.projection.weight)
                 self.projection.requires_grad_(False)
             bow_vectors = self.projection(bow_vectors)
             bow_vectors = F.normalize(bow_vectors, p=2, dim=-1)
-
         return bow_vectors
 
 
 class MinHashEncoder(nn.Module):
-    """MinHash encoder using Hamming distance (no training needed)."""
+    """... (Baseline class unchanged) ..."""
     def __init__(self, model_name: str = "bert-base-uncased", output_dim: int = 768, **kwargs):
         super().__init__()
         self.vocab_size = min(30000, 50000)
-        self.num_hashes = output_dim  # Use output_dim as number of hash functions
-
-        # Find prime for hash functions
+        self.num_hashes = output_dim
         self.prime = self._find_next_prime(self.vocab_size)
-
-        # Initialize hash parameters (will be set on first forward pass to get device)
         self.a = None
         self.b = None
         self.hashed_vocab = None
-
     def _find_next_prime(self, n: int) -> int:
-        """Find next prime >= n."""
         def is_prime(num):
             if num <= 1: return False
             for i in range(2, int(num**0.5) + 1):
@@ -409,87 +404,55 @@ class MinHashEncoder(nn.Module):
         while not is_prime(candidate):
             candidate += 1
         return candidate
-
     def _init_hash_functions(self, device):
-        """Initialize hash functions on the correct device."""
         if self.a is None:
             rand_max = self.prime - 1
             self.a = torch.randint(1, rand_max, (self.num_hashes, 1), device=device, dtype=torch.int64)
             self.b = torch.randint(0, rand_max, (self.num_hashes, 1), device=device, dtype=torch.int64)
-
-            # Pre-compute hash values for all vocabulary tokens
             vocab_indices = torch.arange(self.vocab_size, device=device, dtype=torch.int64).unsqueeze(0)
             self.hashed_vocab = (self.a * vocab_indices + self.b) % self.prime
-
     def forward(self, input_ids, attention_mask):
         batch_size, device = input_ids.shape[0], input_ids.device
-
-        # Initialize hash functions on first call
         self._init_hash_functions(device)
-
-        # Create binary bag-of-words vectors
         bow_vectors = torch.zeros(batch_size, self.vocab_size, device=device)
         for i in range(batch_size):
             valid_tokens = input_ids[i][attention_mask[i] == 1]
             valid_tokens = valid_tokens[(valid_tokens > 100) & (valid_tokens < self.vocab_size)]
             if len(valid_tokens) > 0:
                 bow_vectors[i].scatter_(0, valid_tokens, 1.0)
-
-        # Compute MinHash signatures
-        # Expand hashed vocab for batch processing
         hashed_vocab_expanded = self.hashed_vocab.unsqueeze(0).expand(batch_size, -1, -1)
-
-        # Mask non-present tokens with infinity
         masked_hashes = torch.where(
             bow_vectors.unsqueeze(1) == 1,
             hashed_vocab_expanded.float(),
             float('inf')
         )
-
-        # Get MinHash signature (minimum hash for each hash function)
         signatures, _ = torch.min(masked_hashes, dim=2)
-
-        # Normalize to unit vectors for cosine similarity
-        # (This makes cosine similarity approximate Hamming distance ranking)
         signatures = F.normalize(signatures, p=2, dim=-1)
-
         return signatures
 
 
 class BM25Encoder(nn.Module):
-    """BM25 scoring encoder (no training needed)."""
+    """... (Baseline class unchanged) ..."""
     def __init__(self, model_name: str = "bert-base-uncased", output_dim: int = 768, **kwargs):
         super().__init__()
         self.vocab_size = min(30000, 50000)
         self.output_dim = output_dim
-        # BM25 parameters
-        self.k1 = 1.2  # Term frequency saturation
-        self.b = 0.75  # Length normalization
-
+        self.k1 = 1.2
+        self.b = 0.75
     def forward(self, input_ids, attention_mask):
         batch_size, device = input_ids.shape[0], input_ids.device
-
-        # Create BM25 weighted vectors
         bm25_vectors = torch.zeros(batch_size, self.vocab_size, device=device)
-
         for i in range(batch_size):
             valid_tokens = input_ids[i][attention_mask[i] == 1]
             valid_tokens = valid_tokens[(valid_tokens > 100) & (valid_tokens < self.vocab_size)]
-
             if len(valid_tokens) > 0:
                 doc_len = len(valid_tokens)
-                # Vectorized BM25 scoring
                 unique_tokens, counts = torch.unique(valid_tokens, return_counts=True)
                 tf = counts.float()
-                # BM25 scoring: (tf * (k1 + 1)) / (tf + k1 * norm)
                 length_norm = 1.0 + self.b * (doc_len / 100.0 - 1.0)
                 bm25_scores = (tf * (self.k1 + 1)) / (tf + self.k1 * max(length_norm, 0.5))
                 bm25_vectors[i, unique_tokens] = bm25_scores
-
-        # L2 normalize for cosine similarity
         bm25_vectors = F.normalize(bm25_vectors + 1e-10, p=2, dim=-1)
-
-        # Project to output dimension if needed
         if self.vocab_size != self.output_dim:
             if not hasattr(self, 'projection'):
                 self.projection = nn.Linear(self.vocab_size, self.output_dim, bias=False).to(device)
@@ -497,7 +460,6 @@ class BM25Encoder(nn.Module):
                 self.projection.requires_grad_(False)
             bm25_vectors = self.projection(bm25_vectors)
             bm25_vectors = F.normalize(bm25_vectors, p=2, dim=-1)
-
         return bm25_vectors
 
 
@@ -510,8 +472,8 @@ ENCODER_REGISTRY = {
 }
 
 
-
 class EncoderWrapper(nn.Module):
+    """... (Class unchanged) ..."""
     def __init__(self, base_encoder, max_length):
         super().__init__()
         self.base_encoder = base_encoder
@@ -523,6 +485,7 @@ class EncoderWrapper(nn.Module):
         return self.base_encoder(input_ids, attention_mask)
 
 class TheoremContrastiveModel(nn.Module):
+    """... (Class unchanged) ..."""
     def __init__(self, base_encoder, max_length):
         super().__init__()
         self.encoder_x = EncoderWrapper(base_encoder, max_length)
@@ -532,22 +495,20 @@ class TheoremContrastiveModel(nn.Module):
         return self.encoder_x(x_packed), self.encoder_y(y_packed)
 
 # ===================================================================
-# Helper Functions (Unchanged)
+# Helper Functions
 # ===================================================================
+
 def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps: int, num_training_steps: int, last_epoch: int = -1):
-    """
-    Create a learning rate schedule with a linear warmup phase followed by a cosine decay.
-    """
+    """... (Function unchanged) ..."""
     def lr_lambda(current_step):
         if current_step < num_warmup_steps:
             return float(current_step) / float(max(1, num_warmup_steps))
         progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
         return 0.5 * (1.0 + math.cos(math.pi * progress))
-
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 def init_wandb(cfg: DictConfig, rank: int = 0) -> Optional[object]:
-    """Initialize Weights & Biases logging."""
+    """... (Function unchanged) ..."""
     if not cfg.wandb.enabled or rank != 0:
         return None
     tags = OmegaConf.to_container(cfg.wandb.tags, resolve=True)
@@ -562,13 +523,13 @@ def init_wandb(cfg: DictConfig, rank: int = 0) -> Optional[object]:
     return run
 
 def log_metrics(metrics: Dict, step: int, prefix: str = ""):
-    """Log metrics to wandb if enabled."""
+    """... (Function unchanged) ..."""
     if wandb.run is not None:
         log_dict = {f"{prefix}/{k}" if prefix else k: v for k, v in metrics.items()}
         wandb.log(log_dict, step=step)
 
 def print_trainable_parameters(model):
-    """Prints the number of trainable parameters in the model."""
+    """... (Function unchanged) ..."""
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     all_param = sum(p.numel() for p in model.parameters())
     if all_param > 0:
@@ -583,30 +544,22 @@ def print_trainable_parameters(model):
         })
 
 def setup_model(cfg: DictConfig, device):
-    """Setup model with optional LoRA, quantization, and gradient checkpointing."""
+    """... (Function unchanged) ..."""
     encoder_class = ENCODER_REGISTRY.get(cfg.model.model_type)
     if encoder_class is None:
         raise ValueError(f"Unknown model type: {cfg.model.model_type}")
-
-    # Convert model config to dict and filter for encoder parameters
     model_config_dict = OmegaConf.to_container(cfg.model, resolve=True)
-
-    # Extract only the parameters expected by the encoder class
     model_kwargs = {
         'model_name': model_config_dict.get('model_name'),
         'hidden_dim': model_config_dict.get('hidden_dim'),
         'output_dim': model_config_dict.get('output_dim', cfg.training.get('output_dim', 2048)),
         'use_gradient_checkpointing': cfg.training.get('gradient_checkpointing', False),
     }
-
-    # Handle quantization if enabled in training config
     if cfg.training.get("quantization") and cfg.training.quantization.get("enabled"):
         if global_rank == 0:
             print("Quantization is ENABLED.")
-
         compute_dtype_str = cfg.training.quantization.get("bnb_4bit_compute_dtype", "bfloat16")
         compute_dtype = getattr(torch, compute_dtype_str)
-
         model_kwargs['quantization_config'] = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type=cfg.training.quantization.get("bnb_4bit_quant_type", "nf4"),
@@ -615,15 +568,10 @@ def setup_model(cfg: DictConfig, device):
         )
     elif global_rank == 0:
         print("Quantization is DISABLED.")
-
-    # Create encoder with unpacked model config
     base_encoder = encoder_class(**model_kwargs)
-
     if cfg.training.lora.enabled:
-        # Prepare for LoRA. This works correctly whether the model is quantized or not.
         for param in base_encoder.base_model.parameters():
             param.requires_grad = False
-
         target_modules = list(cfg.model.lora_target_modules)
         peft_config = LoraConfig(
             task_type=TaskType.FEATURE_EXTRACTION, r=cfg.training.lora.r,
@@ -631,21 +579,16 @@ def setup_model(cfg: DictConfig, device):
             target_modules=target_modules,
         )
         base_encoder.base_model = get_peft_model(base_encoder.base_model, peft_config)
-
-    # Only set projection parameters if encoder has projection layer
     if hasattr(base_encoder, 'projection'):
         for param in base_encoder.projection.parameters():
             param.requires_grad = True
-        
     model = TheoremContrastiveModel(base_encoder, max_length=cfg.training.max_length)
-    
     return model.to(device)
 
 def prepare_validation_data(val_dataset, device, distributed, rank, reshuffle=False):
-    """Prepare and distribute validation data."""
+    """... (Function unchanged) ..."""
     val_objects = [None, None]
     if rank == 0:
-        # Optionally reshuffle validation pairs to randomize which statements are paired
         if reshuffle:
             val_dataset.reset_epoch()
             print("Preparing and distributing validation dataset (with reshuffled pairs)...")
@@ -666,87 +609,45 @@ def prepare_validation_data(val_dataset, device, distributed, rank, reshuffle=Fa
     return val_x_packed, val_y_packed
 
 def prepare_all_statements_data(val_dataset, device, distributed, rank, world_size: int = 1):
-    """
-    Prepare and distribute all validation statements and their paper IDs.
-    
-    Pads the dataset with dummy entries if the total number of statements
-    is not divisible by the world size.
-    
-    Args:
-        val_dataset: An instance of AllStatementsDataset.
-        device: The target device.
-        distributed: Boolean flag for distributed mode.
-        rank: The current process rank.
-        world_size: The total number of distributed processes.
-
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]: 
-            - all_statements_packed (N_global, 2 * max_length)
-            - all_paper_ids (N_global)
-    """
+    """... (Function unchanged) ..."""
     objects_to_broadcast = [None, None]
-    
     if rank == 0:
         print("Preparing and distributing all validation statements for all-vs-all eval...")
-        
-        # Iterate through the dataset to get all items
         data = [val_dataset[i] for i in range(len(val_dataset))]
-        
-        # Stack the tensors
         all_input_ids = torch.stack([d['input_ids'] for d in data])
         all_attention_masks = torch.stack([d['attention_mask'] for d in data])
         all_paper_ids = torch.stack([d['paper_id'] for d in data])
-        
-        # Pack the statement tensors (input_ids + attention_mask)
         all_statements_packed = torch.cat([all_input_ids, all_attention_masks], dim=1)
-
-        # --- NEW PADDING LOGIC ---
         num_statements = all_statements_packed.shape[0]
         if distributed and num_statements % world_size != 0:
             remainder = num_statements % world_size
             num_to_pad = world_size - remainder
-            
             print(f"Padding validation set with {num_to_pad} dummy statements "
                   f"to be divisible by world size {world_size}.")
-            
-            # Create padding
-            # We can just repeat the first statement
             padding_statements = all_statements_packed[0:1].repeat(num_to_pad, 1)
-            # We use -1 as a dummy paper_id that will match nothing
             padding_ids = torch.full((num_to_pad,), -1, 
                                      dtype=all_paper_ids.dtype, 
                                      device=all_paper_ids.device)
-
-            # Append padding
             all_statements_packed = torch.cat([all_statements_packed, padding_statements], dim=0)
             all_paper_ids = torch.cat([all_paper_ids, padding_ids], dim=0)
-        # --- END NEW PADDING LOGIC ---
-
         if distributed:
             objects_to_broadcast = [all_statements_packed, all_paper_ids]
-    
     if distributed:
         dist.broadcast_object_list(objects_to_broadcast, src=0)
         all_statements_packed, all_paper_ids = objects_to_broadcast
-
-    # Handle non-distributed case
     if not distributed and rank == 0:
-        pass # The tensors are already correct
+        pass
     elif not distributed:
         return None, None
-
     return all_statements_packed, all_paper_ids
+
 def save_model(cfg: DictConfig, model, rank, epoch: Optional[int] = None):
-    """Save model or LoRA adapters. If epoch is provided, save as checkpoint."""
+    """... (Function unchanged) ..."""
     if rank != 0: return
     output_dir = Path(cfg.output.save_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-
     model_to_save = model.module if hasattr(model, 'module') else model
-
-    # Determine naming based on whether this is a checkpoint or final save
     suffix = f'_epoch{epoch}' if epoch is not None else ''
-
     if cfg.training.lora.enabled and cfg.output.save_lora:
         adapter_path = output_dir / f'{cfg.model.name}_lora_adapters{suffix}'
         projection_path = output_dir / f'{cfg.model.name}_projection{suffix}.pt'
@@ -759,27 +660,21 @@ def save_model(cfg: DictConfig, model, rank, epoch: Optional[int] = None):
         print(f"Model saved to {model_path}")
 
 def load_saved_weights(model, load_path: Path, cfg: DictConfig, rank: int = 0):
-    """Load saved LoRA adapters and projection weights. Assumes model already has LoRA initialized."""
+    """... (Function unchanged) ..."""
     if rank == 0:
         print(f"Loading saved weights from: {load_path}")
-
     model_to_load = model.module if hasattr(model, 'module') else model
-
     if cfg.training.lora.enabled:
         adapter_path = load_path / f'{cfg.model.name}_lora_adapters'
         projection_path = load_path / f'{cfg.model.name}_projection.pt'
-
-        # Load LoRA adapter weights into already-initialized LoRA model
         if rank == 0:
             print(f"Loading LoRA adapter weights from: {adapter_path}")
         model_to_load.encoder_x.base_encoder.base_model.load_adapter(str(adapter_path), adapter_name="default")
-
         if rank == 0:
             print(f"Loading projection from: {projection_path}")
         model_to_load.encoder_x.base_encoder.projection.load_state_dict(
             torch.load(projection_path, map_location='cpu', weights_only=False)
         )
-        # Convert projection to half precision to match quantized model
         model_to_load.encoder_x.base_encoder.projection = model_to_load.encoder_x.base_encoder.projection.half()
     else:
         model_path = load_path / f'{cfg.model.name}_contrastive_model.pt'
@@ -787,54 +682,36 @@ def load_saved_weights(model, load_path: Path, cfg: DictConfig, rank: int = 0):
             print(f"Loading full model from: {model_path}")
         model_to_load.load_state_dict(torch.load(model_path, map_location='cpu', weights_only=False))
 
-# ADD this new one in its place
-# (In theorem_contrastive_training.py)
 
 def compute_embeddings(model, tokenizer, cfg: DictConfig, device, rank: int = 0, world_size: int = 1, distributed: bool = False):
-    """
-    Compute embeddings for all statements in the specified split (from config)
-    and save them to the /embeddings directory.
-    """
+    """... (Function unchanged) ..."""
     import json
     from tqdm import tqdm
-
     model.eval()
-
-    # --- NEW: Read data split from config ---
     data_split = cfg.dataset.get('split', 'eval')
-
     if rank == 0:
         print(f"\n{'='*80}")
         print(f"COMPUTE EMBEDDINGS MODE (Split: {data_split})")
         print(f"{'='*80}")
-
-    # --- 1. Load Data (now uses data_split) ---
     dataset_path = Path(cfg.dataset.base_path) / f"{cfg.dataset.size}.jsonl"
-    
     dataset_all = AllStatementsDataset(
         str(dataset_path), tokenizer,
         max_length=cfg.training.max_length,
-        split=data_split,  # <-- Use the specified split
+        split=data_split,
         train_ratio=cfg.dataset.get('train_ratio', 0.8),
         seed=cfg.dataset.get('seed', 42)
     )
-
-    # Prepare and distribute the data
     all_statements_packed, all_paper_ids = prepare_all_statements_data(
         dataset_all, device, distributed, rank, world_size
     )
-
     N_global = all_statements_packed.shape[0]
     C_local = N_global // world_size
     start, end = rank * C_local, (rank + 1) * C_local
-
-    # --- 2. Compute Embeddings ---
     use_amp = cfg.training.get('use_amp', True) and torch.cuda.is_available()
     compute_config = {
         'MICRO_BATCH_SIZE': cfg.training.micro_batch_size,
         'USE_AMP': use_amp 
     }
-
     _, Z_all, paper_ids_all = compute_and_gather_embeddings(
         model,
         all_statements_packed[start:end].to(device),
@@ -842,32 +719,24 @@ def compute_embeddings(model, tokenizer, cfg: DictConfig, device, rank: int = 0,
         compute_config,
         rank
     )
-
-    # --- 3. Save to Disk (Rank 0 only, with new file names) ---
     if rank == 0:
         num_original_statements = len(dataset_all)
         if N_global > num_original_statements:
             print(f"Trimming {N_global - num_original_statements} padding statements before saving.")
             Z_all = Z_all[:num_original_statements]
             paper_ids_all = paper_ids_all[:num_original_statements]
-        
         output_dir = Path(cfg.output.save_dir) / 'embeddings' / cfg.dataset.size
         output_dir.mkdir(parents=True, exist_ok=True)
-
-        # --- Parameterized file paths ---
         embeddings_path = output_dir / f'{data_split}_embeddings.pt'
         paper_ids_path = output_dir / f'{data_split}_paper_ids.pt'
         info_path = output_dir / f'{data_split}_info.json'
-
         print(f"Saving embeddings to: {embeddings_path}")
         torch.save(Z_all.cpu(), embeddings_path)
-
         print(f"Saving paper IDs to: {paper_ids_path}")
         torch.save(paper_ids_all.cpu(), paper_ids_path)
-
         info = {
             'dataset_size': cfg.dataset.size,
-            'split': data_split,  # <-- Use the specified split
+            'split': data_split,
             'num_statements': len(Z_all),
             'embedding_dim': Z_all.shape[1],
             'model_dir': str(cfg.output.save_dir),
@@ -875,16 +744,169 @@ def compute_embeddings(model, tokenizer, cfg: DictConfig, device, rank: int = 0,
         }
         with open(info_path, 'w') as f:
             json.dump(info, f, indent=2)
-
         print(f"✓ Saved {len(Z_all)} embeddings ({Z_all.shape})")
         print(f"{'='*80}\n")
 
 # ===================================================================
-# Training Function (Unchanged)
+# NEW: Top-K Retrieval Function
 # ===================================================================
-# (in theorem_contrastive_training.py)
+def retrieve_top_k(model, tokenizer, cfg: DictConfig, device, rank: int):
+    """
+    Loads queries from a file and retrieves the top-K most similar
+    items from the pre-computed embedding database.
+    
+    This function runs *only* on Rank 0.
+    """
+    if rank != 0:
+        return
 
-# (in theorem_contrastive_training.py)
+    K = cfg.training.retrieve_top_k
+    query_file = cfg.training.get('query_file')
+    if not query_file:
+        raise ValueError("Must provide `+training.query_file=path/to/queries.txt` for retrieval.")
+    
+    query_file_path = Path(query_file)
+    if not query_file_path.exists():
+        raise FileNotFoundError(f"Query file not found: {query_file_path}")
+
+    data_split = cfg.dataset.get('split', 'eval')
+    
+    print(f"\n{'='*80}")
+    print(f"RETRIEVAL MODE (K={K}, Split: {data_split})")
+    print(f"{'='*80}")
+
+    # --- 1. Load Database Metadata ---
+    # We re-load the dataset to get the text and metadata.
+    # The modified AllStatementsDataset now loads everything we need.
+    print(f"Loading database metadata for split '{data_split}'...")
+    dataset_path = Path(cfg.dataset.base_path) / f"{cfg.dataset.size}.jsonl"
+    db_dataset = AllStatementsDataset(
+        str(dataset_path), tokenizer,
+        max_length=cfg.training.max_length,
+        split=data_split,
+        train_ratio=cfg.dataset.get('train_ratio', 0.8),
+        seed=cfg.dataset.get('seed', 42)
+    )
+    db_metadata = db_dataset.metadata
+
+    # --- 2. Load Database Embeddings ---
+    load_path = Path(cfg.training.load_model_path)
+    embeddings_path = load_path / 'embeddings' / cfg.dataset.size / f'{data_split}_embeddings.pt'
+    if not embeddings_path.exists():
+        raise FileNotFoundError(f"Database embeddings not found: {embeddings_path}")
+        
+    print(f"Loading database embeddings from {embeddings_path}...")
+    db_embeddings = torch.load(embeddings_path, map_location=device, weights_only=True).half()
+
+    if len(db_metadata) != len(db_embeddings):
+        raise ValueError(
+            f"Metadata count ({len(db_metadata)}) does not match "
+            f"embedding count ({len(db_embeddings)}). Is your split ('{data_split}') correct?"
+        )
+
+    # Filter out zero vectors
+    norms = torch.norm(db_embeddings, p=2, dim=1)
+    valid_mask = norms > 1e-6
+    db_embeddings = db_embeddings[valid_mask]
+    db_metadata = [db_metadata[i] for i in range(len(db_metadata)) if valid_mask[i]]
+
+    print(f"Loaded {len(db_embeddings)} database entries (filtered {(~valid_mask).sum().item()} zero vectors).")
+
+    # --- 3. Load and Embed Queries ---
+    print(f"Reading queries from: {query_file_path}")
+    with open(query_file_path, 'r') as f:
+        queries = [line.strip() for line in f if line.strip()]
+    
+    print(f"Embedding {len(queries)} queries...")
+    
+    model_to_use = model.module if hasattr(model, 'module') else model
+    model_to_use.eval()
+    
+    query_embeddings = []
+    use_amp = cfg.training.get('use_amp', True) and torch.cuda.is_available()
+    batch_size = cfg.training.micro_batch_size
+    
+    with torch.no_grad(), autocast(enabled=use_amp):
+        for i in tqdm(range(0, len(queries), batch_size), desc="Embedding Queries"):
+            batch_queries = queries[i:i+batch_size]
+            
+            tokens = tokenizer(
+                batch_queries, 
+                padding='max_length', 
+                truncation=True,
+                max_length=cfg.training.max_length, 
+                return_tensors='pt'
+            )
+            
+            input_ids = tokens['input_ids'].to(device)
+            attention_mask = tokens['attention_mask'].to(device)
+            
+            # Manually pack the tensor [B, 2 * max_length]
+            packed_batch = torch.cat([input_ids, attention_mask], dim=1)
+            
+            # Get embeddings (will be fp16 from our modified encoder)
+            q_embeds = model_to_use.encoder_x(packed_batch)
+            query_embeddings.append(q_embeds)
+            
+    query_embeddings = torch.cat(query_embeddings, dim=0)
+
+    # --- 4. Perform Search ---
+    print("Searching...")
+    # Compute cosine similarity
+    # [num_queries, D] @ [D, num_db] -> [num_queries, num_db]
+    scores = torch.matmul(query_embeddings, db_embeddings.T)
+    
+    top_k_scores, top_k_indices = scores.topk(k=K, dim=1)
+    
+    # Move results to CPU for processing
+    top_k_scores = top_k_scores.cpu()
+    top_k_indices = top_k_indices.cpu()
+
+    # --- 5. Format and Print Results ---
+    results_list = []
+    for i in range(len(queries)):
+        query_text = queries[i]
+        hits = []
+        for j in range(K):
+            db_index = top_k_indices[i, j].item()
+            score = top_k_scores[i, j].item()
+            metadata = db_metadata[db_index]
+            
+            hits.append({
+                "rank": j + 1,
+                "score": score,
+                "text": metadata['text'],
+                "type": metadata['type'],
+                "paper_id": metadata['paper_id'], # This is the local split ID
+                "paper_title": metadata['paper_title'],
+                "arxiv_id": metadata['arxiv_id']
+            })
+        
+        results_list.append({
+            "query": query_text,
+            "top_k_hits": hits
+        })
+
+        # Print to console
+        print(f"\n{'='*80}")
+        print(f"QUERY: {query_text}")
+        print(f"{'-'*80}")
+        for hit in hits:
+            print(f"  RANK {hit['rank']} (Score: {hit['score']:.4f})")
+            print(f"  Type: {hit['type']} | Paper: {hit['paper_title']} ({hit['arxiv_id']})")
+            print(f"  Text: {hit['text'][:200]}...") # Truncate for readability
+        print(f"{'='*80}")
+    
+    # --- 6. Save Full Results to JSON ---
+    output_file = Path(cfg.output.save_dir) / f"retrieval_results_{data_split}_k{K}.json"
+    print(f"\nSaving full results for {len(results_list)} queries to: {output_file}")
+    with open(output_file, 'w') as f:
+        json.dump(results_list, f, indent=2)
+
+
+# ===================================================================
+# Main Training Function
+# ===================================================================
 
 def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool = False):
     """Main training function with learning rate scheduler."""
@@ -944,28 +966,22 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
         model = DDP(model, device_ids=[rank], find_unused_parameters=True)
 
     # --- Define the data split to use for compute modes ---
-    data_split = cfg.dataset.get('split_for_compute', 'eval')
+    data_split = cfg.dataset.get('split', 'eval')
 
 
     # --- BLOCK 1: compute_embeddings ---
     if cfg.training.get('compute_embeddings', False):
         load_path = Path(cfg.training.get('load_model_path', cfg.output.save_dir))
         load_saved_weights(model, load_path, cfg, rank)
-
         compute_embeddings(model, tokenizer, cfg, device, rank, world_size, distributed)
-        
         return
 
     # --- AMP/SCALER DEFINITION ---
     use_amp = cfg.training.get('use_amp', True) and torch.cuda.is_available()
-    
-    # --- FIX for GradScaler FutureWarning ---
     if use_amp:
         scaler = torch.amp.GradScaler('cuda')
     else:
         scaler = None
-    # --- END FIX ---
-    
     if rank == 0:
         print(f"Mixed precision training {'ENABLED' if use_amp else 'DISABLED'}")
 
@@ -978,9 +994,7 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
             print(f"{'='*80}")
         
         objects_to_broadcast = [None, None]
-        # --- FIX: Initialize Z_all and paper_ids_all to None ---
         Z_all, paper_ids_all = None, None
-        # --- END FIX ---
         
         if rank == 0:
             load_path = Path(cfg.training.load_model_path)
@@ -992,29 +1006,24 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
                     f"Could not find cached embeddings for split '{data_split}'. Searched for: \n"
                     f"- {embeddings_path}\n"
                     f"- {paper_ids_path}\n"
-                    f"Please run `+training.compute_embeddings=true dataset.split_for_compute={data_split}` first."
+                    f"Please run `+training.compute_embeddings=true dataset.split={data_split}` first."
                 )
 
             print(f"Loading cached embeddings from: {embeddings_path}")
-            # --- FIX for torch.load FutureWarning ---
             Z_all_cached = torch.load(embeddings_path, map_location='cpu', weights_only=True)
             print(f"Loading cached paper IDs from: {paper_ids_path}")
             paper_ids_all_cached = torch.load(paper_ids_path, map_location='cpu', weights_only=True)
-            # --- END FIX ---
             
             if distributed:
                 objects_to_broadcast = [Z_all_cached, paper_ids_all_cached]
             else:
-                # --- FIX: Assign tensors directly for single-GPU ---
                 Z_all = Z_all_cached
                 paper_ids_all = paper_ids_all_cached
-                # --- END FIX ---
         
         if distributed:
             dist.broadcast_object_list(objects_to_broadcast, src=0)
             Z_all, paper_ids_all = objects_to_broadcast
         
-        # This line will now work correctly
         Z_all = Z_all.to(device)
         paper_ids_all = paper_ids_all.to(device)
 
@@ -1035,7 +1044,7 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
             'TAU': cfg.training.tau,
             'USE_AMP': use_amp
         }
-        k_vals = cfg.training.get('k_vals', [1, 5, 10])
+        k_vals = cfg.training.get('k_vals', [1, 5, 10,])
 
         val_loss, val_metrics = compute_retrieval_metrics(
             local_Z, local_paper_ids, Z_all, paper_ids_all,
@@ -1112,6 +1121,20 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
             print(f"{'='*80}")
         return
 
+    # --- NEW BLOCK 4: retrieve_top_k ---
+    if cfg.training.get('retrieve_top_k', 0) > 0:
+        if distributed:
+            print("WARNING: Retrieval mode does not support multi-GPU. Running on Rank 0 only.")
+        
+        # Load model weights
+        load_path = Path(cfg.training.get('load_model_path', cfg.output.save_dir))
+        load_saved_weights(model, load_path, cfg, rank)
+        
+        # Call the new helper function
+        retrieve_top_k(model, tokenizer, cfg, device, rank)
+        
+        return # Exit after retrieval
+
     # --- Standard Training Setup ---
     trainable_params = list(filter(lambda p: p.requires_grad, model.parameters()))
 
@@ -1154,7 +1177,6 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
     if len(trainable_params) == 0:
         if rank == 0:
             print("No trainable parameters - running in-training-style validation only.")
-
         model.eval()
         N_val = val_x_packed.shape[0]
         val_world_size = world_size if distributed else 1
@@ -1162,18 +1184,15 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
         start, end = rank * C_val, (rank + 1) * C_val
         local_val_x_packed = val_x_packed[start:end].to(device)
         local_val_y_packed = val_y_packed[start:end].to(device)
-
         val_config = {
             'GLOBAL_BATCH_SIZE': N_val,
             'MICRO_BATCH_SIZE': cfg.training.micro_batch_size,
             'STREAM_CHUNK_SIZE': cfg.training.stream_chunk_size,
             'TAU': cfg.training.tau
         }
-
         val_loss, val_metrics = distributed_validate_step(
             model, local_val_x_packed, local_val_y_packed, val_config
         )
-
         if rank == 0:
             print(f"\nValidation Results:")
             print(f"Val Loss: {val_loss:.4f}")
@@ -1196,14 +1215,12 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
             'TAU': cfg.training.tau,
             'USE_AMP': use_amp
         }
-        
         with torch.no_grad(), autocast(enabled=use_amp):
             val_loss, topk_acc = distributed_validate_step(
                 model, val_x_packed[start:end].to(device),
                 val_y_packed[start:end].to(device), val_config,
                 k_vals=cfg.training.get('k_vals', [1, 5, 10])
             )
-        
         if rank == 0:
             prefix = f"\n[Epoch {epoch_num+1}] Validation" if epoch_num is not None else "\nValidation"
             print(f"{prefix} at step {step_num}:")
@@ -1211,7 +1228,6 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
             k_vals_to_report = cfg.training.get('k_vals', [1, 5, 10])
             acc_str = "  ".join([f"Top@{k}: {topk_acc.get(k, 0)*100:.2f}%" for k in k_vals_to_report if k in topk_acc])
             print(f"  {acc_str}\n")
-            
             metrics = {'loss': val_loss, 'mrr': topk_acc.get('MRR', 0)}
             for k in k_vals_to_report:
                 if k in topk_acc:
