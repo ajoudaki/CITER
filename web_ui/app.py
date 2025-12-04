@@ -10,10 +10,12 @@ from typing import Dict, List, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast
-from transformers import AutoTokenizer, AutoModel, BitsAndBytesConfig
-from peft import PeftModel
+from torch.amp import autocast
+from transformers import AutoTokenizer
 from tqdm import tqdm
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from compute_embeddings import SimpleEncoder, load_model as load_model_compute_embeddings
 
 app = Flask(__name__)
 
@@ -157,7 +159,7 @@ def get_paper(paper_idx: int):
     })
 
 def load_model(model_name: str):
-    """Load a trained model for similarity search."""
+    """Load a trained model for similarity search using compute_embeddings.py code."""
     global loaded_models, current_model
 
     if model_name in loaded_models:
@@ -166,137 +168,30 @@ def load_model(model_name: str):
 
     # Check for CUDA availability
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    use_fp16 = torch.cuda.is_available()  # Use fp16 if CUDA is available
-    num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-    print(f"Loading model on {device} (fp16: {use_fp16}, GPUs: {num_gpus})")
+    local_rank = 0  # Use GPU 0 for web app
 
-    # Clear GPU cache before loading to free up memory
+    # Clear GPU cache before loading
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-
-    # Simple encoder class matching compute_embeddings.py
-    class SimpleEncoder(nn.Module):
-        def __init__(self, base_model, projection, model_type: str):
-            super().__init__()
-            self.base_model = base_model
-            self.projection = projection
-            self.model_type = model_type
-
-        def forward(self, input_ids, attention_mask):
-            outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
-
-            # Pretrained embedding models may return embeddings directly
-            if self.model_type == 'pretrained' and hasattr(outputs, 'embeddings'):
-                return F.normalize(outputs.embeddings, p=2, dim=-1)
-
-            # Use CLS token for BERT, last token for Qwen
-            if 'bert' in self.model_type.lower():
-                embedding = outputs.last_hidden_state[:, 0, :]
-            else:
-                sequence_lengths = attention_mask.sum(dim=1) - 1
-                batch_indices = torch.arange(len(sequence_lengths), device=sequence_lengths.device)
-                embedding = outputs.last_hidden_state[batch_indices, sequence_lengths, :]
-            return F.normalize(self.projection(embedding), p=2, dim=-1)
 
     # Model directory
     model_dir = Path(f'../outputs/demo/{model_name}')
     if not model_dir.exists():
         raise ValueError(f"Model directory not found: {model_dir}")
 
-    # Detect model type from directory name or LoRA adapter name
-    model_name_lower = model_name.lower()
+    # Use compute_embeddings.py's load_model function directly
+    encoder, tokenizer = load_model_compute_embeddings(model_dir, local_rank, pretrained_model=None)
 
-    # Check for LoRA adapters to determine exact model
-    lora_dirs = list(model_dir.glob('*lora_adapters'))
-    lora_hint = lora_dirs[0].name.lower() if lora_dirs else ''
-
-    if 'bert' in model_name_lower:
-        base_model_name = 'bert-base-uncased'
-        hidden_dim = 768
-        model_type = 'bert'
-    elif '7b' in model_name_lower or '7b' in lora_hint or 'math-7b' in lora_hint:
-        # Qwen 7B models
-        if 'math' in lora_hint:
-            base_model_name = 'Qwen/Qwen2.5-Math-7B-Instruct'
-        else:
-            base_model_name = 'Qwen/Qwen2.5-7B'
-        hidden_dim = 3584
-        model_type = 'qwen-7b'
-    elif '1.5b' in model_name_lower or '1.5b' in lora_hint or 'qwen' in model_name_lower:
-        base_model_name = 'Qwen/Qwen2.5-1.5B'
-        hidden_dim = 1536
-        model_type = 'qwen'
-    else:
-        # Default to Qwen 1.5B
-        base_model_name = 'Qwen/Qwen2.5-1.5B'
-        hidden_dim = 1536
-        model_type = 'qwen'
-
-    # Use quantization for large models (7B+)
-    use_quantization = '7b' in model_name_lower or '7b' in lora_hint
-
-    if use_quantization and torch.cuda.is_available():
-        print(f"Loading {base_model_name} with 4-bit quantization...")
-        quantization_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_compute_dtype=torch.bfloat16
-        )
-        base_model = AutoModel.from_pretrained(
-            base_model_name,
-            quantization_config=quantization_config,
-            device_map="auto"
-        )
-    else:
-        # Load base model normally
-        base_model = AutoModel.from_pretrained(base_model_name)
-
-    # Load LoRA adapters from model directory
-    lora_paths = list(model_dir.glob('*lora_adapters'))
-    if lora_paths:
-        lora_path = lora_paths[0]
-        print(f"Loading LoRA adapters from: {lora_path}")
-        base_model = PeftModel.from_pretrained(base_model, str(lora_path))
-
-    # Load projection layer from model directory
-    projection_files = list(model_dir.glob('*projection.pt'))
-    projection = nn.Linear(hidden_dim, 2048)
-    if projection_files:
-        projection_path = projection_files[0]
-        print(f"Loading projection from: {projection_path}")
-        projection.load_state_dict(torch.load(projection_path, map_location='cpu'))
-
-    # Create encoder and move to device
-    encoder = SimpleEncoder(base_model, projection, model_type)
-
-    # For quantized models, don't move to device (already handled by device_map)
-    # For non-quantized models, move to device and optionally convert to fp16
-    if not use_quantization:
-        encoder = encoder.to(device)
-        if use_fp16:
-            encoder = encoder.half()
-        # Use DataParallel for multi-GPU
-        if num_gpus > 1:
-            print(f"Using DataParallel across {num_gpus} GPUs")
-            encoder = nn.DataParallel(encoder)
-    else:
-        # For quantized models, only convert projection layer to fp16
-        if use_fp16:
-            encoder.projection = encoder.projection.half().to(device)
+    # Remove DDP wrapper if present (not needed for web app)
+    if hasattr(encoder, 'module'):
+        encoder = encoder.module
 
     encoder.eval()
-
-    # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(base_model_name)
 
     loaded_models[model_name] = {
         'encoder': encoder,
         'tokenizer': tokenizer,
-        'device': device,
-        'use_fp16': use_fp16,
-        'num_gpus': num_gpus,
-        'use_quantization': use_quantization
+        'device': device
     }
     current_model = model_name
     return loaded_models[model_name]
@@ -348,8 +243,6 @@ def compute_embeddings_for_dataset():
     encoder = model_data['encoder']
     tokenizer = model_data['tokenizer']
     device = model_data['device']
-    use_fp16 = model_data.get('use_fp16', False)
-    num_gpus = model_data.get('num_gpus', 0)
 
     all_embeddings = []
     all_metadata = []
@@ -376,15 +269,14 @@ def compute_embeddings_for_dataset():
                 'text': stmt.get('text', '')
             })
 
-    # Process in batches for efficiency - scale batch size with GPUs
-    base_batch_size = 32 if use_fp16 else 8
-    batch_size = base_batch_size * max(1, num_gpus)  # Scale with number of GPUs
-    print(f"Computing embeddings for {len(all_texts)} statements (batch_size={batch_size}, fp16={use_fp16}, GPUs={num_gpus})...")
+    # Process in batches - use same batch size as compute_embeddings.py
+    batch_size = 32
+    print(f"Computing embeddings for {len(all_texts)} statements (batch_size={batch_size})...")
     with torch.no_grad():
         for i in tqdm(range(0, len(all_texts), batch_size), desc="Processing batches"):
             batch_texts = all_texts[i:i+batch_size]
 
-            # Tokenize batch
+            # Tokenize batch - same as compute_embeddings.py
             inputs = tokenizer(
                 batch_texts,
                 truncation=True,
@@ -397,8 +289,8 @@ def compute_embeddings_for_dataset():
             input_ids = inputs['input_ids'].to(device)
             attention_mask = inputs['attention_mask'].to(device)
 
-            # Use autocast for mixed precision
-            with autocast(enabled=use_fp16):
+            # Use autocast - EXACTLY as in compute_embeddings.py
+            with autocast(device_type='cuda', enabled=True):
                 embeddings = encoder(input_ids, attention_mask)
 
             # Move embeddings back to CPU for storage
@@ -618,9 +510,8 @@ def semantic_search():
     encoder = model_data['encoder']
     tokenizer = model_data['tokenizer']
     device = model_data['device']
-    use_fp16 = model_data.get('use_fp16', False)
 
-    # Embed the query
+    # Embed the query - EXACTLY as in compute_embeddings.py
     with torch.no_grad():
         inputs = tokenizer(
             [query_text],
@@ -633,7 +524,8 @@ def semantic_search():
         input_ids = inputs['input_ids'].to(device)
         attention_mask = inputs['attention_mask'].to(device)
 
-        with autocast(enabled=use_fp16):
+        # Use EXACT same autocast as compute_embeddings.py line 307
+        with autocast(device_type='cuda', enabled=True):
             query_embedding = encoder(input_ids, attention_mask)
 
         query_embedding = query_embedding.float().cpu()

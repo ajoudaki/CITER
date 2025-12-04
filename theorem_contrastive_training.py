@@ -905,6 +905,153 @@ def retrieve_top_k(model, tokenizer, cfg: DictConfig, device, rank: int):
 
 
 # ===================================================================
+# NEW: Pairwise Query Similarity Function
+# ===================================================================
+def compute_pairwise_similarities(model, tokenizer, cfg: DictConfig, device, rank: int):
+    """
+    Loads queries from a file, embeds them all, and computes pairwise similarities.
+
+    This function runs *only* on Rank 0.
+    """
+    if rank != 0:
+        return
+
+    query_file = cfg.training.get('query_file')
+    if not query_file:
+        raise ValueError("Must provide `+training.query_file=path/to/queries.txt` for pairwise similarity computation.")
+
+    query_file_path = Path(query_file)
+    if not query_file_path.exists():
+        raise FileNotFoundError(f"Query file not found: {query_file_path}")
+
+    print(f"\n{'='*80}")
+    print(f"PAIRWISE SIMILARITY MODE")
+    print(f"{'='*80}")
+
+    # --- 1. Load Queries ---
+    print(f"\nReading queries from: {query_file_path}")
+    with open(query_file_path, 'r') as f:
+        queries = [line.strip() for line in f if line.strip()]
+
+    print(f"Loaded {len(queries)} queries")
+
+    # --- 2. Embed All Queries ---
+    print(f"\nEmbedding {len(queries)} queries...")
+
+    model_to_use = model.module if hasattr(model, 'module') else model
+    model_to_use.eval()
+
+    query_embeddings = []
+    use_amp = cfg.training.get('use_amp', True) and torch.cuda.is_available()
+    batch_size = cfg.training.micro_batch_size
+
+    with torch.no_grad(), autocast(enabled=use_amp):
+        for i in tqdm(range(0, len(queries), batch_size), desc="Embedding Queries"):
+            batch_queries = queries[i:i+batch_size]
+
+            tokens = tokenizer(
+                batch_queries,
+                padding='max_length',
+                truncation=True,
+                max_length=cfg.training.max_length,
+                return_tensors='pt'
+            )
+
+            input_ids = tokens['input_ids'].to(device)
+            attention_mask = tokens['attention_mask'].to(device)
+
+            # Manually pack the tensor [B, 2 * max_length]
+            packed_batch = torch.cat([input_ids, attention_mask], dim=1)
+
+            # Get embeddings (will be fp16 from our modified encoder)
+            q_embeds = model_to_use.encoder_x(packed_batch)
+            query_embeddings.append(q_embeds)
+
+    query_embeddings = torch.cat(query_embeddings, dim=0)  # [num_queries, D]
+    print(f"Embedded {len(query_embeddings)} queries with shape {query_embeddings.shape}")
+
+    # --- 3. Compute Pairwise Similarities ---
+    print("\nComputing pairwise similarities...")
+    # [num_queries, D] @ [D, num_queries] -> [num_queries, num_queries]
+    similarity_matrix = torch.matmul(query_embeddings, query_embeddings.T)
+
+    # Move to CPU and convert to float for processing
+    similarity_matrix = similarity_matrix.float().cpu()
+
+    print(f"Similarity matrix shape: {similarity_matrix.shape}")
+    print(f"Min similarity: {similarity_matrix.min().item():.4f}")
+    print(f"Max similarity: {similarity_matrix.max().item():.4f}")
+    print(f"Mean similarity (excluding diagonal): {(similarity_matrix.sum() - similarity_matrix.trace()).item() / (len(queries) * (len(queries) - 1)):.4f}")
+
+    # --- 4. Format and Print Results ---
+    print(f"\n{'='*80}")
+    print("PAIRWISE SIMILARITY RESULTS")
+    print(f"{'='*80}\n")
+
+    # Create results structure
+    results = {
+        'num_queries': len(queries),
+        'queries': queries,
+        'similarity_matrix': similarity_matrix.tolist(),
+        'pairwise_results': []
+    }
+
+    # Print and save detailed pairwise comparisons
+    for i in range(len(queries)):
+        for j in range(i + 1, len(queries)):  # Only upper triangle (avoid duplicates and self-comparisons)
+            similarity = similarity_matrix[i, j].item()
+
+            results['pairwise_results'].append({
+                'query_1_idx': i,
+                'query_2_idx': j,
+                'query_1': queries[i][:100] + '...' if len(queries[i]) > 100 else queries[i],
+                'query_2': queries[j][:100] + '...' if len(queries[j]) > 100 else queries[j],
+                'similarity': similarity
+            })
+
+    # Sort by similarity (highest first)
+    results['pairwise_results'].sort(key=lambda x: x['similarity'], reverse=True)
+
+    # Print top 10 most similar pairs
+    print("Top 10 Most Similar Query Pairs:")
+    print("-" * 80)
+    for idx, pair in enumerate(results['pairwise_results'][:10], 1):
+        print(f"\n{idx}. Similarity: {pair['similarity']:.4f}")
+        print(f"   Query {pair['query_1_idx']}: {pair['query_1']}")
+        print(f"   Query {pair['query_2_idx']}: {pair['query_2']}")
+
+    # Print bottom 10 least similar pairs
+    print(f"\n{'='*80}")
+    print("Top 10 Least Similar Query Pairs:")
+    print("-" * 80)
+    for idx, pair in enumerate(results['pairwise_results'][-10:], 1):
+        print(f"\n{idx}. Similarity: {pair['similarity']:.4f}")
+        print(f"   Query {pair['query_1_idx']}: {pair['query_1']}")
+        print(f"   Query {pair['query_2_idx']}: {pair['query_2']}")
+
+    # --- 5. Save Results to JSON ---
+    output_file = Path(cfg.output.save_dir) / f"pairwise_similarities.json"
+    print(f"\n{'='*80}")
+    print(f"Saving results to: {output_file}")
+    with open(output_file, 'w') as f:
+        json.dump(results, f, indent=2)
+
+    # Also save similarity matrix as numpy array for easier analysis
+    import numpy as np
+    matrix_file = Path(cfg.output.save_dir) / f"similarity_matrix.npy"
+    np.save(matrix_file, similarity_matrix.numpy())
+    print(f"Saved similarity matrix to: {matrix_file}")
+
+    print(f"\n{'='*80}")
+    print("SUMMARY:")
+    print(f"  Total queries: {len(queries)}")
+    print(f"  Total pairs: {len(results['pairwise_results'])}")
+    print(f"  Highest similarity: {results['pairwise_results'][0]['similarity']:.4f}")
+    print(f"  Lowest similarity: {results['pairwise_results'][-1]['similarity']:.4f}")
+    print(f"{'='*80}\n")
+
+
+# ===================================================================
 # Main Training Function
 # ===================================================================
 
@@ -1125,15 +1272,29 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
     if cfg.training.get('retrieve_top_k', 0) > 0:
         if distributed:
             print("WARNING: Retrieval mode does not support multi-GPU. Running on Rank 0 only.")
-        
+
         # Load model weights
         load_path = Path(cfg.training.get('load_model_path', cfg.output.save_dir))
         load_saved_weights(model, load_path, cfg, rank)
-        
+
         # Call the new helper function
         retrieve_top_k(model, tokenizer, cfg, device, rank)
-        
+
         return # Exit after retrieval
+
+    # --- NEW BLOCK 5: compute_pairwise_similarities ---
+    if cfg.training.get('compute_pairwise_similarities', False):
+        if distributed:
+            print("WARNING: Pairwise similarity mode does not support multi-GPU. Running on Rank 0 only.")
+
+        # Load model weights
+        load_path = Path(cfg.training.get('load_model_path', cfg.output.save_dir))
+        load_saved_weights(model, load_path, cfg, rank)
+
+        # Call the new helper function
+        compute_pairwise_similarities(model, tokenizer, cfg, device, rank)
+
+        return # Exit after computation
 
     # --- Standard Training Setup ---
     trainable_params = list(filter(lambda p: p.requires_grad, model.parameters()))
