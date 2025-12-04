@@ -64,6 +64,8 @@ def compute_and_gather_embeddings(
 
         for i in embedding_pbar:
             with amp_context:
+                # Slicing logic automatically handles the last partial batch (e.g. [i : min(i+B, C_local)])
+                # even if we just write [i : i+B] because Python list/tensor slicing is robust to overflow.
                 z = module.encoder_x(local_statements_packed[i:i + B_micro])
             local_Z.append(z)
         
@@ -486,10 +488,12 @@ def compute_retrieval_metrics(
             print(f"  Max:    {np.max(counts_np):.0f}")
             print(f"  Percentiles (50, 75, 90, 95, 99):")
             print(f"    {np.percentile(counts_np, [50, 75, 90, 95, 99])}")
-            print(f"{'='*60}\n")
+            separator = '=' * 60
+            print(f"{separator}\n")
         
         # --- Debug Check 2: Unique Paper IDs ---
-        print(f"\n{'='*60}")
+        separator = '=' * 60
+        print(f"\n{separator}")
         print(f"DEBUG: Paper ID Sanity Check (Global)")
         
         # We need the *global* list of paper IDs
@@ -514,7 +518,8 @@ def compute_retrieval_metrics(
                 print(f"  ✗ FAILURE: Unique count ({num_unique_papers}) != max ID count ({num_papers_from_max_id}).")
         else:
             print("  No valid paper IDs (>= 0) found to analyze.")
-        print(f"{'='*60}\n")
+        separator = '=' * 60
+        print(f"{separator}\n")
     # =================== END DEBUGGING BLOCK ===================
 
     # --- Sync Point 2: Aggregate metrics from all GPUs ---
@@ -588,7 +593,7 @@ def validate_metrics(
 
     if config['GLOBAL_BATCH_SIZE'] != local_statements_packed.shape[0] * P:
         N, C = config['GLOBAL_BATCH_SIZE'], local_statements_packed.shape[0]
-        raise ValueError(f"Global batch size N={N} must equal C*P ({C}*{P}).")
+        raise ValueError(f"Global batch size N={N} must equal local_chunk_size*P ({C}*{P}).")
     
     if k_vals is None:
         k_vals = [1, 5, 10]
@@ -650,4 +655,3 @@ def trivial_contrastive_step(
         total_loss.backward()
         optimizer.step()
     return total_loss.item()
-
