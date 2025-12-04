@@ -246,21 +246,25 @@ class AllStatementsDataset(Dataset):
             paper_title = paper.get('title', 'Untitled')
             arxiv_id = paper.get('arxiv_id', 'Unknown')
             
-            for stmt in paper.get('lemmas', []):
+            for i, stmt in enumerate(paper.get('lemmas', [])):
                 self.metadata.append({
                     'text': stmt,
                     'paper_id': paper_id, # Local split paper_id
                     'paper_title': paper_title,
                     'arxiv_id': arxiv_id,
-                    'type': 'lemma'
+                    'type': 'lemma',
+                    'stmt_idx': i,
+                    'uid': f"{paper_id}.lemma.{i}"
                 })
-            for stmt in paper.get('theorems', []):
+            for i, stmt in enumerate(paper.get('theorems', [])):
                 self.metadata.append({
                     'text': stmt,
                     'paper_id': paper_id,
                     'paper_title': paper_title,
                     'arxiv_id': arxiv_id,
-                    'type': 'theorem'
+                    'type': 'theorem',
+                    'stmt_idx': i,
+                    'uid': f"{paper_id}.theorem.{i}"
                 })
         # --- END MODIFIED ---
 
@@ -734,6 +738,16 @@ def compute_embeddings(model, tokenizer, cfg: DictConfig, device, rank: int = 0,
         torch.save(Z_all.cpu(), embeddings_path)
         print(f"Saving paper IDs to: {paper_ids_path}")
         torch.save(paper_ids_all.cpu(), paper_ids_path)
+        
+        metadata_path = output_dir / f'{data_split}_metadata.jsonl'
+        print(f"Saving metadata to: {metadata_path}")
+        with open(metadata_path, 'w') as f:
+            for i in range(len(Z_all)): # Z_all is already trimmed to num_original_statements
+                # Safety check in case dataset changed (unlikely in this scope)
+                if i >= len(dataset_all.metadata):
+                    break
+                f.write(json.dumps(dataset_all.metadata[i]) + '\n')
+        
         info = {
             'dataset_size': cfg.dataset.size,
             'split': data_split,

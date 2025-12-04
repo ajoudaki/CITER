@@ -6,8 +6,8 @@ import sys
 
 # Configuration
 MODEL_PATH = "outputs/demo/big_run_qwen-7b"
-DATASET_SIZE = "tiny_sanitized"
-QUERY_FILE = "tiny_queries.txt"
+DATASET_SIZE = "integrity_test"
+QUERY_FILE = "temp_queries.txt"
 
 def run_command(cmd):
     print(f"Running: {cmd}")
@@ -28,7 +28,6 @@ cmd1 = (
     f"dataset.size={DATASET_SIZE} "
     f"+dataset.split=all "
     f"+training.load_model_path={MODEL_PATH} "
-    f"training.max_length=512 "
     f"training.micro_batch_size=8 "
     f"training.quantization.enabled=true "
     f"wandb.enabled=false"
@@ -41,7 +40,6 @@ cmd2 = (
     f"+training.compute_pairwise_similarities=true "
     f"+training.query_file={QUERY_FILE} "
     f"+training.load_model_path={MODEL_PATH} "
-    f"training.max_length=512 "
     f"training.micro_batch_size=8 "
     f"training.quantization.enabled=true "
     f"wandb.enabled=false"
