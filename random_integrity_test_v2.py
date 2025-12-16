@@ -11,7 +11,7 @@ def get_cmd_prefix(nproc):
         return "python"
     return f"torchrun --nproc_per_node={nproc}"
 
-def run_randomized_integrity_test_v2(dataset_size='small', split='eval', num_samples=50, model_path='outputs/demo/big_run_qwen-7b', nproc=1):
+def run_randomized_integrity_test_v2(dataset_size='small', split='eval', num_samples=50, model_path='outputs/big_run_qwen-7b', nproc=1):
     print(f"--- Randomized Integrity Test V2 (Using Metadata) ---")
     print(f"Dataset: {dataset_size} | Split: {split} | Samples: {num_samples} | GPUs: {nproc}")
     
