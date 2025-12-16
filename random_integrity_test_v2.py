@@ -34,7 +34,7 @@ def run_randomized_integrity_test_v2(dataset_size='small', split='eval', num_sam
             f"dataset.size={dataset_size} "
             f"+dataset.split={split} "
             f"+training.load_model_path={model_path} "
-            f"training.max_length=128 " # Keep it fast for test
+            f"training.max_length=256 " # Keep it fast for test
             f"training.micro_batch_size=8 "
             f"training.quantization.enabled=true "
             f"wandb.enabled=false "
@@ -70,7 +70,20 @@ def run_randomized_integrity_test_v2(dataset_size='small', split='eval', num_sam
     
     selected_metadata = [metadata[i] for i in indices]
     selected_embeddings = full_embeddings[indices]
-    
+
+    # DEBUG: Check for duplicate texts
+    texts = [m['text'] for m in selected_metadata]
+    unique_texts = set(texts)
+    if len(unique_texts) < len(texts):
+        print(f"WARNING: {len(texts) - len(unique_texts)} duplicate texts found!")
+        from collections import Counter
+        text_counts = Counter(texts)
+        for t, c in text_counts.items():
+            if c > 1:
+                print(f"  Duplicate ({c}x): {t[:60]}...")
+    else:
+        print(f"All {len(texts)} selected texts are unique.")
+
     print(f"Selected {len(selected_metadata)} samples.")
     
     # 4. Create Temp Dataset from Selected Texts
@@ -94,7 +107,7 @@ def run_randomized_integrity_test_v2(dataset_size='small', split='eval', num_sam
         f"dataset.size={temp_dataset_name} "
         f"+dataset.split=all "
         f"+training.load_model_path={model_path} "
-        f"training.max_length=128 "
+        f"training.max_length=256 "
         f"training.micro_batch_size=8 "
         f"training.quantization.enabled=true "
         f"wandb.enabled=false "
@@ -155,7 +168,28 @@ def run_randomized_integrity_test_v2(dataset_size='small', split='eval', num_sam
         ordered_new_embeddings.append(text_to_emb[text])
         
     new_embeddings = torch.stack(ordered_new_embeddings)
-    
+
+    # DEBUG: Check for zero or near-zero embeddings before normalization
+    old_norms = torch.norm(selected_embeddings, dim=1)
+    new_norms = torch.norm(new_embeddings, dim=1)
+    if (old_norms < 1e-6).any() or (new_norms < 1e-6).any():
+        print("WARNING: Zero or near-zero embeddings detected!")
+        print(f"  Old zeros: {(old_norms < 1e-6).sum().item()}, New zeros: {(new_norms < 1e-6).sum().item()}")
+    else:
+        print(f"Embedding norms OK - Old: min={old_norms.min():.4f}, max={old_norms.max():.4f} | New: min={new_norms.min():.4f}, max={new_norms.max():.4f}")
+
+    # DEBUG: Check direct cosine similarity between old and new for each sample
+    # This tells us if individual embeddings match (before looking at pair-wise sim matrix)
+    old_norm = torch.nn.functional.normalize(selected_embeddings, p=2, dim=1)
+    new_norm = torch.nn.functional.normalize(new_embeddings, p=2, dim=1)
+    direct_cosine = (old_norm * new_norm).sum(dim=1)
+    print(f"Direct old-vs-new cosine per sample: min={direct_cosine.min():.4f}, max={direct_cosine.max():.4f}, mean={direct_cosine.mean():.4f}")
+    low_match_indices = (direct_cosine < 0.99).nonzero(as_tuple=True)[0]
+    if len(low_match_indices) > 0:
+        print(f"WARNING: {len(low_match_indices)} samples have low direct match (cosine < 0.99):")
+        for idx in low_match_indices[:5]:  # Show first 5
+            print(f"  Sample {idx.item()}: cosine={direct_cosine[idx]:.4f}, text={selected_metadata[idx.item()]['text'][:80]}...")
+
     # Compare Similarity Matrices
     # Normalize
     selected_embeddings = torch.nn.functional.normalize(selected_embeddings, p=2, dim=1)
@@ -167,7 +201,27 @@ def run_randomized_integrity_test_v2(dataset_size='small', split='eval', num_sam
     diff = (sim_old - sim_new).abs()
     max_diff = diff.max().item()
     mean_diff = diff.mean().item()
-    
+
+    # DEBUG: Print worst pair details
+    if max_diff > 0.01:
+        worst_idx = diff.argmax().item()
+        i, j = worst_idx // diff.shape[1], worst_idx % diff.shape[1]
+        print(f"\n--- DEBUG: Worst Pair Analysis ---")
+        print(f"Worst pair indices: ({i}, {j})")
+        print(f"  sim_old[{i},{j}] = {sim_old[i,j]:.4f}")
+        print(f"  sim_new[{i},{j}] = {sim_new[i,j]:.4f}")
+        print(f"  Text i: {selected_metadata[i]['text'][:100]}...")
+        print(f"  Text j: {selected_metadata[j]['text'][:100]}...")
+        # Check if texts are the same (duplicate issue)
+        if selected_metadata[i]['text'] == selected_metadata[j]['text']:
+            print(f"  *** DUPLICATE TEXT DETECTED between indices {i} and {j}! ***")
+        # Also check direct embedding comparison for these indices
+        cos_sim_direct_old = torch.nn.functional.cosine_similarity(
+            selected_embeddings[i:i+1], selected_embeddings[j:j+1]).item()
+        cos_sim_direct_new = torch.nn.functional.cosine_similarity(
+            new_embeddings[i:i+1], new_embeddings[j:j+1]).item()
+        print(f"  Direct cosine (old): {cos_sim_direct_old:.4f}, Direct cosine (new): {cos_sim_direct_new:.4f}")
+
     print(f"\n--- Results ---")
     print(f"Max Difference: {max_diff:.6f}")
     print(f"Mean Difference: {mean_diff:.6f}")

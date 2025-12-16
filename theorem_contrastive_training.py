@@ -686,6 +686,12 @@ def load_saved_weights(model, load_path: Path, cfg: DictConfig, rank: int = 0):
             print(f"Loading full model from: {model_path}")
         model_to_load.load_state_dict(torch.load(model_path, map_location='cpu', weights_only=False))
 
+    # Barrier to ensure all ranks have loaded weights before proceeding
+    if dist.is_initialized():
+        dist.barrier()
+        if rank == 0:
+            print("All ranks synchronized after loading weights.")
+
 
 def compute_embeddings(model, tokenizer, cfg: DictConfig, device, rank: int = 0, world_size: int = 1, distributed: bool = False):
     """... (Function unchanged) ..."""
@@ -714,7 +720,8 @@ def compute_embeddings(model, tokenizer, cfg: DictConfig, device, rank: int = 0,
     use_amp = cfg.training.get('use_amp', True) and torch.cuda.is_available()
     compute_config = {
         'MICRO_BATCH_SIZE': cfg.training.micro_batch_size,
-        'USE_AMP': use_amp 
+        'USE_AMP': use_amp,
+        'DEBUG_GATHER': True  # TEMP: Hardcoded for debugging
     }
     _, Z_all, paper_ids_all = compute_and_gather_embeddings(
         model,

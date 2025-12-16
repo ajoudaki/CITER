@@ -13,7 +13,7 @@ import numpy as np
 # Distributed Utilities
 # ===================================================================
 
-def all_gather_embeddings(local_embeddings: torch.Tensor) -> torch.Tensor:
+def all_gather_embeddings(local_embeddings: torch.Tensor, debug: bool = False) -> torch.Tensor:
     """
     Gathers embeddings from all ranks (Sync Point 1).
     Ensures the result is detached to prevent cross-rank autograd edges.
@@ -22,10 +22,26 @@ def all_gather_embeddings(local_embeddings: torch.Tensor) -> torch.Tensor:
         return local_embeddings.detach()
 
     world_size = dist.get_world_size()
+    rank = dist.get_rank()
     local_embeddings = local_embeddings.contiguous()
+
+    # DEBUG: Check local embeddings before gather
+    if debug:
+        local_norm = torch.norm(local_embeddings, dim=1)
+        local_zeros = (local_norm < 1e-6).sum().item()
+        print(f"[Rank {rank}] PRE-GATHER: local_embeddings shape={local_embeddings.shape}, "
+              f"zeros={local_zeros}/{local_embeddings.shape[0]}, device={local_embeddings.device}")
+
     gathered = [torch.empty_like(local_embeddings) for _ in range(world_size)]
 
     dist.all_gather(gathered, local_embeddings)
+
+    # DEBUG: Check gathered results
+    if debug:
+        for i, g in enumerate(gathered):
+            g_norm = torch.norm(g, dim=1)
+            g_zeros = (g_norm < 1e-6).sum().item()
+            print(f"[Rank {rank}] POST-GATHER: gathered[{i}] zeros={g_zeros}/{g.shape[0]}")
 
     return torch.cat(gathered, dim=0).detach()
 
@@ -72,8 +88,13 @@ def compute_and_gather_embeddings(
         local_Z = torch.cat(local_Z, dim=0).half() # [C_local, D]
 
         # --- Sync Point: All-gather embeddings and paper IDs ---
-        Z_all = all_gather_embeddings(local_Z).half() 
-        paper_ids_all = all_gather_embeddings(local_paper_ids)
+        # Add barrier to ensure all ranks have finished computing before gather
+        if dist.is_initialized():
+            dist.barrier()
+
+        debug_gather = config.get('DEBUG_GATHER', False)
+        Z_all = all_gather_embeddings(local_Z, debug=debug_gather).half()
+        paper_ids_all = all_gather_embeddings(local_paper_ids, debug=False)  # Don't debug paper_ids
         
         return local_Z, Z_all, paper_ids_all
 
