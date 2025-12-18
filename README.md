@@ -1,4 +1,4 @@
-# Mathematical Theorem Contrastive Learning System
+# MathCLIP: CLIP style contrastive learning for mathematical lemmas/theorems
 
 ## Table of Contents
 1. [Overview](#overview)
