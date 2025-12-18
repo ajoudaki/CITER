@@ -41,24 +41,46 @@ except ImportError:
 # =============================================================================
 
 def clean_html(text: str) -> str:
-    """Remove HTML tags and decode entities."""
+    """Remove HTML tags, decode entities, and sanitize URLs that could reveal linked posts."""
     if not text:
         return ""
     # Decode HTML entities
     text = html.unescape(text)
     # Remove HTML tags
     text = re.sub(r'<[^>]+>', ' ', text)
+
+    # Sanitize URLs (could reveal linked posts in StackExchange)
+    text = re.sub(r'https?://[^\s<>\[\]]+', '', text)
+    text = re.sub(r'www\.[^\s<>\[\]]+', '', text)
+
     # Collapse whitespace
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
 
 def clean_latex(text: str) -> str:
-    """Basic LaTeX cleaning (preserve math)."""
+    """Clean LaTeX text and sanitize cross-references that could reveal edge structure."""
     if not text:
         return ""
-    # Remove common LaTeX commands but preserve content
+
+    # Remove cross-references (these reveal edge/dependency structure)
+    text = re.sub(r'\\eqref\{[^}]*\}', '', text)
+    text = re.sub(r'\\ref\{[^}]*\}', '', text)
+    text = re.sub(r'\\autoref\{[^}]*\}', '', text)
+    text = re.sub(r'\\[Cc]ref\{[^}]*\}', '', text)
+    text = re.sub(r'\\pageref\{[^}]*\}', '', text)
+    text = re.sub(r'\\hyperref\[[^\]]*\]\{[^}]*\}', '', text)
+    text = re.sub(r'\\hyperref\[[^\]]*\]', '', text)
+
+    # Remove labels entirely (they define reference targets)
+    text = re.sub(r'\\label\{[^}]*\}', '', text)
+
+    # Remove citations (reveal bibliography links)
+    text = re.sub(r'\\cite[a-z]*\{[^}]*\}', '', text)
+
+    # Remove common LaTeX formatting commands but preserve content
     text = re.sub(r'\\(?:emph|textbf|textit|text)\{([^}]*)\}', r'\1', text)
+
     # Collapse whitespace
     text = re.sub(r'\s+', ' ', text).strip()
     return text
