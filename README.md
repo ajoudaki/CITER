@@ -1,4 +1,4 @@
-# MathCLIP: CLIP style contrastive learning for mathematical lemmas/theorems
+# MathCLIP: CLIP-style pretraining for mathematical lemmas/theorems embedding 
 
 ## Table of Contents
 1. [Overview](#overview)
