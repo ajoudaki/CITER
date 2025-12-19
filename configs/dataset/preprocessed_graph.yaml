@@ -1,0 +1,36 @@
+# Preprocessed Graph Dataset configuration
+# Merged dataset from multiple sources (ArXiv, StackExchange, etc.)
+name: preprocessed_graph
+type: preprocessed_graph  # Dataset type identifier
+
+# Data paths
+base_path: data/processed
+nodes_file: nodes.arrow    # Relative to base_path
+edges_file: edges.npy      # Relative to base_path
+metadata_file: metadata.json  # Relative to base_path
+
+# Train/eval split configuration
+train_ratio: 0.9
+seed: 42
+
+# Text processing
+use_prompts: true  # Prepend edge-type specific prompts to text
+
+# DataLoader configuration
+dataloader:
+  num_workers: 4
+  pin_memory: true
+  drop_last: true
+  prefetch_factor: 2
+
+# Validation configuration
+validation:
+  max_samples: 50000  # Maximum samples for validation (for efficiency)
+  batch_size: 512     # Batch size for validation data loading
+
+# Dataset statistics (for reference, updated after preprocessing)
+stats:
+  num_nodes: null     # Populated from metadata.json
+  num_edges: null     # Populated from metadata.json
+  num_clusters: null  # Populated from metadata.json
+  sources: []         # List of source datasets (arxiv, stackexchange, etc.)

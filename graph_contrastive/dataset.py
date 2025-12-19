@@ -330,6 +330,8 @@ class PreprocessedGraphDataset(Dataset):
         train_ratio: Fraction of edges to use for training (default 0.9)
         seed: Random seed for train/eval split
         use_prompts: Whether to prepend edge-type prompts to text
+        nodes_file: Name of the nodes file (default 'nodes.arrow')
+        edges_file: Name of the edges file (default 'edges.npy')
     """
 
     def __init__(
@@ -341,6 +343,8 @@ class PreprocessedGraphDataset(Dataset):
         train_ratio: float = 0.9,
         seed: int = 42,
         use_prompts: bool = True,
+        nodes_file: str = 'nodes.arrow',
+        edges_file: str = 'edges.npy',
     ):
         self.data_dir = Path(data_dir)
         self.tokenizer = tokenizer
@@ -351,7 +355,7 @@ class PreprocessedGraphDataset(Dataset):
         self.epoch = 0
 
         # Load nodes (memory-mapped Arrow)
-        nodes_path = self.data_dir / "nodes.arrow"
+        nodes_path = self.data_dir / nodes_file
         if not nodes_path.exists():
             raise FileNotFoundError(f"Nodes file not found: {nodes_path}")
 
@@ -361,7 +365,7 @@ class PreprocessedGraphDataset(Dataset):
         self.cluster_ids = self.nodes_table.column('cluster_id').to_numpy()
 
         # Load edges (memory-mapped NumPy)
-        edges_path = self.data_dir / "edges.npy"
+        edges_path = self.data_dir / edges_file
         if not edges_path.exists():
             raise FileNotFoundError(f"Edges file not found: {edges_path}")
 

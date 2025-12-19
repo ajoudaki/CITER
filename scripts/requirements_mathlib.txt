@@ -1,0 +1,18 @@
+# LeanDojo for extracting Lean 4 / Mathlib 4 data
+lean-dojo>=2.0.0
+
+# Graph processing and analysis
+networkx>=3.0
+
+# Data handling
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Visualization (optional)
+matplotlib>=3.7.0
+
+# Progress bars
+tqdm>=4.65.0
+
+# Serialization
+orjson>=3.9.0

@@ -593,8 +593,20 @@ def setup_model(cfg: DictConfig, device):
     model = TheoremContrastiveModel(base_encoder, max_length=cfg.training.max_length)
     return model.to(device)
 
-def prepare_validation_data(val_dataset, device, distributed, rank, reshuffle=False, max_val_samples=50000):
-    """Prepare validation data using DataLoader for fast parallel loading."""
+def prepare_validation_data(val_dataset, device, distributed, rank, reshuffle=False,
+                           max_val_samples=50000, val_batch_size=512, num_workers=4):
+    """Prepare validation data using DataLoader for fast parallel loading.
+
+    Args:
+        val_dataset: Validation dataset
+        device: Target device
+        distributed: Whether using distributed training
+        rank: Process rank
+        reshuffle: Whether to reshuffle the dataset
+        max_val_samples: Maximum number of validation samples (from config)
+        val_batch_size: Batch size for validation loading (from config)
+        num_workers: Number of dataloader workers (from config)
+    """
     val_objects = [None, None]
     if rank == 0:
         if reshuffle and hasattr(val_dataset, 'reset_epoch'):
@@ -607,7 +619,7 @@ def prepare_validation_data(val_dataset, device, distributed, rank, reshuffle=Fa
         # Use DataLoader with workers for parallel tokenization
         from torch.utils.data import DataLoader, Subset
         subset = Subset(val_dataset, range(n_samples))
-        loader = DataLoader(subset, batch_size=512, num_workers=4, shuffle=False, pin_memory=True)
+        loader = DataLoader(subset, batch_size=val_batch_size, num_workers=num_workers, shuffle=False, pin_memory=True)
 
         val_x_list, val_mx_list, val_y_list, val_my_list = [], [], [], []
         for batch in tqdm(loader, desc="Loading validation", disable=False):
@@ -1118,13 +1130,51 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
     dataset_path = Path(cfg.dataset.base_path)  # Directory for preprocessed data
     if rank == 0:
         print(f"Loading preprocessed dataset from: {dataset_path}")
-        if not (dataset_path / "nodes.arrow").exists():
-            raise FileNotFoundError(f"Preprocessed dataset not found: {dataset_path}/nodes.arrow")
+        nodes_file = cfg.dataset.get('nodes_file', 'nodes.arrow')
+        if not (dataset_path / nodes_file).exists():
+            raise FileNotFoundError(f"Preprocessed dataset not found: {dataset_path}/{nodes_file}")
+
+    # --- Dataset configuration from config ---
+    dataset_train_ratio = cfg.dataset.get('train_ratio', 0.9)
+    dataset_seed = cfg.dataset.get('seed', 42)
+    dataset_use_prompts = cfg.dataset.get('use_prompts', True)
+    dataset_nodes_file = cfg.dataset.get('nodes_file', 'nodes.arrow')
+    dataset_edges_file = cfg.dataset.get('edges_file', 'edges.npy')
 
     # --- Datasets for TRAINING (using preprocessed graph data) ---
     DatasetClass = PreprocessedGraphDataset
-    train_dataset = DatasetClass(str(dataset_path), tokenizer, max_length=cfg.training.max_length, split='train')
-    val_dataset = DatasetClass(str(dataset_path), tokenizer, max_length=cfg.training.max_length, split='eval')
+    train_dataset = DatasetClass(
+        str(dataset_path), tokenizer,
+        max_length=cfg.training.max_length,
+        split='train',
+        train_ratio=dataset_train_ratio,
+        seed=dataset_seed,
+        use_prompts=dataset_use_prompts,
+        nodes_file=dataset_nodes_file,
+        edges_file=dataset_edges_file
+    )
+    val_dataset = DatasetClass(
+        str(dataset_path), tokenizer,
+        max_length=cfg.training.max_length,
+        split='eval',
+        train_ratio=dataset_train_ratio,
+        seed=dataset_seed,
+        use_prompts=dataset_use_prompts,
+        nodes_file=dataset_nodes_file,
+        edges_file=dataset_edges_file
+    )
+
+    # --- DataLoader configuration from config ---
+    dataloader_cfg = cfg.dataset.get('dataloader', {})
+    dl_num_workers = dataloader_cfg.get('num_workers', cfg.runtime.num_workers)
+    dl_pin_memory = dataloader_cfg.get('pin_memory', True)
+    dl_drop_last = dataloader_cfg.get('drop_last', True)
+    dl_prefetch_factor = dataloader_cfg.get('prefetch_factor', 2)
+
+    # --- Validation configuration from config ---
+    validation_cfg = cfg.dataset.get('validation', {})
+    val_max_samples = validation_cfg.get('max_samples', 50000)
+    val_batch_size = validation_cfg.get('batch_size', 512)
 
     if distributed:
         if cfg.training.global_batch_size % world_size != 0:
@@ -1138,7 +1188,10 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
     train_loader = DataLoader(
         train_dataset, batch_size=local_batch_size, sampler=train_sampler,
         shuffle=False,
-        num_workers=cfg.runtime.num_workers, pin_memory=True, drop_last=True
+        num_workers=dl_num_workers,
+        pin_memory=dl_pin_memory,
+        drop_last=dl_drop_last,
+        prefetch_factor=dl_prefetch_factor if dl_num_workers > 0 else None
     )
 
     model = setup_model(cfg, device)
@@ -1368,7 +1421,12 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
         scheduler = None
         validation_interval = 0
 
-    val_x_packed, val_y_packed = prepare_validation_data(val_dataset, device, distributed, rank)
+    val_x_packed, val_y_packed = prepare_validation_data(
+        val_dataset, device, distributed, rank,
+        max_val_samples=val_max_samples,
+        val_batch_size=val_batch_size,
+        num_workers=dl_num_workers
+    )
 
     if len(trainable_params) == 0:
         if rank == 0:
