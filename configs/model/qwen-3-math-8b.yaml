@@ -1,0 +1,12 @@
+name: qwen-3-math-8b
+model_name: Qwen/Qwen3-8B
+model_type: last_token_pooling
+hidden_dim: 4096
+lora_target_modules:
+- q_proj
+- v_proj
+- k_proj
+- o_proj
+output_dim: 2048
+use_gradient_checkpointing: false
+quantization_config: null
