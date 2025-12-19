@@ -31,13 +31,17 @@ import wandb
 
 # Import distributed functions
 from distributed_clip import (
-    distributed_train_step, 
-    trivial_contrastive_step, 
+    distributed_train_step,
+    trivial_contrastive_step,
     distributed_validate_step,
     validate_metrics,
     compute_and_gather_embeddings,
     compute_retrieval_metrics as compute_retrieval_metrics # Use alias to fix name mismatch
 )
+
+# Import preprocessed graph dataset
+from graph_contrastive.dataset import PreprocessedGraphDataset
+
 from numba import njit # Import the Numba JIT compiler
 import torch.utils.checkpoint as checkpoint # <-- ADD THIS IMPORT
 
@@ -589,22 +593,32 @@ def setup_model(cfg: DictConfig, device):
     model = TheoremContrastiveModel(base_encoder, max_length=cfg.training.max_length)
     return model.to(device)
 
-def prepare_validation_data(val_dataset, device, distributed, rank, reshuffle=False):
-    """... (Function unchanged) ..."""
+def prepare_validation_data(val_dataset, device, distributed, rank, reshuffle=False, max_val_samples=50000):
+    """Prepare validation data using DataLoader for fast parallel loading."""
     val_objects = [None, None]
     if rank == 0:
-        if reshuffle:
+        if reshuffle and hasattr(val_dataset, 'reset_epoch'):
             val_dataset.reset_epoch()
-            print("Preparing and distributing validation dataset (with reshuffled pairs)...")
-        else:
-            print("Preparing and distributing validation dataset...")
-        val_data = [val_dataset[i] for i in range(len(val_dataset))]
-        val_x = torch.stack([d['input_ids_x'] for d in val_data])
-        val_mx = torch.stack([d['attention_mask_x'] for d in val_data])
-        val_y = torch.stack([d['input_ids_y'] for d in val_data])
-        val_my = torch.stack([d['attention_mask_y'] for d in val_data])
-        val_x_packed = torch.cat([val_x, val_mx], dim=1)
-        val_y_packed = torch.cat([val_y, val_my], dim=1)
+
+        # Limit validation size for efficiency
+        n_samples = min(len(val_dataset), max_val_samples)
+        print(f"Preparing validation dataset ({n_samples:,} samples)...")
+
+        # Use DataLoader with workers for parallel tokenization
+        from torch.utils.data import DataLoader, Subset
+        subset = Subset(val_dataset, range(n_samples))
+        loader = DataLoader(subset, batch_size=512, num_workers=4, shuffle=False, pin_memory=True)
+
+        val_x_list, val_mx_list, val_y_list, val_my_list = [], [], [], []
+        for batch in tqdm(loader, desc="Loading validation", disable=False):
+            val_x_list.append(batch['input_ids_x'])
+            val_mx_list.append(batch['attention_mask_x'])
+            val_y_list.append(batch['input_ids_y'])
+            val_my_list.append(batch['attention_mask_y'])
+
+        val_x_packed = torch.cat([torch.cat([x, mx], dim=1) for x, mx in zip(val_x_list, val_mx_list)], dim=0)
+        val_y_packed = torch.cat([torch.cat([y, my], dim=1) for y, my in zip(val_y_list, val_my_list)], dim=0)
+
         if distributed:
             val_objects = [val_x_packed, val_y_packed]
     if distributed:
@@ -1101,14 +1115,14 @@ def train(cfg: DictConfig, rank: int = 0, world_size: int = 1, distributed: bool
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    dataset_path = Path(cfg.dataset.base_path) / f"{cfg.dataset.size}.jsonl"
+    dataset_path = Path(cfg.dataset.base_path)  # Directory for preprocessed data
     if rank == 0:
-        print(f"Loading dataset: {dataset_path}")
-        if not dataset_path.exists():
-            raise FileNotFoundError(f"Dataset not found: {dataset_path}")
+        print(f"Loading preprocessed dataset from: {dataset_path}")
+        if not (dataset_path / "nodes.arrow").exists():
+            raise FileNotFoundError(f"Preprocessed dataset not found: {dataset_path}/nodes.arrow")
 
-    # --- Datasets for TRAINING ---
-    DatasetClass = StratifiedTheoremDataset
+    # --- Datasets for TRAINING (using preprocessed graph data) ---
+    DatasetClass = PreprocessedGraphDataset
     train_dataset = DatasetClass(str(dataset_path), tokenizer, max_length=cfg.training.max_length, split='train')
     val_dataset = DatasetClass(str(dataset_path), tokenizer, max_length=cfg.training.max_length, split='eval')
 
